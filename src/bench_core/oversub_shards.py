@@ -360,6 +360,102 @@ class _ProviderHint:
         return None
 
 
+def start_host_monitor(
+    trial_cfg: dict, trial_dir: Path, *, provider: str, test_duration: int, timeout_sec: int | None = None
+) -> MonitorController | None:
+    """Spawn the driver-owned host collector for one sharded trial.
+
+    One collector per host: it samples while the union of the shards' stress
+    markers is non-empty and exports to ``<trial_dir>/vm_monitor/``. Returns
+    None when the collector is not applicable (no VMM for this provider, no
+    binary, ``monitor.enabled: false``) -- the shards then simply publish
+    markers nobody reads.
+
+    ``timeout_sec`` is the shard group's deadline: the collector's sampling
+    back-stop must cover the WHOLE union window (inter-shard start skew + the
+    trial), which ``test_duration`` alone understates whenever skew is large
+    (exec_only: every shard runs a full create_all first). The group deadline
+    is the sound upper bound -- the window cannot outlive it.
+    """
+    raw = dict(trial_cfg.get("monitor") or {})
+    log_dir = Path(raw.get("log_dir") or trial_dir / "vm_monitor")
+    raw.update(
+        log_dir=str(log_dir),
+        stress_file=str(log_dir / "stress.lock"),
+        external_collector=False,  # this process IS the collector
+    )
+    cfg = SimpleNamespace(
+        monitor=MonitorConfig.from_raw(raw),
+        output_dir=str(trial_dir),
+        test_duration=max(int(test_duration), int(timeout_sec or 0)),
+    )
+    controller = MonitorController(cfg, _ProviderHint(f"{provider}-driver", provider_vmm_type(provider)))
+    controller.start()
+    return controller if controller.proc is not None else None
+
+
+class ShardStressBracket:
+    """Mirror the union of the shards' stress markers onto one collector lock.
+
+    Each shard's kernel publishes ``monitor.stress_file`` for its own stress
+    window; the driver-owned collector must sample from the FIRST shard's start
+    to the LAST shard's end. This poller opens the collector's lock on the
+    first marker it sees and holds it until ``stop()``, so a gapped union (one
+    shard finishing while another is still creating) or a shard killed
+    mid-stress never cuts the window short.
+    """
+
+    def __init__(self, marker_paths: list[Path], controller: MonitorController, poll_sec: float = 0.5) -> None:
+        self._markers = list(marker_paths)
+        self._controller = controller
+        self._poll = poll_sec
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._opened = False
+
+    @property
+    def opened(self) -> bool:
+        """True once a shard marker was seen, i.e. the collector began sampling.
+
+        Read after :meth:`stop` (which joins the thread). An unopened bracket
+        means no shard reached its stress phase: there is no window to export
+        and nothing for the collector to preserve.
+        """
+        return self._opened
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="shard-stress-bracket", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """End the window; the collector then exports on its own."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(5.0, self._poll * 4))
+            self._thread = None
+
+    def _run(self) -> None:
+        # Open on the first marker, then latch: the window covers [first shard
+        # marker, driver stop]. A transition to an empty union (gapped starts,
+        # a killed shard's kernel clearing its marker) must NOT end the sampling
+        # -- the collector is single-shot and would export before the tail
+        # shards' stress even begins.
+        while not self._stop.is_set():
+            if self._stop.wait(self._poll):
+                break
+            if not self._opened and any(p.exists() for p in self._markers):
+                self._opened = True
+                self._controller.begin_stress()
+        if self._opened:
+            self._controller.end_stress()
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-group supervision
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
 class GroupResult:
     """Outcome of one sharded launch: per-shard rc + how the group ended."""
 
