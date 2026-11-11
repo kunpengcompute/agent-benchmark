@@ -35,6 +35,9 @@ dev = [
 # install only when using --provider cubesandbox.
 cubesandbox = ["cubesandbox>=0.7.0"]
 
+[project.scripts]
+bench-core = "bench_core.bench_cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["bench_core*", "env_provider*"]
