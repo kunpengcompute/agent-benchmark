@@ -1,0 +1,958 @@
+"""Trajectory replay workflow task runners (host-agnostic).
+
+Each sandbox gets an independent thread that re-executes a recorded SWE-bench
+agent trajectory (ordered shell + ``str_replace_editor`` actions with per-step
+``delay_time``) solely through :meth:`EnvironmentProvider.exec`. P1 is
+exec-only: the recorded action string is exec'd verbatim -- workdir and env are
+passed via the ``exec`` contract's first-class ``cwd`` / ``env`` params, with
+no shell wrapping and no ``str_replace_editor`` semantic re-implementation.
+
+The runner is built around ``_run_slice(step)``, whose ``_resume`` / ``_pause``
+are overridable **no-op hooks**. P2 (lifecycle mode, e2b only) will override
+them with real ``provider.pause`` / ``provider.resume`` calls -- the slice
+shape is fixed here so P2 is a pure override, not a refactor. Exec-only mode
+also yields the "no lifecycle overhead" baseline against which P2's
+pause/resume measurements can be compared.
+
+Classes:
+    ReplayBaseRunner   - the slice base (shared by the three runners below)
+
+The concrete runners live in :mod:`bench_core.task_runner.replay_runners`,
+imported at the bottom of this module to register the workflow.
+"""
+from __future__ import annotations
+
+import logging
+import time
+
+from bench_core.admission import ShutdownInterrupted
+from bench_core.payload.replay_payload import ReplayStep, Trajectory, load_pool, template_at, within_template_rank
+from bench_core.schemas import REPLAY_STEP_ORDER, ReplayMetrics
+from bench_core.transients import is_transient_sandbox_error
+from bench_core.workflow_registry import RunContext, TaskRunner, WorkflowSpec, register_workflow
+from env_provider import CommandResult, SnapshotSizeCapable
+
+from .replay_config import ReplayConfig
+from .replay_formatter import ReplayReportFormatter
+
+from .replay_types import (
+    ACTION_SERIES_LIMIT,
+    READY_PROBE_MAX_ATTEMPTS,
+    READY_PROBE_TIMEOUT,
+    TIMEOUT_EXIT_CODE,
+    SandboxInfrastructureError,
+    StepResult,
+    _compact_action,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ReplayBaseRunner(TaskRunner):
+    """Slice base shared by the three replay runners.
+
+    Subclasses (warmup / fixed / round) implement ``do_run()``; they share the
+    slice + exec plumbing here. The runner contract is ``__init__(ctx)`` +
+    ``do_run()``; warmup / task / round pull what they need from ``ctx``.
+    """
+
+    def __init__(self, ctx: RunContext) -> None:
+        super().__init__(ctx)
+        assert isinstance(ctx.config.workflow_config, ReplayConfig), "replay runner requires a ReplayConfig view"
+        self.cfg = ctx.config.workflow_config
+        self.series = ctx.series
+        self.scanner = ctx.scanner
+        self.admission = ctx.admission
+        self._prev_pause_end_monotonic: float | None = None
+        # G5: shared no-catch-up launch pacer (exec_ephemeral). One LaunchPacer
+        # instance is shared across the whole fleet by the spine so the
+        # next-launch deadline is visible to every worker.
+        self._launch_pacer = ctx.launch_pacer
+        # Per-sandbox 1-based pause counter for snapshot_size events.
+        self._pause_seq = 0
+        # Run identity for the series layer. Series events key a run by
+        # (trajectory_id, sandbox_index, round_id); a slot that replays the
+        # same trajectory twice under one round_id merges into ONE run row
+        # downstream (double n_steps, summed create/kill, wall-spanning
+        # elapsed_sec). The round runner's identity comes from ctx (a fresh
+        # instance per round); the fixed runner is ONE long-lived instance
+        # cycling the pool, so it stamps an advancing per-slot pass ordinal
+        # via _begin_pass() at the top of every pass. Initialized from ctx so
+        # the attribute always exists for the defensive getattr reads below.
+        self.round_id = ctx.round_id
+        self._pass_seq = 0
+
+    def do_run(self) -> None:
+        """Run-hostile stub: this is a slice-machinery helper base, not a runner.
+
+        The base stays instantiable (unlike a pure ABC) so unit tests can drive
+        its slice / lifecycle / admission helpers directly -- ``_run_slice``,
+        ``_lifecycle_call_with_retry``, ``_emit_snapshot_size`` -- without
+        spinning a concrete subclass's loop. The three real runners (warmup /
+        task / round) override this with their loop; calling it on the bare
+        base is a wiring bug, so it raises loudly instead of silent-no-op'ing.
+        """
+        raise NotImplementedError(
+            "ReplayBaseRunner is a slice-machinery base; instantiate a concrete "
+            "runner (ReplayWarmupRunner / ReplayTaskRunner / ReplayRoundRunner) to run"
+        )
+
+    # --- the slice (the spine P2 plugs into) ---
+    def _run_slice(self, step: ReplayStep, *, trajectory_id: str = "") -> StepResult:
+        """One resume -> execute -> pause cycle (wait-decoupled order).
+
+        Order (the running lease brackets only the memory-held window; resume
+        rate pacing is PRE-lease so it cannot inflate ``running_slot_held``)::
+
+            [resume rate-pacing] -> slots.acquire(natural_delay + capacity_wait,
+            grant) -> [resume inflight + resume API] -> [ready] -> [exec] ->
+            [pause rate-pacing + inflight + API] -> slots.release
+
+        Lifecycle strategy (asymmetric, by resource state):
+
+        * **resume rate-pacing is PRE-lease**: the sandbox is still PAUSED (no
+          memory demand, no lease needed), so pacing here cannot inflate the
+          running-slot hold. Under oversub the dispatch slot is consumed before
+          the FIFO grants, so resumes may bunch after a FIFO release --
+          acceptable because under oversub the slot capacity (not uniform
+          spacing) is the bottleneck, and at the default (qps off) this is moot.
+        * **pause rate-pacing is IN-lease**: the sandbox is RUNNING and holds
+          memory until pause CONFIRMS, so the lease must stay held through the
+          pause call (releasing first would let an oversub peer resume into
+          un-freed memory).
+
+        Four independent wait components are persisted: ``natural_delay``
+        (think-time), ``capacity_wait`` (FIFO token contention),
+        ``rate_pacing_wait`` (QPS 1/qps shaping), ``inflight_wait`` (fuse
+        semaphore block). ``slot_contention_wait_sec`` stays as the composite
+        (natural_delay + capacity_wait) for downstream parse-compat. Lease
+        release in finally so mid-slice exceptions don't leak the running slot.
+        """
+        lease = None
+        # The recorded think-delay (inter-step pacing) is slept by the run
+        # loop's _sleep_delay BEFORE this slice, so by the time slots.acquire
+        # runs the scheduler's ready_at pre-park is only the residual
+        # (replay_pause_duration) -- lease.natural_delay_sec alone is ~0.
+        # Attribute the full slept think-delay to natural_delay here (it IS
+        # think-time) so interaction_total's think-delay term is decomposed;
+        # otherwise the decomposition column reads 0 while interaction_total
+        # carries hundreds of seconds of unattributed delay (observed 1:1
+        # lifecycle: interaction_total=568, natural_delay=0).
+        natural_delay_sec = step.delay_time_sec * self.cfg.replay_delay_scale
+        capacity_wait_sec = 0.0
+        slot_acquired_at = 0.0
+        resume_rate_pacing_wait_sec = 0.0
+
+        # PRE-LEASE resume rate-pacing (sandbox paused; no lease/memory demand).
+        # Done before slots.acquire so it does NOT inflate running_slot_held.
+        # Only lifecycle has an admission controller (exec_ephemeral is
+        # admission-free by construction), so the attribution concern is
+        # lifecycle-only.
+        if self.admission is not None and self.admission.qps is not None and self.cfg.replay_mode == "lifecycle":
+            resume_rate_pacing_wait_sec = self.admission.qps.time_wait("resume")
+
+        # Acquire the per-step running slot (lifecycle: admission non-None).
+        # natural_delay (think-time) + capacity_wait (FIFO) are surfaced
+        # separately from the composite.
+        if self.admission is not None:
+            ready_at = self._compute_ready_at(step)
+            lease = self.admission.slots.acquire(f"sbx{self.state.index}_step{step.index}", ready_at=ready_at)
+            natural_delay_sec += lease.natural_delay_sec  # residual ready_at park (replay_pause_duration)
+            capacity_wait_sec = lease.queue_wait_sec
+            slot_acquired_at = lease.acquired_at
+        slot_contention_wait_sec = natural_delay_sec + capacity_wait_sec
+
+        if lease is not None:
+            self._series_write(
+                {
+                    "event": "slot_acquire",
+                    "sandbox_index": self.state.index,
+                    "timestamp": time.time(),
+                    "task_id": lease.task_id,
+                    "lease_id": lease.lease_id,
+                    "queue_wait_sec": lease.queue_wait_sec,
+                    "natural_delay_sec": lease.natural_delay_sec,
+                    **self._slot_snapshot(),
+                }
+            )
+
+        retry_count_before = self.state.replay_metrics.retry_queued_count
+
+        try:
+            # Resume phase. Rate pacing was done PRE-lease above
+            # (resume_rate_pacing_wait_sec); _resume passes rate_wait=False so
+            # only the inflight fuse is re-acquired per retry attempt (a
+            # transient retry never re-pays the 1/qps delay). The returned
+            # first element is always 0 here (pre-lease caller owns it).
+            resume_start_ts = time.time()
+            _, resume_inflight_wait_sec, resume_api_sec = self._resume()
+
+            # Ready probe (post-resume, not QPS-gated; config-gated + lifecycle)
+            resume_ready_wait_sec = 0.0
+            if self.cfg.replay_ready_probe and self.cfg.replay_mode == "lifecycle":
+                resume_ready_wait_sec = self._probe_ready()
+
+            # resume_sec = inflight + api + ready_wait (rate pacing is
+            # pre-lease, NOT in resume_sec -- the decoupling).
+            resume_sec = resume_inflight_wait_sec + resume_api_sec + resume_ready_wait_sec
+            resume_end_ts = time.time()
+
+            # Exec phase
+            exec_start_ts = time.time()
+            exec_start = time.perf_counter()
+            result = self._execute(step)
+            exec_end = time.perf_counter()
+            exec_end_ts = time.time()
+            exec_elapsed = exec_end - exec_start
+
+            # Pause phase. Rate pacing is IN-lease (sandbox running, memory held
+            # until pause confirms), so _pause passes rate_wait=True. Returns
+            # (rate_pacing, inflight, api).
+            pause_start_ts = time.time()
+            pause_rate_pacing_wait_sec, pause_inflight_wait_sec, pause_api_sec = self._pause()
+            pause_sec = pause_rate_pacing_wait_sec + pause_inflight_wait_sec + pause_api_sec
+            pause_end_ts = time.time()
+
+            # P-snap: collect overlaybd snapshot sizes when the provider can.
+            self._emit_snapshot_size()
+
+            rate_pacing_wait_sec = resume_rate_pacing_wait_sec + pause_rate_pacing_wait_sec
+            inflight_wait_sec = resume_inflight_wait_sec + pause_inflight_wait_sec
+
+            sr = StepResult(
+                step_index=step.index,
+                action_type=step.action_type,
+                exit_code=result.exit_code,
+                exec_elapsed_sec=exec_elapsed,
+                slice_total_sec=resume_sec + exec_elapsed + pause_sec,
+                resume_sec=resume_sec,
+                pause_sec=pause_sec,
+                requested_delay_sec=step.delay_time_sec,
+                resume_api_sec=resume_api_sec,
+                resume_ready_wait_sec=resume_ready_wait_sec,
+                slot_contention_wait_sec=slot_contention_wait_sec,
+                # Per-phase rate-pacing (kept under the legacy "queue" names for
+                # downstream parse-compat): resume = pre-lease, pause = in-lease.
+                resume_rate_pacing_wait_sec=resume_rate_pacing_wait_sec,
+                pause_rate_pacing_wait_sec=pause_rate_pacing_wait_sec,
+                pause_api_sec=pause_api_sec,
+                running_slot_held_sec=((time.perf_counter() - slot_acquired_at) if slot_acquired_at else 0.0),
+                # interaction_total = slice + resume_rate_pacing + natural_delay
+                # (the slept think-delay) + capacity_wait. The think-delay lives
+                # in natural_delay (set above), NOT a separate + delay term --
+                # adding both would double-count once natural_delay is populated.
+                interaction_total_sec=(
+                    resume_rate_pacing_wait_sec
+                    + resume_sec
+                    + exec_elapsed
+                    + pause_sec
+                    + natural_delay_sec
+                    + capacity_wait_sec
+                ),
+                natural_delay_sec=natural_delay_sec,
+                capacity_wait_sec=capacity_wait_sec,
+                resume_inflight_wait_sec=resume_inflight_wait_sec,
+                pause_inflight_wait_sec=pause_inflight_wait_sec,
+            )
+            # Success-path record. On exception _run_slice raises (no record here);
+            # the caller's except block emits a slice_failed=True record instead.
+            # ``retries_in_slice`` lets a consumer rebuild ``retries_per_slice``
+            # from the series alone (a sharded trial's per-shard accumulators die
+            # with their process; see lifecycle_reconstruct.replay_states_from_events).
+            retries_in_slice = self.state.replay_metrics.retry_queued_count - retry_count_before
+            if self.series is not None:
+                self.series.write(
+                    {
+                        "event": "step",
+                        "sandbox_index": self.state.index,
+                        "trajectory_id": trajectory_id,
+                        "round_id": getattr(self, "round_id", None),
+                        "step_index": step.index,
+                        "action_type": step.action_type,
+                        "resume_start": resume_start_ts,
+                        "resume_end": resume_end_ts,
+                        "exec_start": exec_start_ts,
+                        "exec_end": exec_end_ts,
+                        "pause_start": pause_start_ts,
+                        "pause_end": pause_end_ts,
+                        "resume_sec": resume_sec,
+                        "exec_sec": exec_elapsed,
+                        "pause_sec": pause_sec,
+                        "slice_total_sec": sr.slice_total_sec,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.exit_code == TIMEOUT_EXIT_CODE,
+                        "slice_failed": False,
+                        "slot_contention_wait_sec": slot_contention_wait_sec,
+                        "natural_delay_sec": natural_delay_sec,
+                        "capacity_wait_sec": capacity_wait_sec,
+                        "resume_rate_pacing_wait_sec": resume_rate_pacing_wait_sec,
+                        "resume_api_sec": resume_api_sec,
+                        "resume_ready_wait_sec": resume_ready_wait_sec,
+                        "resume_inflight_wait_sec": resume_inflight_wait_sec,
+                        "pause_rate_pacing_wait_sec": pause_rate_pacing_wait_sec,
+                        "pause_api_sec": pause_api_sec,
+                        "pause_inflight_wait_sec": pause_inflight_wait_sec,
+                        "rate_pacing_wait_sec": rate_pacing_wait_sec,
+                        "inflight_wait_sec": inflight_wait_sec,
+                        "running_slot_held_sec": sr.running_slot_held_sec,
+                        "interaction_total_sec": sr.interaction_total_sec,
+                        "action": _compact_action(step.action),
+                        "retries_in_slice": retries_in_slice,
+                    }
+                )
+            # Track pause-end for the next step's ready_at (G2).
+            self._prev_pause_end_monotonic = time.perf_counter()
+            self.state.replay_metrics.append_retries_per_slice(retries_in_slice)
+            return sr
+        finally:
+            # Release lease in finally so mid-slice exceptions don't leak the slot.
+            if lease is not None:
+                self._series_write(
+                    {
+                        "event": "slot_release",
+                        "sandbox_index": self.state.index,
+                        "timestamp": time.time(),
+                        "lease_id": lease.lease_id,
+                        **self._slot_snapshot(),
+                    }
+                )
+                self.admission.slots.release(lease)
+
+    def _compute_ready_at(self, step: ReplayStep) -> float | None:
+        """G2: the monotonic timestamp this step becomes admissible.
+
+        ``prev_pause_end_monotonic + step.delay_time_sec + replay_pause_duration_sec``.
+        The first step in a worker has no preceding pause -> ``None`` (immediate
+        admission, no pre-delay park). Splits natural think-time delay from
+        capacity contention on the lease.
+        """
+        prev = self._prev_pause_end_monotonic
+        if prev is None:
+            return None
+        extra = self.cfg.replay_pause_duration_sec or 0.0
+        return prev + step.delay_time_sec * self.cfg.replay_delay_scale + extra
+
+    # --- lifecycle hooks (lifecycle: real call + G3 retry; exec_only / exec_ephemeral: no-op) ---
+    def _resume(self) -> tuple[float, float, float]:
+        """Resume the sandbox (restore from snapshot) before exec.
+
+        lifecycle: real call with G3 transient retry. Rate pacing is
+        PRE-lease (done by ``_run_slice`` before the slot acquire), so this
+        passes ``rate_wait=False`` -- only the inflight fuse is re-acquired per
+        retry attempt (a transient retry never re-pays the 1/qps delay).
+        Returns ``(rate_pacing_wait_sec, inflight_wait_sec, api_sec)`` where the
+        first element is always 0 here (the pre-lease caller owns it).
+        exec_only / exec_ephemeral: no-op so the baseline (resume ~= 0) stays comparable.
+        """
+        if self.cfg.replay_mode != "lifecycle":
+            return 0.0, 0.0, 0.0
+        return self._lifecycle_call_with_retry("resume", lambda: self.provider.resume(self.state), rate_wait=False)
+
+    def _pause(self) -> tuple[float, float, float]:
+        """Pause the sandbox (memory-snapshot) after exec.
+
+        lifecycle: real call with G3 transient retry. Rate pacing is
+        IN-lease (the sandbox is RUNNING and holds memory until pause confirms,
+        so the lease must stay held through the pause call), so this passes
+        ``rate_wait=True`` -- the 1/qps delay is paid ONCE before the retry
+        loop, never re-paid per attempt. Returns
+        ``(rate_pacing_wait_sec, inflight_wait_sec, api_sec)``. exec_only / exec_ephemeral: no-op.
+        """
+        if self.cfg.replay_mode != "lifecycle":
+            return 0.0, 0.0, 0.0
+        return self._lifecycle_call_with_retry("pause", lambda: self.provider.pause(self.state), rate_wait=True)
+
+    def _series_write(self, record: dict) -> None:
+        """Best-effort series write; a logging failure must never change control flow."""
+        if self.series is None:
+            return
+        try:
+            self.series.write(record)
+        except Exception as e:  # noqa: BLE001 - logging best-effort
+            logger.warning(f"[Sandbox{self.state.index}] series write failed: {str(e)[:80]}")
+
+    def _slot_snapshot(self) -> dict:
+        """Running-slot snapshot fields for admission events (empty if no admission)."""
+        if self.admission is None:
+            return {}
+        s = self.admission.slots.snapshot()
+        return {"active_after": s["active"], "waiting_after": s["waiting"]}
+
+    def _emit_snapshot_size(self) -> None:
+        """Collect overlaybd snapshot sizes and emit a ``snapshot_size`` event.
+
+        Only in lifecycle mode (exec_only and exec_ephemeral have no real
+        pause). Probes the :class:`SnapshotSizeCapable` capability; a ``None``
+        result (dir absent) or a scan error is skipped silently so non-aenv
+        backends and missing snapshot dirs are unaffected. Best-effort: never
+        raises.
+
+        When a :class:`SnapshotSizeScanner` is wired in (lifecycle on a
+        SnapshotSizeCapable provider), the scan + emit move OFF this step
+        path: this method assigns the per-sandbox ``pause_seq`` and hands the
+        request to the scanner's background drain thread (a non-blocking enqueue
+        -- no scan, no I/O wait here). Without a scanner, falls back to the
+        synchronous incremental scan + series write.
+        """
+        if self.cfg.replay_mode != "lifecycle":
+            return
+        if not isinstance(self.provider, SnapshotSizeCapable):
+            return
+        self._pause_seq += 1
+        if self.scanner is not None:
+            self.scanner.request(self.state, self._pause_seq)  # non-blocking; drained off-path
+            return
+        # Fallback (no scanner): synchronous incremental scan + write.
+        try:
+            snap = self.provider.snapshot_sizes(self.state)
+        except Exception as e:  # noqa: BLE001 - best-effort, never fail the slice
+            logger.warning(f"[Sandbox{self.state.index}] snapshot_sizes failed: {str(e)[:80]}")
+            return
+        if snap is None:
+            return
+        self._series_write(
+            {
+                "event": "snapshot_size",
+                "sandbox_index": self.state.index,
+                "sandbox_id": getattr(self.state, "id", None),
+                "timestamp": time.time(),
+                "pause_seq": self._pause_seq,
+                **snap,
+            }
+        )
+
+    def _lifecycle_call_with_retry(self, operation: str, fn, *, rate_wait: bool = True) -> tuple[float, float, float]:
+        """Run a lifecycle call with transient-error retry (G3) + retry events.
+
+        Returns ``(rate_pacing_wait_sec, inflight_wait_sec, api_sec)``. Rate
+        pacing is done ONCE (when ``rate_wait``) before the retry loop, NOT per
+        attempt -- a transient retry re-acquires only the inflight fuse, never
+        re-paying the 1/qps delay (the previous per-attempt ``slot()`` re-paid
+        it on every retry, inflating ``time_lost_to_retry`` and the queue-wait
+        metrics). For resume the caller does the PRE-lease ``time_wait`` itself
+        and passes ``rate_wait=False``; for pause ``rate_wait=True`` (IN-lease).
+        Emits ``retry_queued`` / ``retry_recovered`` / ``retry_exhausted`` events;
+        series writes are best-effort. ``ShutdownInterrupted`` (BaseException)
+        bypasses the ``except Exception`` retry path, so no ``retry_exhausted``
+        is emitted for a shutdown.
+        """
+        retries = self.cfg.replay_lifecycle_retries
+        rate_pacing_wait = 0.0
+        if rate_wait and self.admission is not None and self.admission.qps is not None:
+            rate_pacing_wait = self.admission.qps.time_wait(operation)
+        total_inflight = 0.0
+        total_api = 0.0
+        had_transient = False
+        last_exc: BaseException | None = None
+        for attempt in range(retries + 1):
+            inflight_wait = 0.0
+            api = 0.0
+            try:
+                if self.admission is not None and self.admission.qps is not None:
+                    # Inflight fuse around the API only (rate pacing was done
+                    # once above; the permit is released even if fn() raises).
+                    ctx = self.admission.qps.inflight(operation)
+                    ctx.__enter__()
+                    inflight_wait = ctx.wait_sec
+                    try:
+                        t_api_start = time.perf_counter()
+                        try:
+                            fn()
+                        finally:
+                            api = time.perf_counter() - t_api_start
+                    finally:
+                        ctx.__exit__(None, None, None)
+                else:
+                    t_api_start = time.perf_counter()
+                    try:
+                        fn()
+                    finally:
+                        api = time.perf_counter() - t_api_start
+                total_inflight += inflight_wait
+                total_api += api
+                if had_transient:
+                    self._series_write(
+                        {
+                            "event": "retry_recovered",
+                            "sandbox_index": self.state.index,
+                            "timestamp": time.time(),
+                            "operation": operation,
+                            "attempt": attempt + 1,
+                            "total_rate_pacing_wait_sec": rate_pacing_wait,
+                            "total_inflight_wait_sec": total_inflight,
+                            "total_api_sec": total_api,
+                        }
+                    )
+                return rate_pacing_wait, total_inflight, total_api
+            except Exception as e:  # noqa: BLE001 - classify + retry/re-raise
+                # Account this attempt's waits even on failure (the inflight
+                # permit was held + the partial API time ran before the raise).
+                total_inflight += inflight_wait
+                total_api += api
+                last_exc = e
+                transient = is_transient_sandbox_error(e)
+                if attempt >= retries or not transient:
+                    self._series_write(
+                        {
+                            "event": "retry_exhausted",
+                            "sandbox_index": self.state.index,
+                            "timestamp": time.time(),
+                            "operation": operation,
+                            "attempt": attempt + 1,
+                            "retryable": transient,
+                            "error_type": type(e).__name__,
+                            "error": str(e)[:120],
+                        }
+                    )
+                    raise
+                had_transient = True
+                self._series_write(
+                    {
+                        "event": "retry_queued",
+                        "sandbox_index": self.state.index,
+                        "timestamp": time.time(),
+                        "operation": operation,
+                        "attempt": attempt + 1,
+                        "max_attempts": retries + 1,
+                        "error_type": type(e).__name__,
+                        "error": str(e)[:120],
+                        "accumulated_rate_pacing_wait_sec": rate_pacing_wait,
+                        "accumulated_inflight_wait_sec": total_inflight,
+                        "accumulated_api_sec": total_api,
+                    }
+                )
+                # Advance the report accumulator; time_lost = all wait + api
+                # accumulated across attempts so far (rate pacing is paid once).
+                self.state.replay_metrics.record_retry_event(
+                    "retry_queued",
+                    operation=operation,
+                    time_lost_sec=rate_pacing_wait + total_inflight + total_api,
+                )
+                logger.warning(
+                    f"[Sandbox{self.state.index}] {operation} transient error "
+                    f"(attempt {attempt + 1}/{retries + 1}): {str(e)[:80]}; retrying"
+                )
+        if last_exc is not None:
+            raise last_exc
+        return 0.0, 0.0, 0.0  # pragma: no cover - unreachable
+
+    def _init_lifecycle(self) -> None:
+        """One-time transition into the paused state before the first slice.
+
+        Pre-pauses a running sandbox so step 1's resume is a true snapshot
+        restore (not a reattach). Idempotent via ``state.lifecycle_paused`` so
+        a fresh ReplayRoundRunner per round / multiple trajectories don't
+        double-pause. exec_only: no-op. The initial-pause cost is recorded
+        separately (``initial_pause_sec``), never folded into a per-step
+        ``resume_sec``.
+
+        Only lifecycle performs the initial pause (guard is ``== "lifecycle"``):
+        exec_ephemeral's per-trajectory ``create_one`` yields a fresh sandbox,
+        so its first ``_resume`` is whatever the provider defines for a
+        freshly-created sandbox (the contract is that ``create_one`` returns a
+        sandbox ready for ``resume``; whether resume is a no-op or a real
+        restore is provider-defined and out of scope for the runner).
+        """
+        if self.cfg.replay_mode == "lifecycle" and not self.state.lifecycle_paused:
+            pause_start_ts = time.time()
+            t0 = time.perf_counter()
+            self.provider.pause(self.state)
+            pause_elapsed = time.perf_counter() - t0
+            pause_end_ts = time.time()
+            self.state.replay_metrics.initial_pause_sec = pause_elapsed
+            self.state.lifecycle_paused = True
+            if self.series is not None:
+                self.series.write(
+                    {
+                        "event": "initial_pause",
+                        "sandbox_index": self.state.index,
+                        "pause_start": pause_start_ts,
+                        "pause_end": pause_end_ts,
+                        "initial_pause_sec": pause_elapsed,
+                    }
+                )
+            logger.info(
+                f"[Sandbox{self.state.index}] lifecycle initial pause "
+                f"{self.state.replay_metrics.initial_pause_sec:.3f}s"
+            )
+
+    def _probe_ready(self) -> float:
+        """Run ``true`` until the sandbox command plane is ready. Not QPS-gated.
+
+        Returns total wall time of the probe loop. Exhaustion raises
+        SandboxInfrastructureError -> the caller synthesizes a failed slice.
+        """
+        started = time.perf_counter()
+        for _ in range(READY_PROBE_MAX_ATTEMPTS):
+            try:
+                result = self.provider.exec(self.state, "true", timeout=READY_PROBE_TIMEOUT)
+                if result.exit_code == 0:
+                    return time.perf_counter() - started
+            except Exception as e:
+                logger.debug(f"[Sandbox{self.state.index}] ready-probe attempt failed: {e}")
+        raise SandboxInfrastructureError(
+            f"Sandbox {self.state.index} command service did not become ready "
+            f"after {READY_PROBE_MAX_ATTEMPTS} attempts"
+        )
+
+    def _execute(self, step: ReplayStep) -> CommandResult:
+        """Exec the recorded action verbatim -- cwd/env via the exec contract.
+
+        G1: in lifecycle mode the exec dispatch is QPS-gated under the
+        ``"command"`` bucket but with ``hold_inflight=False`` -- the QPS time-wait
+        smooths the burst of command dispatches, but no inflight permit is held
+        during the body. The reference's ``command_start_slot`` rate-limits only
+        stream establishment and releases before the command body runs; bench_core
+        has no stream handle (``provider.exec`` is a monolithic blocking RPC), so
+        holding an inflight permit for the whole body would serialize long
+        commands behind the cap. exec_only and exec_ephemeral are ungated (no
+        admission controller).
+        """
+        if self.admission is not None and self.admission.qps is not None:
+            with self.admission.qps.slot("command", hold_inflight=False):
+                result = self.provider.exec(
+                    self.state,
+                    step.action,
+                    cwd=self.cfg.replay_workdir or None,
+                    env=self.cfg.replay_env or None,
+                    timeout=self.cfg.replay_action_timeout,
+                )
+        else:
+            result = self.provider.exec(
+                self.state,
+                step.action,
+                cwd=self.cfg.replay_workdir or None,
+                env=self.cfg.replay_env or None,
+                timeout=self.cfg.replay_action_timeout,
+            )
+        if result.exit_code != 0:
+            # Non-zero exits were previously invisible: metrics counted them
+            # but neither the action nor its stderr reached any log. DEBUG
+            # (not WARNING): replayed traces legitimately contain non-zero
+            # steps -- the detail matters only while debugging a run.
+            logger.debug(
+                "[Sandbox%d] step %d exit=%d action=%r stderr=%r",
+                self.state.index,
+                step.index,
+                result.exit_code,
+                step.action[:120],
+                (result.stderr or "")[-300:],
+            )
+        return result
+
+    # --- shared metric recording ---
+    def _record_step(
+        self,
+        step_result: StepResult,
+        *,
+        timed_out: bool,
+        actual_delay: float,
+        trajectory_complete: bool,
+        trajectory_id: str = "",
+    ) -> None:
+        """Record one step's metrics into ``self.state.replay_metrics``."""
+        # A provider may surface a command timeout as exit_code=TIMEOUT_EXIT_CODE
+        # (the E2B SDK raises on request timeout; the provider converts it to a
+        # CommandResult so the slice continues). Treat that as timed_out here so
+        # the timeout metric bucket and the success flag stay accurate.
+        if step_result.exit_code == TIMEOUT_EXIT_CODE:
+            timed_out = True
+        success = step_result.exit_code == 0 and not timed_out
+        self.state.replay_metrics.add(
+            latency=step_result.exec_elapsed_sec,
+            success=success,
+            timeout=timed_out,
+            step_times={step_result.action_type: step_result.exec_elapsed_sec},
+            action_type=step_result.action_type,
+            requested_delay=step_result.requested_delay_sec,
+            actual_delay=actual_delay,
+            trajectory_complete=trajectory_complete,
+            resume_sec=step_result.resume_sec,
+            pause_sec=step_result.pause_sec,
+            slice_total_sec=step_result.slice_total_sec,
+            resume_api_sec=step_result.resume_api_sec,
+            resume_ready_wait_sec=step_result.resume_ready_wait_sec,
+            slot_contention_wait_sec=step_result.slot_contention_wait_sec,
+            pause_api_sec=step_result.pause_api_sec,
+            resume_rate_pacing_wait_sec=step_result.resume_rate_pacing_wait_sec,
+            pause_rate_pacing_wait_sec=step_result.pause_rate_pacing_wait_sec,
+            running_slot_held_sec=step_result.running_slot_held_sec,
+            interaction_total_sec=step_result.interaction_total_sec,
+            natural_delay_sec=step_result.natural_delay_sec,
+            capacity_wait_sec=step_result.capacity_wait_sec,
+            resume_inflight_wait_sec=step_result.resume_inflight_wait_sec,
+            pause_inflight_wait_sec=step_result.pause_inflight_wait_sec,
+        )
+        self.state.update_last_task_time(time.time())
+
+    def _sleep_delay(self, step: ReplayStep) -> None:
+        """Honour the recorded think-time gap, scaled. First step's delay applies."""
+        gap = step.delay_time_sec * self.cfg.replay_delay_scale
+        if gap > 0 and not self.stop_event.is_set():
+            self.stop_event.wait(gap)
+
+    # --- exec_ephemeral (G8): per-trajectory create -> steps -> kill ---
+    def _wait_for_launch_turn(self) -> None:
+        """G5: no-catch-up pacing of trajectory starts.
+
+        ``next_launch_at = max(now, next_launch_at) + interval`` -- never let
+        multiple workers start in the same instant to "catch up". The shared
+        :class:`LaunchPacer` owns the lock + deadline cell so every worker in
+        the fleet sees the same advancing deadline. No-op when the interval is
+        0 or no pacer is wired (the spine wires one for exec_ephemeral).
+        """
+        if self._launch_pacer is None:
+            return
+        interval = self.cfg.replay_launch_interval_sec or 0.0
+        if interval <= 0:
+            return
+        wait_until = self._launch_pacer.claim_turn(interval)
+        delay = wait_until - time.monotonic()
+        if delay > 0 and not self.stop_event.is_set():
+            self.stop_event.wait(delay)
+
+    def _begin_pass(self) -> None:
+        """Pass-identity hook: stamp THIS pass's ``round_id`` before any event.
+
+        The series run key ``(trajectory_id, sandbox_index, round_id)`` only
+        separates repeated passes of one trajectory on one slot when each pass
+        carries a distinct ``round_id``. Both pass entry points
+        (:meth:`_run_trajectory`, :meth:`ReplayTaskRunner._replay_trajectory`)
+        call this as their first statement, so every fixed-mode branch —
+        current or future — gets per-pass run identity structurally instead of
+        each scheduling loop having to remember to set it.
+
+        Base default is a no-op: the round runner's ``round_id`` comes from
+        ``ctx`` (a fresh instance per round already has a distinct id), and
+        warmup emits no trajectory-keyed events. The fixed runner
+        (:class:`ReplayTaskRunner`) is one long-lived instance, so it overrides
+        this with an advancing per-slot pass ordinal.
+        """
+
+    def _run_trajectory(self, traj: Trajectory) -> None:
+        """Per-trajectory create_one -> (resume->exec->pause steps) -> kill_one (G8).
+
+        exec_ephemeral's per-trajectory cycle: ``create_one`` yields a FRESH
+        sandbox, the trajectory's steps replay as slices under it, then
+        ``kill_one`` destroys it -- the customer's spin-up -> run -> kill
+        model. No running-slot lease exists on this path: the spine builds the
+        Admission controller only for lifecycle, so the ephemeral path is
+        admission-free by construction (create/kill run ungated; only the
+        traffic-light LaunchPacer paces create starts).
+        """
+        self._begin_pass()
+        self.state.replay_metrics._mark_attempt()
+        self._prev_pause_end_monotonic = None  # fresh sandbox: no prior pause (G2)
+        # kill_one flips is_alive=False at the end of the PREVIOUS trajectory
+        # (correct: the per-trajectory sandbox is dead, and stats_collector /
+        # check_alive rely on that). Re-establish slot liveness here so the
+        # step-loop below (guarded by is_alive) runs THIS trajectory's steps.
+        # The M-loop continuation is gated by _slot_continuable() (persistent
+        # create-failure), NOT is_alive.
+        self.state.is_alive = True
+        self._wait_for_launch_turn()
+        # G1: single create call, no retry.
+        t0 = time.perf_counter()
+        try:
+            self.provider.create_one(
+                self.state.index, template=traj.template, metadata={"trajectory_id": traj.instance_id}
+            )
+        except Exception as e:
+            logger.error(f"[Sandbox{self.state.index}] trajectory {traj.instance_id} create failed: {str(e)[:120]}")
+            self._series_write(
+                {
+                    "event": "trajectory_create",
+                    "sandbox_index": self.state.index,
+                    "timestamp": time.time(),
+                    "trajectory_id": traj.instance_id,
+                    "round_id": getattr(self, "round_id", None),
+                    "create_sec": 0.0,
+                    "success": False,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:120],
+                }
+            )
+            self._record_trajectory_failure(traj, create_sec=0.0, kill_sec=0.0)
+            return
+        create_sec = time.perf_counter() - t0
+        self._series_write(
+            {
+                "event": "trajectory_create",
+                "sandbox_index": self.state.index,
+                "timestamp": time.time(),
+                "trajectory_id": traj.instance_id,
+                "round_id": getattr(self, "round_id", None),
+                "create_sec": create_sec,
+                "success": True,
+            }
+        )
+        self._init_lifecycle()  # no-op for exec_ephemeral (guard is == "lifecycle")
+        prev_slice_end = time.perf_counter()
+        completed = True
+        for step in traj.steps:
+            if self.stop_event.is_set() or not self.state.is_alive:
+                completed = False
+                break
+            self._sleep_delay(step)
+            if self.stop_event.is_set():
+                completed = False
+                break
+            actual_delay = time.perf_counter() - prev_slice_end
+            timed_out = False
+            try:
+                sr = self._run_slice(step, trajectory_id=traj.instance_id)
+            except Exception as e:
+                msg = str(e).lower()
+                timed_out = "timed out" in msg or "context deadline exceeded" in msg
+                sr = self._failed_step_result(step)
+                if self.series is not None:
+                    self.series.write(self._failed_series_record(step, traj.instance_id, timed_out))
+                logger.error(f"[Sandbox{self.state.index}] step {step.index} exception: {msg[:120]}")
+            prev_slice_end = time.perf_counter()
+            self._record_step(
+                sr,
+                timed_out=timed_out,
+                actual_delay=actual_delay,
+                trajectory_complete=False,
+                trajectory_id=traj.instance_id,
+            )
+            if sr.exit_code != 0 or timed_out:
+                if self.cfg.replay_stop_on_error:
+                    completed = False
+                    break
+        # Mirror the non-ephemeral paths: a trajectory whose every step ran to
+        # the end (no stop_event / offline / stop_on_error abort) counts as one
+        # completion, regardless of kill outcome.
+        if completed and not self.stop_event.is_set():
+            self.state.replay_metrics._mark_completion()
+        # G1: single kill call (torn-down cleanup on success; see PR #253).
+        t0 = time.perf_counter()
+        try:
+            self.provider.kill_one(self.state)
+        except Exception as e:
+            logger.warning(f"[Sandbox{self.state.index}] kill failed: {str(e)[:80]}")
+            kill_sec = time.perf_counter() - t0
+            self._series_write(
+                {
+                    "event": "trajectory_kill",
+                    "sandbox_index": self.state.index,
+                    "timestamp": time.time(),
+                    "trajectory_id": traj.instance_id,
+                    "round_id": getattr(self, "round_id", None),
+                    "kill_sec": kill_sec,
+                    "success": False,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:120],
+                }
+            )
+        else:
+            kill_sec = time.perf_counter() - t0
+            self._series_write(
+                {
+                    "event": "trajectory_kill",
+                    "sandbox_index": self.state.index,
+                    "timestamp": time.time(),
+                    "trajectory_id": traj.instance_id,
+                    "round_id": getattr(self, "round_id", None),
+                    "kill_sec": kill_sec,
+                    "success": True,
+                }
+            )
+
+    def _failed_step_result(self, step: ReplayStep) -> StepResult:
+        """Synthesize a zero-duration failed StepResult for an exception path."""
+        return StepResult(
+            step_index=step.index,
+            action_type=step.action_type,
+            exit_code=1,
+            exec_elapsed_sec=0.0,
+            slice_total_sec=0.0,
+            resume_sec=0.0,
+            pause_sec=0.0,
+            requested_delay_sec=step.delay_time_sec,
+        )
+
+    def _failed_series_record(self, step: ReplayStep, trajectory_id: str, timed_out: bool) -> dict:
+        """Series record for a step that threw (slice_failed=True, honestly zeroed)."""
+        return {
+            "event": "step",
+            "sandbox_index": self.state.index,
+            "trajectory_id": trajectory_id,
+            "round_id": getattr(self, "round_id", None),
+            "step_index": step.index,
+            "action_type": step.action_type,
+            "resume_start": 0.0,
+            "resume_end": 0.0,
+            "exec_start": 0.0,
+            "exec_end": 0.0,
+            "pause_start": 0.0,
+            "pause_end": 0.0,
+            "resume_sec": 0.0,
+            "exec_sec": 0.0,
+            "pause_sec": 0.0,
+            "slice_total_sec": 0.0,
+            "exit_code": 1,
+            "timed_out": timed_out,
+            "slice_failed": True,
+            "slot_contention_wait_sec": 0.0,
+            "resume_rate_pacing_wait_sec": 0.0,
+            "resume_api_sec": 0.0,
+            "resume_ready_wait_sec": 0.0,
+            "pause_rate_pacing_wait_sec": 0.0,
+            "pause_api_sec": 0.0,
+            "running_slot_held_sec": 0.0,
+            "interaction_total_sec": 0.0,
+            # Wait-decoupling components: honestly zeroed on the failure path.
+            "natural_delay_sec": 0.0,
+            "capacity_wait_sec": 0.0,
+            "resume_inflight_wait_sec": 0.0,
+            "pause_inflight_wait_sec": 0.0,
+            "rate_pacing_wait_sec": 0.0,
+            "inflight_wait_sec": 0.0,
+            "action": _compact_action(step.action),
+        }
+
+    # Consecutive trajectory create-failures after which an ephemeral slot gives
+    # up -- the ONLY legit "stop this slot early" signal in ephemeral modes.
+    # ``is_alive`` is NOT that signal there: ``kill_one`` flips it False at the
+    # end of every trajectory (the per-trajectory sandbox is genuinely dead).
+    # Gating the per-sandbox M-loop on is_alive would exit after trajectory 1,
+    # defeating ``replay.multiplier`` (1 trajectory ran, not M).
+    # ``consecutive_failures`` is monotonic (never reset), so >= threshold is a
+    # stable latch -- no separate flag needed.
+    _TRAJECTORY_GIVEUP_THRESHOLD: int = 3
+
+    def _slot_continuable(self) -> bool:
+        """Ephemeral slot continuation gate (checked between trajectories).
+
+        True unless the slot hit persistent create-failure. ``stop_event`` and
+        ``run < target`` are checked in the loop condition itself; this only
+        answers "should this slot run another trajectory after a kill_one".
+        """
+        return self.state.consecutive_failures < self._TRAJECTORY_GIVEUP_THRESHOLD
+
+    def _record_trajectory_failure(self, traj: Trajectory, *, create_sec: float, kill_sec: float) -> None:
+        """Record a failed trajectory (create failed before any step)."""
+        if self.series is not None:
+            self.series.write(
+                {
+                    "event": "trajectory_failed",
+                    "sandbox_index": self.state.index,
+                    "trajectory_id": traj.instance_id,
+                    "round_id": getattr(self, "round_id", None),
+                    "create_sec": create_sec,
+                    "kill_sec": kill_sec,
+                }
+            )
+        self.state.replay_metrics.last_error = "trajectory create failed"
+        self.state.consecutive_failures += 1
+        if self.state.consecutive_failures >= self._TRAJECTORY_GIVEUP_THRESHOLD:
+            self.state.is_alive = False
+
+
+# Imported last: the subclasses need ReplayBaseRunner above, and importing
+# them registers the ``replay`` workflow in the registry.
+try:  # pragma: no cover - present once the concrete runners are imported
+    from .replay_runners import ReplayRoundRunner, ReplayTaskRunner, ReplayWarmupRunner  # noqa: E402,F401
+except ImportError:  # the subclasses live in a later layer of the package
+    pass
