@@ -42,6 +42,7 @@ from .replay_types import (
     TIMEOUT_EXIT_CODE,
     SandboxInfrastructureError,
     StepResult,
+    _affinity_pool,
     _compact_action,
 )
 
@@ -952,7 +953,4 @@ class ReplayBaseRunner(TaskRunner):
 
 # Imported last: the subclasses need ReplayBaseRunner above, and importing
 # them registers the ``replay`` workflow in the registry.
-try:  # pragma: no cover - present once the concrete runners are imported
-    from .replay_runners import ReplayRoundRunner, ReplayTaskRunner, ReplayWarmupRunner  # noqa: E402,F401
-except ImportError:  # the subclasses live in a later layer of the package
-    pass
+from .replay_runners import ReplayRoundRunner, ReplayTaskRunner, ReplayWarmupRunner  # noqa: E402,F401
