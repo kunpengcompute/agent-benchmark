@@ -37,6 +37,7 @@ cubesandbox = ["cubesandbox>=0.7.0"]
 
 [project.scripts]
 bench-core = "bench_core.bench_cli:main"
+oversub-bench = "bench_core.oversub_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
