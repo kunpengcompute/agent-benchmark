@@ -1,132 +1,119 @@
 # agent-benchmark
 
-使用内置 55 条 Agent 轨迹，在 AgentENV 上对比持续运行与暂停/恢复模式的耗时和资源开销。以下命令均在仓库根目录执行。
+Agent 负载压测套件：同一份压力配置通过 `--provider` 在 AENV / E2B / Docker / 本地 `fake`
+后端之间切换，采集创建与执行耗时、主机资源指标；超分扫描驱动按不同超分比自动跑一组 trial
+并输出退化曲线。以下命令均在仓库根目录执行。
 
-## 安装
+| 目录 | 内容 | 从哪看 |
+| --- | --- | --- |
+| `src/` | `bench-core` 内核（5 个后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
+| `artifacts/` | 55 条轨迹、镜像清单、轨迹 → 模板映射 | [数据集与模板](#数据集与模板) |
+| `agent_replay/` | 早期回放实现，保留仅供参考，后续会 deprecate | — |
+| `docs/guide/` | 中英文使用指南 | [文档](#文档) |
+
+## 数据集与模板
+
+仓库自带一套可直接用的负载：55 条 Agent 轨迹，以及它们对应的镜像与模板映射。
+
+- `artifacts/traces/replays/`：55 条轨迹（`.json` / `.traj`）。
+- `artifacts/traces/image-map.json`：每条轨迹对应的 template 名。
+- `artifacts/images/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
+
+**模板**就是把这些镜像灌进 AgentENV 后得到的一份快照。在 AgentENV 主机上装 Docker 和
+`aenv` CLI（先 `aenv auth` 配好服务地址与密钥），并保证目标 Registry 已启动、允许推送且
+AgentENV 能访问，然后：
+
+```bash
+bash artifacts/images/download-images.sh              # 按本机架构下载对应的 55 个镜像
+python artifacts/images/build_template.py --dry-run   # 预览将执行的命令
+python artifacts/images/build_template.py             # 构建全部 55 个模板
+```
+
+`build_template.py` 读本地当前架构的镜像，并校验与 `image-map.json` 一致。常用参数：
+`--template` 只建指定模板（可重复）、`--registry` 改推送前缀（默认
+`127.0.0.1:5000/swerebench`）、`--timeout` 单模板等待秒数（默认 1800）、`--list` 只列清单。
+
+> 只有 AENV 路径需要模板；`fake` 与 `docker` 后端不需要，可以直接跳到下面的快速开始。
+
+## 快速开始
 
 需要 Python 3.11+。
+
+### 1. 冒烟：一条命令，不需要任何后端（约 1 分钟）
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r agent_replay/requirements.txt
+python -m pip install -e .        # e2b 是核心依赖（pin 2.46.0），随包安装
+
+bench-core --provider fake --config config/common/browser.yaml --create-only -n 1
 ```
 
-## 数据集与服务
+`fake` 后端在内存里模拟沙箱：**不需要 SDK、不需要服务器、不需要模板、不需要轨迹**。这条
+命令能跑通，说明内核、CLI、配置解析都已就绪，剩下的只是接一个真后端。
 
-轨迹、镜像和映射已配好，直接使用：
+### 2. AgentENV 小规模验证（推荐的真后端路径）
 
-- `artifacts/traces/replays/`：55 条轨迹。
-- `artifacts/traces/image-map.json`：轨迹对应的 template 名称。
-- `artifacts/images/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
-
-真实压测需要启动 AgentENV，并按下节构建映射中的 55 个模板。回放默认连接本机服务并读取默认密钥文件，例如：
+前提：上一节的模板已建好，AgentENV 服务已启动。改 `config/common/replay-ephemeral.yaml`
+的 `aenv:` 块三处：`template` 写上一节建好的模板名；`E2B_ACCESS_TOKEN` / `E2B_API_KEY`
+贴上密钥（保留 `your_*_here` 占位符则回落到 `~/.e2b/config.json`）；`E2B_API_URL` /
+`E2B_SANDBOX_URL` 指向服务端。然后跑一个小集群：
 
 ```bash
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_API_KEY_FILE=/var/lib/aenv/secrets/api-key
+bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --test-duration 600
 ```
 
-服务部署不同时调整这两个值，也可用 `E2B_API_KEY` 直接提供密钥。
+`-n 8` 是必须的：该配置默认声明 384 个沙箱，不加会按 384 个去申请。跑通后 `-n`、
+`--test-duration` 随规模放大即可。
 
-## 构建 AENV 模板
+第一次只求连通性时，把 `replay.delay_scale` 临时改成 `0.02`（思考时间压缩 50 倍，几十秒
+就能看到 `success`），出真实数字前必须还原 `1.0`。缩放为 1.0 时轨迹自带思考时间——仓库
+这 55 条里最短一条约 3.5 分钟、中位约 20 分钟——窗口短于一条轨迹的时长时步骤照跑、但
+`success` 是 0：不是没跑起来，是没跑完。
 
-在 AgentENV 主机上安装 Docker 和 `aenv` CLI，并用 `aenv auth` 配置服务地址和密钥。目标 Registry 须已启动、允许推送且能被 AgentENV 访问；默认使用 `127.0.0.1:5000/swerebench`。
+轨迹默认就读上一节那 55 条：`replay-ephemeral.yaml` 的 `replay.trajectory_dir` /
+`replay.template_manifest` 已指向 `artifacts/traces/replays` 与
+`artifacts/traces/image-map.json`，模板名与上一节构建出来的名字一一对应，无需改任何东西。
+换成自己的数据时改这两个键；`template_manifest` 不设则所有轨迹退回 `aenv.template`。
+
+手边没有 AgentENV 时，可以先用本地 docker 做同样的连通性验证：`pip install docker`，
+把 `config/common/docker.yaml` 的 `docker.image` 换成本地已有镜像，再跑
+`bench-core --provider docker --config config/common/docker.yaml --create-only -n 2`。
+
+### 3. 超分扫描：按超分比出一组曲线
 
 ```bash
-# 自动识别本机架构，只下载对应的 55 个镜像
-bash artifacts/images/download-images.sh
-
-# 预览模板构建命令
-python artifacts/images/build_template.py --dry-run
-
-# 按本机架构构建全部 55 个模板
-python artifacts/images/build_template.py
+oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.yaml
 ```
 
-下载和构建分开执行。`build_template.py` 读取本地当前架构镜像，校验架构对应 `image-map.json`。
+在 sweep 配置里改 `ratios` 调超分比、改 `test_duration` 调每轮时间窗（真实曲线至少 2 小时，
+内网长跑用过 600000 秒），在 base 配置的 `monitor.skip` 里关掉不需要的采集。先加 `--dry-run`
+可以只看它生成什么、不创建沙箱。五步逐条说明见
+[oversub-bench 指南 §1.1](docs/guide/oversub-bench-usage-zh.md)。
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--arch` | 本机架构 | `arm64` 或 `x86`，须与 AgentENV 主机一致。 |
-| `--registry` | `127.0.0.1:5000/swerebench` | 推送目标前缀，不带 `http://`；远程 Registry 按需先执行 `docker login`。 |
-| `--template` | 全部 55 个 | 指定映射中的模板名，可重复传入。 |
-| `--timeout` | `1800` | 每个模板构建的等待秒数；超时后先检查服务端状态。 |
-| `--dry-run` | 关闭 | 仅打印命令，不查询或修改服务。 |
-| `--list` | 关闭 | 仅列出轨迹、模板名和源镜像。 |
+## bench-core 套件
 
-## 监控环境变量
+- **后端**：`fake`（内存，无 SDK）、`docker`、`e2b`、`aenv`（e2b SDK 打 AENV 服务端，带
+  pause/resume）、`cubesandbox`。切后端只换 `--provider`，配置文件的共享段不变。
+- **工作流**：browser、coding、document，以及轨迹回放 `replay`
+  （`exec_only` / `lifecycle` / `exec_ephemeral`）。
+- **阶段阶梯**：`--create-only` / `--detect` 都会留下运行中的沙箱，收尾用 `--cleanup`。从
+  `fake` → `docker` → `e2b`/`aenv` 逐级验证，比一上来就连生产后端省时间。
+- **主机资源采集**交给外部 `vm-monitor` 程序；没装时内核跳过主机采集，任务级指标照常产出。
 
-自动监控应在 AgentENV 主机运行。在启动回放前设置以下变量，`continuous` 和 `pause-resume` 每轮自动启动的监控都会继承这些配置；直接运行 `agent_replay/observability/spotbox_monitor.py` 时同样生效。
+## 文档
 
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `SNAP_BASE` | `/var/lib/aenv/persisted-sandboxes/artifacts` | 服务端实际保存快照的 artifacts 目录，采集器读取其下的 `<sandbox_id>/<generation>/`；未设置或为空时使用默认值。 |
-| `DISKS` | `sda,sdb,sdc` | 逗号分隔的磁盘设备名，对应 `/sys/block/<设备名>/stat`，不带 `/dev/` 前缀；忽略两侧空格和空项，设置为空字符串可关闭磁盘指标采集。不存在的设备会跳过。 |
+| 文档 | 内容 |
+| --- | --- |
+| [bench-core 使用指南（中文）](docs/guide/bench-core-usage-zh.md) | 安装、CLI、配置、后端、replay 模式、报告字段 |
+| [bench-core usage guide (EN)](docs/guide/bench-core-usage.md) | 英文同内容 |
+| [oversub-bench 使用指南（中文）](docs/guide/oversub-bench-usage-zh.md) | 五步上手、sweep 配置、读结果、故障排查 |
+| [oversub-bench usage guide (EN)](docs/guide/oversub-bench-usage.md) | 英文同内容 |
 
-例如：
+## 开发
 
 ```bash
-export SNAP_BASE=/var/lib/aenv/persisted-sandboxes/artifacts
-export DISKS=sda,sdb
+python -m pytest src/bench_core/tests src/env_provider/tests   # 内核与 provider
+python -m pytest                                               # 全量
+ruff check src config && ruff format --check src config
 ```
-
-## 运行
-
-暂停/恢复模式，循环使用 55 条源轨迹组成 384 个任务，并发上限为 384，以下为运行示例，参数根据实际负载情况配置：
-
-```bash
-python -m agent_replay.runner bench \
-  --mode pause-resume --base-count 384 \
-  --trajectory-dir artifacts/traces/replays \
-  --image-map artifacts/traces/image-map.json \
-  --ratios 1 \
-  --command-timeout-continue \
-  --command-timeout-sec 300 \
-  --launch-interval-sec 0.2 \
-  --total-multiplier 2
-```
-
-持续运行对照：将 `--mode` 改为 `continuous`。`--base-count` 设置基础负载，`--ratios` 设置超分倍数，并发上限为两者乘积。重复实验时使用新的输出目录。
-
-## 参数与默认值
-
-下表列出 `python -m agent_replay.runner bench` 的全部参数。`--mode`、`--base-count`、`--trajectory-dir` 必填；其余可省略。时间单位均为秒，开关默认值见表。
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--mode` | 无，必填 | `pause-resume` 或 `continuous`。前者在轨迹等待期间暂停沙箱并释放 RUNNING 名额，后者持续占用名额。 |
-| `--base-count` | 无，必填 | 基础负载数量 N，正整数。两种模式的任务并发上限和 RUNNING 沙箱上限均为 k × N；pause/resume 不再额外限制 RUNNING 数。 |
-| `--trajectory-dir` | 无，必填 | 源轨迹目录，读取其中的 `.json`、`.traj` 文件。 |
-| `--image-map` | 不使用映射文件 | 轨迹到镜像/template 的 JSON 或 CSV 映射；省略时从轨迹内读取，显式映射优先。 |
-| `--ratios` | `1` | 超分倍数 k，逗号分隔，例如 `1,2,4`；正整数，自动去重并升序执行。 |
-| `--repeats` | `1` | 每个超分倍数执行的轮数，正整数。 |
-| `--total-multiplier` | `1` | 每轮任务数倍数 M；总任务数为 `M × k × N`（k 为超分倍数、N 为 `--base-count`），不改变并发上限。 |
-| `--launch-interval-sec` | `0` | 任务启动之间的最小间隔，可为非负小数；`0` 表示不额外间隔。 |
-| `--output-dir` | `agent_replay/report/runs/<日期-时间-微秒>-<mode>/` | 输出目录；默认位置相对于项目中的 `agent_replay` 目录，自动生成带时间戳的目录名。 |
-| `--api-url` | 环境变量 `E2B_API_URL`；未设置时为 `http://127.0.0.1:8000` | AgentENV 服务地址，命令行指定值优先。 |
-| `--api-key-file` | 环境变量 `E2B_API_KEY_FILE`；未设置时为 `/var/lib/aenv/secrets/api-key` | API 密钥文件路径；已有非空 `E2B_API_KEY` 环境变量时直接使用该密钥，不读取文件。 |
-| `--observability` / `--no-observability` | 开启 | 每轮自动启停监控并生成报告；continuous 生成 Excel、Markdown，pause/resume 额外生成 PNG。关闭时跳过采集和报告；dry-run 和结果复用不重复执行。 |
-| `--observability-interval-sec` | `1.0` | 主机指标采样间隔（秒），必须为有限正数；沙箱列表轮询最短间隔仍为 1 秒。 |
-| `--command-timeout-sec` | `300` | 命令超时秒数；`0` 表示关闭命令超时。超时前等待计入命令耗时，超时后的终止和日志处理单独统计。 |
-| `--request-timeout-sec` | `120` | 创建、暂停、恢复、删除等沙箱 API 请求的超时，正整数；命令请求使用 `--command-timeout-sec`。 |
-| `--sandbox-timeout-sec` | `86400`（24 小时） | 创建/恢复时传入的沙箱生存超时时间，正整数；与单条命令超时不同。 |
-| `--command-timeout-continue` | 关闭 | 命令超时后继续执行该轨迹的后续命令；默认超时即停止当前轨迹。 |
-| `--event-loop` | `uvloop` | 回放事件循环，支持 `asyncio`、`uvloop`；仅在最外层选择，两组测试需使用独立输出目录。 |
-| `--stop-on-error` | 关闭 | 普通命令非零退出或普通命令 SDK 异常时停止当前轨迹；默认记录失败并继续。超时是否继续由 `--command-timeout-continue` 控制。 |
-| `--stop-on-failure` | 关闭 | 某轮未通过完整性、回放或清理检查时，不再执行后续轮次；普通业务命令非零退出不一定使该轮失败。 |
-| `--create-retries` | `1` | 创建遇到可安全重试的错误时，最多额外重试次数；`0` 表示不重试，结果不确定的创建不会盲目重复。 |
-| `--resume-retries` | `2` | 恢复遇到可重试错误时，最多额外重试次数；`0` 表示不重试。仅用于 `pause-resume`，`continuous` 不接受此参数。 |
-| `--cooldown-sec` | `0` | 实际执行的轮次之间的等待间隔，可为非负小数。 |
-| `--setup-command` | 无 | 每条轨迹命令执行前添加的 shell 初始化命令。 |
-| `--dry-run` | 关闭 | 校验输入、镜像映射及任务计划并写入计划文件，不连接 AgentENV，不创建沙箱，也不要求 API 密钥。 |
-| `--mock` | 关闭 | 使用真实轨迹和本地成功沙箱，不执行命令、不读取凭据，自动关闭真实监控；保留轨迹延迟、日志与普通汇总。 |
-| `--skip-delays` | 关闭 | 跳过所有轨迹 delay_time，仍保留原始延迟字段；不跳过启动间隔、冷却时间或名额等待。 |
-| `--reuse` | 关闭 | 配置、任务计划及源轨迹哈希匹配时复用已有轮次结果；也可接着执行同目录的 dry-run 计划。已有未完成任务产物的轮次不能续跑，应换新目录。 |
-| `--skip-orphan-cleanup` | 关闭 | 跳过真实回放前后的遗留沙箱扫描与清理；默认执行清理。 |
-| `--verbose` | 关闭 | 启用 DEBUG 日志，并显示 SDK/HTTP 客户端的详细日志。 |
-| `-h`、`--help` | 不显示 | 显示参数帮助并退出。 |
-
-## 结果
-
-结果保存在 `--output-dir` 下：`ratio-*/repeat-*/tasks/` 存放逐任务日志及结果，`batch-summary.json` 汇总每轮结果。默认同时生成监控报告。
