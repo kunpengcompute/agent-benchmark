@@ -1,0 +1,265 @@
+"""Tests for the RoundRobinTaskManager orchestrator (host-agnostic).
+
+The round-robin manager rotates sandbox execution across rounds. Each round
+launches one one-shot ``TabOperationRunner`` per sandbox in the round's group;
+those runners exit after a single tab cycle, so a 2-round run with a
+:class:`FakeProvider` completes in milliseconds. The bench-core StatsCollector
+exposes a polymorphic ``set_round`` + ``_take_snapshot`` path that the manager
+calls directly, so we construct a collector without starting its background
+thread (only its ``start_time`` is seeded for sane elapsed values).
+"""
+from __future__ import annotations
+
+import threading
+import time
+
+from bench_core.config import KernelConfig
+from bench_core.observability.stats_collector import StatsCollector
+from bench_core.task_manager.round_robin import RoundRobinTaskManager
+from bench_core.schemas import BenchSandbox
+from bench_core.task_runner.browser import BrowserConfig
+from bench_core.task_runner.replay import ReplayConfig
+from env_provider import CreationMetrics, SandboxStatus
+from env_provider.fake import FakeProvider
+
+
+def _ready_sbx(i: int) -> BenchSandbox:
+    return BenchSandbox(
+        id=f"f-{i}",
+        index=i,
+        ready=True,
+        is_alive=True,
+        creation_metrics=CreationMetrics(status=SandboxStatus.READY),
+    )
+
+
+def _states(n: int) -> dict[int, BenchSandbox]:
+    return {i: _ready_sbx(i) for i in range(n)}
+
+
+def _new_stats(config: KernelConfig, states: dict[int, BenchSandbox]) -> StatsCollector:
+    """Collector with no background thread; start_time seeded for sane elapsed."""
+    stats = StatsCollector(config, states, "fake")
+    stats.start_time = time.time()
+    return stats
+
+
+class TestPrepareSandboxGroups:
+    def test_even_split(self):
+        config = KernelConfig(
+            workflow_type="browser", round_size=2, workflow_config=BrowserConfig(browser_urls=["http://x"])
+        )
+        states = _states(4)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), _new_stats(config, states), FakeProvider())
+
+        mgr._prepare_sandbox_groups()
+
+        assert len(mgr.sandbox_groups) == 2
+        assert [len(g) for g in mgr.sandbox_groups] == [2, 2]
+
+    def test_remainder_distributed_front_loaded(self):
+        config = KernelConfig(
+            workflow_type="browser", round_size=2, workflow_config=BrowserConfig(browser_urls=["http://x"])
+        )
+        states = _states(5)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), _new_stats(config, states), FakeProvider())
+
+        mgr._prepare_sandbox_groups()
+
+        assert len(mgr.sandbox_groups) == 3  # ceil(5/2)
+        assert [len(g) for g in mgr.sandbox_groups] == [2, 2, 1]
+
+    def test_empty_when_none_ready(self):
+        config = KernelConfig(
+            workflow_type="browser", round_size=2, workflow_config=BrowserConfig(browser_urls=["http://x"])
+        )
+        states = _states(3)
+        for s in states.values():
+            s.ready = False
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), _new_stats(config, states), FakeProvider())
+
+        mgr._prepare_sandbox_groups()
+
+        assert mgr.sandbox_groups == []
+        assert mgr.all_ready_states == []
+
+
+class TestCalculateRounds:
+    def test_explicit_round_count(self):
+        config = KernelConfig(
+            workflow_type="browser", round_count=3, workflow_config=BrowserConfig(browser_urls=["http://x"])
+        )
+        mgr = RoundRobinTaskManager(
+            config, _states(2), threading.Event(), _new_stats(config, _states(2)), FakeProvider()
+        )
+        assert mgr._calculate_rounds() == 3
+
+    def test_none_falls_back_to_large_sentinel(self):
+        # round_count=None relies on the duration check in run() to stop.
+        config = KernelConfig(
+            workflow_type="browser", round_count=None, workflow_config=BrowserConfig(browser_urls=["http://x"])
+        )
+        mgr = RoundRobinTaskManager(
+            config, _states(2), threading.Event(), _new_stats(config, _states(2)), FakeProvider()
+        )
+        assert mgr._calculate_rounds() == 10000
+
+
+class TestRunTwoRoundsBrowser:
+    def test_runs_two_rounds_and_records_baselines(self):
+        config = KernelConfig(
+            workflow_type="browser",
+            round_count=2,
+            round_size=2,
+            round_interval=0,
+            test_duration=60,
+            workflow_config=BrowserConfig(browser_urls=["http://x"]),
+        )
+        states = _states(5)
+        stats = _new_stats(config, states)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), stats, FakeProvider(count=5))
+
+        mgr.run()
+
+        # Last round_id executed was 1 (0-indexed).
+        assert mgr.current_round == 1
+        # Start baselines: round 0 (start), round 1 (end boundary of round 0),
+        # round 2 (end boundary of round 1). set_round is idempotent, so the
+        # _start_round call for round 1 does not overwrite the boundary.
+        assert {0, 1, 2} <= set(stats._round_start_totals.keys())
+        # Both rounds took at least one snapshot each in _stop_round.
+        assert 0 in stats.round_snapshots
+        assert 1 in stats.round_snapshots
+
+    def test_stops_on_stop_event(self):
+        config = KernelConfig(
+            workflow_type="browser",
+            round_count=5,
+            round_size=2,
+            round_interval=0,
+            test_duration=60,
+            workflow_config=BrowserConfig(browser_urls=["http://x"]),
+        )
+        states = _states(4)
+        stop = threading.Event()
+        stop.set()  # set before run -> loop exits at the first iteration guard
+        stats = _new_stats(config, states)
+        mgr = RoundRobinTaskManager(config, states, stop, stats, FakeProvider(count=4))
+
+        mgr.run()
+
+        # No round was ever started.
+        assert mgr.current_round == 0
+        assert stats._round_start_totals == {}
+
+    def test_no_groups_returns_early(self):
+        config = KernelConfig(
+            workflow_type="browser",
+            round_count=2,
+            round_size=2,
+            workflow_config=BrowserConfig(browser_urls=["http://x"]),
+        )
+        states = _states(3)
+        for s in states.values():
+            s.ready = False
+        stats = _new_stats(config, states)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), stats, FakeProvider(count=3))
+
+        mgr.run()
+
+        assert mgr.sandbox_groups == []
+        assert stats._round_start_totals == {}
+
+
+class TestRoundRobinReplayWorkflow:
+    def test_start_round_with_replay_workflow(self):
+        """Verify _start_round accepts workflow_type='replay' without raising ValueError."""
+        import pathlib
+
+        from bench_core.payload.replay_payload import reset_pool_cache
+
+        reset_pool_cache()
+        fixtures_dir = pathlib.Path(__file__).parent.parent / "fixtures" / "replay"
+
+        config = KernelConfig(
+            workflow_type="replay",
+            round_size=1,
+            round_count=1,
+            test_duration=5,
+            workflow_config=ReplayConfig(
+                replay_trajectory_dir=str(fixtures_dir),
+                replay_trajectory_glob="no_terminal.json",
+                replay_delay_scale=0.0,
+            ),
+        )
+        states = _states(1)
+        # Set workflow_type on the sandbox so task_metrics resolves correctly
+        states[0].workflow_type = "replay"
+        stats = _new_stats(config, states)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), stats, FakeProvider(count=1))
+
+        mgr._prepare_sandbox_groups()
+        assert len(mgr.sandbox_groups) == 1
+
+        # Should not raise ValueError about unsupported workflow_type
+        mgr._start_round(0)
+        assert len(mgr.active_runners) == 1
+        mgr._wait_for_active_runners()
+        mgr._stop_round()
+
+    def test_round_runner_join_ceiling_scales_with_test_duration(self):
+        """browser/coding/replay share a per-runner join ceiling of
+        ``test_duration + 60``, not the old hardcoded 120s. A 98-step replay
+        trajectory on a pinned core runs minutes; the old 120s ceiling silently
+        truncated it (steps after the cut unrecorded). Verify the ceiling scales
+        and that a runner still alive past it surfaces a WARNING (the signal
+        the old bug lacked).
+        """
+        import logging
+
+        config = KernelConfig(
+            workflow_type="replay",
+            round_size=1,
+            round_count=1,
+            test_duration=5,
+            workflow_config=ReplayConfig(replay_delay_scale=0.0),
+        )
+        states = _states(1)
+        states[0].workflow_type = "replay"
+        stats = _new_stats(config, states)
+        mgr = RoundRobinTaskManager(config, states, threading.Event(), stats, FakeProvider(count=1))
+
+        join_timeouts: list[float] = []
+
+        class _StubRunner:
+            name = "stub-round-runner"
+            state = states[0]
+
+            def join(self, timeout=None):
+                join_timeouts.append(timeout)
+                return None  # return immediately; never finished
+
+            def is_alive(self):
+                return True
+
+        mgr.active_runners = [_StubRunner()]
+
+        records: list[logging.LogRecord] = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Handler(level=logging.WARNING)
+        rr_logger = logging.getLogger("bench_core.task_manager.round_robin")
+        rr_logger.addHandler(handler)
+        try:
+            mgr._wait_for_active_runners()
+        finally:
+            rr_logger.removeHandler(handler)
+
+        # Ceiling = test_duration (5) + 60 = 65s, NOT the old 120.
+        assert join_timeouts == [65.0], f"expected [65.0], got {join_timeouts}"
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING that the runner was still alive after the join ceiling"
+        assert "truncated" in warnings[0].getMessage()
