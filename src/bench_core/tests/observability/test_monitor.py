@@ -1,0 +1,842 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from bench_core.config import KernelConfig
+from bench_core.observability.monitor import LogRotationConfig, MonitorConfig, MonitorController
+
+
+def test_monitor_config_defaults_when_absent():
+    cfg = KernelConfig.from_raw({"sandbox": {"total_count": 1}})
+    assert isinstance(cfg.monitor, MonitorConfig)
+    assert cfg.monitor.enabled == "auto"
+    assert cfg.monitor.vmm == "auto"
+    assert cfg.monitor.capture == "auto"
+    assert cfg.monitor.interval == 2
+    assert cfg.monitor.merge_report is False
+    assert cfg.monitor.report_timeout == 300
+    assert cfg.monitor.skip is None
+    assert cfg.monitor.skip_charts is False
+    assert cfg.monitor.host_procs is None
+    assert cfg.monitor.log_dir is None
+    assert cfg.monitor.disks == "all"
+    assert cfg.monitor.numa == "all"
+
+
+def test_monitor_config_from_raw_overrides():
+    raw = {
+        "sandbox": {"total_count": 1},
+        "monitor": {
+            "enabled": "true",
+            "vmm": "qemu",
+            "interval": 5,
+            "capture": "false",
+            "numa": "0,1",
+            "disks": "sda,nvme0n1",
+            "stress_file": "/tmp/lock",
+            "log_dir": "out/vm",
+            "merge_report": False,
+            "report_timeout": 120,
+            "skip_charts": True,
+        },
+    }
+    cfg = KernelConfig.from_raw(raw)
+    assert cfg.monitor.enabled == "true"
+    assert cfg.monitor.vmm == "qemu"
+    assert cfg.monitor.interval == 5
+    assert cfg.monitor.capture == "false"
+    assert cfg.monitor.numa == "0,1"
+    assert cfg.monitor.disks == "sda,nvme0n1"
+    assert cfg.monitor.stress_file == "/tmp/lock"
+    assert cfg.monitor.log_dir == "out/vm"
+    assert cfg.monitor.merge_report is False
+    assert cfg.monitor.report_timeout == 120
+    assert cfg.monitor.skip_charts is True
+
+
+def test_monitor_config_yaml_boolean_enabled_normalized():
+    """An unquoted YAML `enabled: true` (bool True) must read as enabled, not
+    str(True)="True" which misses the `== "true"` check and silently disables."""
+    raw = {"sandbox": {"total_count": 1}, "monitor": {"enabled": True, "capture": True}}
+    cfg = KernelConfig.from_raw(raw)
+    assert cfg.monitor.enabled == "true"
+    assert cfg.monitor.capture == "true"
+    prov = _StubProvider(name="cubesandbox", vmm_type="cubesandbox")
+    mc = MonitorController(cfg, prov)
+    assert mc._effective is True
+
+
+class _StubProvider:
+    """Minimal provider stub for MonitorController (no SDK)."""
+
+    def __init__(self, name="stub", vmm_type=None, test_duration=300):
+        self.name = name
+        self.vmm_type = vmm_type
+        self.test_duration = test_duration
+
+
+def _cfg(**over):
+    raw = {"sandbox": {"total_count": 1}, "report": {"output_dir": "out"}}
+    if over:
+        raw["monitor"] = over
+    return KernelConfig.from_raw(raw)
+
+
+def test_start_skips_when_no_vmm(caplog):
+    cfg = _cfg()
+    prov = _StubProvider(vmm_type=None)
+    mc = MonitorController(cfg, prov)
+    mc.start()
+    assert mc._started is False
+    assert any("disabled" in r.message for r in caplog.records)
+
+
+def test_start_skips_when_binary_missing(monkeypatch, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: None)
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(), prov)
+    mc.start()
+    assert mc._started is False
+    assert any("binary not found" in r.message for r in caplog.records)
+
+
+def test_command_construction(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(stress_file=str(tmp_path / "lock")), prov)
+    cmd = mc._cmd
+    assert "--vmm" in cmd and "firecracker" in cmd
+    assert "--stress-file" in cmd
+    assert "--auto-skip" in cmd and "--enable-capture" in cmd  # capture=auto
+    assert "-i" in cmd and "2" in cmd
+    assert cmd[cmd.index("--numa") + 1] == "all"
+    assert "--disks" in cmd and "all" in cmd  # default
+    assert "-t" in cmd  # hard upper-bound timer
+
+
+def test_command_disks_override(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(disks="sda,nvme0n1", stress_file=str(tmp_path / "lock")), prov)
+    cmd = mc._cmd
+    # the custom disk list reaches the vm-monitor CLI verbatim
+    i = cmd.index("--disks")
+    assert cmd[i + 1] == "sda,nvme0n1"
+
+
+def test_command_capture_false_omits_flags(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(capture="false", stress_file=str(tmp_path / "lock")), prov)
+    assert "--enable-capture" not in mc._cmd
+    assert "--auto-skip" not in mc._cmd
+
+
+def test_command_skip_charts_forwards_no_charts(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    # skip_charts=True forwards --no-charts; the default (False) omits it.
+    mc = MonitorController(_cfg(skip_charts=True, stress_file=str(tmp_path / "lock")), prov)
+    assert "--no-charts" in mc._cmd
+    mc_default = MonitorController(_cfg(stress_file=str(tmp_path / "lock")), prov)
+    assert "--no-charts" not in mc_default._cmd
+
+
+def test_host_procs_parsed_from_list_and_comma_string():
+    # YAML list form.
+    cfg = _cfg(host_procs=["server:release/server", "uvm-ublk-daemon"])
+    assert cfg.monitor.host_procs == ["server:release/server", "uvm-ublk-daemon"]
+    # comma-string form (forbids commas inside a spec).
+    cfg2 = _cfg(host_procs="server:release/server,uvm-ublk-daemon")
+    assert cfg2.monitor.host_procs == ["server:release/server", "uvm-ublk-daemon"]
+    # default absent -> None.
+    assert _cfg().monitor.host_procs is None
+
+
+def test_command_forwards_host_proc_specs(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(
+        _cfg(host_procs=["server:release/server", "uvm-ublk-daemon"], stress_file=str(tmp_path / "lock")),
+        prov,
+    )
+    cmd = mc._cmd
+    # each spec forwarded as a repeated --host-proc pair, in order.
+    idxs = [i for i, a in enumerate(cmd) if a == "--host-proc"]
+    assert len(idxs) == 2
+    assert cmd[idxs[0] + 1] == "server:release/server"
+    assert cmd[idxs[1] + 1] == "uvm-ublk-daemon"
+    # default (no host_procs) emits no --host-proc.
+    mc_default = MonitorController(_cfg(stress_file=str(tmp_path / "lock")), prov)
+    assert "--host-proc" not in mc_default._cmd
+
+
+def test_command_hostproc_skip_stem_forwarded(monkeypatch, tmp_path):
+    # --no-hostproc reaches vm-monitor via the same skip-contract as other stems.
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(skip=["hostproc"], stress_file=str(tmp_path / "lock")), prov)
+    assert "--no-hostproc" in mc._cmd
+
+
+def test_log_rotation_config_defaults_when_absent():
+    cfg = KernelConfig.from_raw({"sandbox": {"total_count": 1}})
+    assert cfg.monitor.log_rotation is None
+
+
+def test_log_rotation_config_from_raw_full_block():
+    raw = {
+        "sandbox": {"total_count": 1},
+        "monitor": {
+            "log_rotation": {
+                "enabled": True,
+                "interval_sec": 30,
+                "perf_events": ["cycles", "instructions"],
+            },
+        },
+    }
+    lr = KernelConfig.from_raw(raw).monitor.log_rotation
+    assert isinstance(lr, LogRotationConfig)
+    assert lr.enabled is True
+    assert lr.interval_sec == 30
+    assert lr.perf_events == ["cycles", "instructions"]
+
+
+def test_log_rotation_config_shorthand_and_defaults():
+    # `log_rotation: true` shorthand -> enabled with defaults (no events).
+    lr = KernelConfig.from_raw({"sandbox": {"total_count": 1}, "monitor": {"log_rotation": True}}).monitor.log_rotation
+    assert lr is not None and lr.enabled is True
+    assert lr.interval_sec == 15
+    assert lr.perf_events is None
+    # A present dict implies enabled; perf_events accepts a comma string too.
+    lr2 = KernelConfig.from_raw(
+        {"sandbox": {"total_count": 1}, "monitor": {"log_rotation": {"perf_events": "cycles, instructions"}}}
+    ).monitor.log_rotation
+    assert lr2.enabled is True
+    assert lr2.perf_events == ["cycles", "instructions"]
+
+
+def test_log_rotation_config_tools_parses_list_or_string():
+    # tools accepts a YAML list or comma string; unknown names are dropped.
+    lr = KernelConfig.from_raw(
+        {"sandbox": {"total_count": 1}, "monitor": {"log_rotation": {"tools": ["devkit", "perf"]}}}
+    ).monitor.log_rotation
+    assert lr.tools == ["devkit", "perf"]
+    lr2 = KernelConfig.from_raw(
+        {"sandbox": {"total_count": 1}, "monitor": {"log_rotation": {"tools": "devkit, banana, perf"}}}
+    ).monitor.log_rotation
+    assert lr2.tools == ["devkit", "perf"]
+
+
+def test_log_rotation_config_invalid_tools_warns_and_drops(caplog):
+    # A non-iterable tools value must warn + fall back to all tools, never
+    # raise out of config parsing.
+    lr = KernelConfig.from_raw(
+        {"sandbox": {"total_count": 1}, "monitor": {"log_rotation": {"tools": 42}}}
+    ).monitor.log_rotation
+    assert lr.tools is None
+    assert any("log_rotation.tools" in r.message for r in caplog.records)
+
+
+def test_log_rotation_config_intervals_accepts_uprof():
+    # uprof joins devkit/ksys/perf as a valid per-tool interval key.
+    lr = KernelConfig.from_raw(
+        {"sandbox": {"total_count": 1}, "monitor": {"log_rotation": {"intervals": {"devkit": 20, "uprof": 10}}}}
+    ).monitor.log_rotation
+    assert lr.intervals == {"devkit": 20, "uprof": 10}
+
+
+def test_log_rotation_config_invalid_warns_and_drops(caplog):
+    cfg = KernelConfig.from_raw({"sandbox": {"total_count": 1}, "monitor": {"log_rotation": "banana"}})
+    assert cfg.monitor.log_rotation is None
+    assert any("log_rotation" in r.message for r in caplog.records)
+
+
+def test_command_log_rotation_forwards_flags(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(
+        _cfg(
+            stress_file=str(tmp_path / "lock"),
+            log_rotation={"enabled": True, "interval_sec": 20, "perf_events": ["cycles", "instructions"]},
+        ),
+        prov,
+    )
+    cmd = mc._cmd
+    i = cmd.index("--log-rotation")
+    assert cmd[cmd.index("--rotation-interval") + 1] == "20"
+    assert cmd[cmd.index("--rotation-perf-events") + 1] == "cycles,instructions"
+    # Rotation logs land in <output_dir>/log_capture (sibling of vm_monitor/).
+    assert cmd[cmd.index("--rotation-log-dir") + 1] == str(Path("out") / "log_capture")
+    assert i < cmd.index("--rotation-interval")  # flags travel as one block
+
+
+def test_command_log_rotation_tools_forwards_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_rotation={"enabled": True, "tools": ["devkit", "perf"]}),
+        prov,
+    )
+    assert mc._cmd[mc._cmd.index("--rotation-tools") + 1] == "devkit,perf"
+
+
+def test_command_log_rotation_default_events_omit_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    # perf_events omitted -> vm-monitor's built-in set applies (no flag).
+    mc = MonitorController(_cfg(stress_file=str(tmp_path / "lock"), log_rotation=True), prov)
+    assert "--log-rotation" in mc._cmd
+    assert "--rotation-perf-events" not in mc._cmd
+    assert "--rotation-interval" in mc._cmd  # interval still forwarded (default 15)
+
+
+def test_command_log_rotation_inert_when_capture_off(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(
+        _cfg(capture="false", stress_file=str(tmp_path / "lock"), log_rotation={"enabled": True}),
+        prov,
+    )
+    assert "--log-rotation" not in mc._cmd
+    assert any("rotation will not run" in r.message for r in caplog.records)
+
+
+def test_command_log_rotation_default_off(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(stress_file=str(tmp_path / "lock")), prov)
+    assert "--log-rotation" not in mc._cmd
+
+
+def test_start_removes_stale_lock(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: _FakeProc())
+    lock = tmp_path / "lock"
+    lock.touch()
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(stress_file=str(lock), log_dir=str(tmp_path)), prov)
+    mc.start()
+    assert mc._started is True
+    assert not lock.exists()
+    assert any("stale lock" in r.message.lower() for r in caplog.records)
+
+
+def test_start_degrades_when_log_dir_unwritable(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    # Create a regular file; using it as a parent dir makes mkdir() fail (FileExistsError is OSError).
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    bad_log_dir = str(blocker / "subdir")
+    prov = _StubProvider(vmm_type="firecracker")
+    mc = MonitorController(_cfg(stress_file=str(tmp_path / "lock"), log_dir=bad_log_dir), prov)
+    mc.start()
+    assert mc._started is False
+    assert any("disabled" in r.message for r in caplog.records)
+
+
+class _FakeProc:
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        # Post-sampling vm_monitor ignores SIGTERM (the handler only breaks the
+        # sampling loop, already done), so SIGTERM alone does not stop the
+        # process -- returncode stays None, forcing the reaper to escalate.
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def test_begin_end_stress_lifecycle(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: _FakeProc())
+    lock = tmp_path / "lock"
+    mc = MonitorController(_cfg(stress_file=str(lock), log_dir=str(tmp_path)), _StubProvider(vmm_type="firecracker"))
+    mc.start()
+    assert mc.stress_window is None  # not begun yet
+
+    mc.begin_stress()
+    assert lock.exists()
+    assert mc._begin_ts is not None
+
+    mc.end_stress()
+    assert not lock.exists()
+    assert mc._end_ts is not None
+    assert mc.stress_window is not None and mc.stress_window >= 0.0
+
+
+def test_end_stress_idempotent_when_no_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: _FakeProc())
+    lock = tmp_path / "lock"
+    mc = MonitorController(_cfg(stress_file=str(lock), log_dir=str(tmp_path)), _StubProvider(vmm_type="firecracker"))
+    mc.start()
+    mc.begin_stress()
+    lock.unlink()  # simulate external removal
+    mc.end_stress()  # must not raise
+
+
+def test_begin_end_noop_when_not_started():
+    mc = MonitorController(_cfg(), _StubProvider(vmm_type=None))
+    mc.begin_stress()
+    mc.end_stress()
+    assert mc.stress_window is None
+
+
+def test_external_collector_publishes_marker_without_spawning(monkeypatch, tmp_path):
+    """A shard under driver-owned monitoring signals its window but runs nothing."""
+
+    def _no_spawn(*_a, **_kw):
+        raise AssertionError("external collector must not spawn vm-monitor")
+
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", _no_spawn)
+    lock = tmp_path / "stress.lock"
+    cfg = _cfg(stress_file=str(lock), external_collector=True)
+    mc = MonitorController(cfg, _StubProvider(vmm_type="firecracker"))
+
+    mc.start()
+    assert mc.proc is None and mc._started is False
+    mc.begin_stress()
+    assert lock.exists()
+    mc.end_stress()
+    assert not lock.exists()
+    assert mc.stress_window is not None
+
+
+def test_external_collector_gauge_needs_the_api_state_flag():
+    """Only one process may poll the provider: the collector owner, or an
+    explicitly designated stand-in (shard 0 under driver-owned monitoring)."""
+    prov = _StubProvider(vmm_type="firecracker")
+    assert MonitorController(_cfg(), prov)._gauge is True  # owns the collector
+    assert MonitorController(_cfg(external_collector=True), prov)._gauge is False
+    assert MonitorController(_cfg(external_collector=True, api_state="true"), prov)._gauge is True
+    assert MonitorController(_cfg(api_state="false"), prov)._gauge is False
+
+
+def test_abandon_terminates_an_idle_collector_without_waiting_for_a_report(monkeypatch, tmp_path):
+    """No shard ever reached stress: stop() must not block report_timeout."""
+
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=300),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    started = time.monotonic()
+    mc.abandon()
+    assert proc.terminated is True
+    assert mc._started is False
+    assert time.monotonic() - started < 1  # did not sit out report_timeout
+
+
+def test_stop_collects_report_and_closes_handles(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    proc.returncode = 0  # vm_monitor exited cleanly after producing the report
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=2),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    # the report is already on disk (vm_monitor wrote it before exiting)
+    (tmp_path / "resource_report.xlsx").write_text("x")
+    artifacts = mc.stop()
+    assert mc.report_xlsx == tmp_path / "resource_report.xlsx"
+    assert artifacts and artifacts[0] == mc.report_xlsx
+    assert proc.terminated is False  # clean exit -- no SIGTERM needed
+    assert mc._stdout_fh is None and mc._stderr_fh is None  # closed
+
+
+def test_stop_detaches_overdue_process(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    # no xlsx ever appears; proc never exits (poll stays None). The OLD reaper
+    # SIGTERM'd at 2x report_timeout then SIGKILL'd past grace -- which is what
+    # lost resource_report.xlsx (a kill mid-build leaves an orphan .build.xlsx
+    # and no final report). Now we DETACH: never signal, leave it running to
+    # finish + write the report asynchronously.
+    artifacts = mc.stop()
+    assert proc.terminated is False  # no SIGTERM
+    assert proc.killed is False  # no SIGKILL -- the guarantee
+    assert mc._detached is True
+    assert artifacts == []  # no synchronous report (it appears async)
+    assert any("detaching" in r.message.lower() for r in caplog.records)
+
+
+class _Clock:
+    """Deterministic clock so the mid-export grace path is timing-independent."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, n):
+        self.t += n
+
+
+class _ExportingProc:
+    """Fake proc simulating vm_monitor finishing an xlsx export.
+
+    Stays alive (poll -> None) until ``promote_on_poll`` polls, then promotes
+    the build file to the final xlsx and exits cleanly (returncode 0). With
+    ``promote_on_poll=None`` it never finishes (a hung export).
+    """
+
+    def __init__(self, build_path, xlsx_path, *, promote_on_poll=None):
+        self._build = build_path
+        self._xlsx = xlsx_path
+        self._promote_on = promote_on_poll
+        self._polls = 0
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        self._polls += 1
+        if self._promote_on is not None and self._polls >= self._promote_on and self.returncode is None:
+            # export done: atomic build -> xlsx promote, then exit
+            if self._build.exists():
+                self._build.unlink()
+            self._xlsx.write_text("ok")
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self):
+        # SIGTERM does not interrupt an in-flight export (handler is moot
+        # post-sampling), so the process stays alive -- returncode unchanged.
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def test_stop_waits_for_slow_export_no_sigterm(monkeypatch, tmp_path):
+    """A slow export that finishes within the courtesy ``report_timeout`` window
+    is collected synchronously -- no SIGTERM, no SIGKILL, no detach. This is the
+    fast-path: small/medium runs that finish before the courtesy wait expires
+    still get their report collected inline (and ``merge_report`` still works).
+    The OLD code SIGTERM'd at report_timeout and SIGKILL'd mid-write 5s later,
+    leaving a corrupt orphan ``.build.xlsx`` and no report.
+    """
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    build = tmp_path / "resource_report.xlsx.build.xlsx"
+    xlsx = tmp_path / "resource_report.xlsx"
+    build.write_text("partial")  # export in flight
+    proc = _ExportingProc(build, xlsx, promote_on_poll=2)  # finishes inside the wait window
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    artifacts = mc.stop()
+    assert proc.terminated is False  # finished inside the wait window -- no SIGTERM
+    assert proc.killed is False
+    assert mc.report_xlsx == xlsx  # report collected after the export finished
+    assert artifacts and artifacts[0] == xlsx
+    assert not build.exists()  # promoted away -- no corrupt orphan left behind
+
+
+def test_stop_detaches_when_export_not_done_in_courtesy_window(monkeypatch, tmp_path, caplog):
+    """A slow export that hasn't finished by the courtesy ``report_timeout``
+    window is DETACHED, not killed. The bench stops blocking (returns []) and
+    vm_monitor is left running in its own session to finish the build +
+    ``os.replace`` asynchronously. The orphan ``.build.xlsx`` a mid-write
+    SIGKILL would leave is exactly what detaching avoids: here the in-flight
+    build file is left intact (still being written async), not shot mid-write.
+    (OLD behavior: SIGTERM at 2x window, then a grace, then SIGKILL -- losing
+    the report if the export outlived the grace.)
+    """
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    build = tmp_path / "resource_report.xlsx.build.xlsx"
+    xlsx = tmp_path / "resource_report.xlsx"
+    build.write_text("partial")
+    proc = _ExportingProc(build, xlsx, promote_on_poll=4)  # won't finish in the 1x courtesy window
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    artifacts = mc.stop()
+    assert proc.terminated is False  # no SIGTERM
+    assert proc.killed is False  # no SIGKILL mid-build
+    assert mc._detached is True
+    assert artifacts == []  # not done synchronously
+    assert build.exists()  # left in place for async completion (not a corrupt orphan from a kill)
+    assert any("detaching" in r.message.lower() for r in caplog.records)
+
+
+def test_stop_detaches_hung_export(monkeypatch, tmp_path, caplog):
+    """A genuinely hung export (never finishes) is STILL not killed -- it is
+    detached. Killing a hung export would lose the report (orphan .build.xlsx,
+    no final file); detaching leaves it running so a merely-slow export still
+    finishes + writes the report, while a true hang surfaces via vm_monitor's
+    own -t timer / the OS OOM-killer backstop. Never SIGKILLing the writer is
+    the guarantee that resource_report.xlsx is never lost to a mid-build kill.
+    The orphan ``.build.xlsx`` left here is cleaned at the next export's
+    clean-on-start (exporters unlink a stale build before writing).
+    """
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    build = tmp_path / "resource_report.xlsx.build.xlsx"
+    xlsx = tmp_path / "resource_report.xlsx"
+    build.write_text("partial")
+    proc = _ExportingProc(build, xlsx, promote_on_poll=None)  # never finishes
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    mc.stop()
+    assert proc.terminated is False  # no SIGTERM
+    assert proc.killed is False  # no SIGKILL -- the guarantee
+    assert mc._detached is True
+    assert build.exists()  # left intact, not corrupted by a mid-write SIGKILL
+    assert any("detaching" in r.message.lower() for r in caplog.records)
+
+
+def test_emergency_kill_skips_detached(monkeypatch, tmp_path):
+    """The atexit backstop must NOT reap a detached vm_monitor -- it has to
+    survive bench exit to finish the async xlsx build + os.replace. (Without
+    this, a clean bench exit would kill the very process we detached to save.)"""
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()  # never exits -> stop() will detach
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    assert mc._detached is False
+    mc.stop()  # proc never exits -> detaches
+    assert mc._detached is True
+    assert proc.terminated is False
+    mc._emergency_kill()  # atexit path -- must be a no-op for a detached proc
+    assert proc.terminated is False  # not reaped
+    assert proc.killed is False
+
+
+def test_stop_noop_when_not_started():
+    mc = MonitorController(_cfg(), _StubProvider(vmm_type=None))
+    assert mc.stop() == []
+
+
+def test_stop_handles_dead_subprocess(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    proc.returncode = 1  # already dead, no report
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=2),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    mc.stop()
+    assert mc.report_xlsx is None
+    assert any("without report" in r.message for r in caplog.records)
+
+
+class _HostResProc:
+    """Fake proc simulating vm_monitor writing ``host_resources.xlsx`` (the
+    FIRST export step) after a few polls, then staying alive (slow SVG/xlsx
+    still running). ``write_on_poll=None`` -> never writes (timeout path)."""
+
+    def __init__(self, hr_path, *, write_on_poll=2):
+        self._hr = hr_path
+        self._write_on = write_on_poll
+        self._polls = 0
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        self._polls += 1
+        if self._write_on is not None and self._polls >= self._write_on and self.returncode is None:
+            if not self._hr.exists():
+                self._hr.write_text("ok")  # vm_monitor finishes the fast CSV-only export step
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def test_wait_for_host_resources_noop_when_not_started():
+    mc = MonitorController(_cfg(), _StubProvider(vmm_type=None))
+    assert mc.wait_for_host_resources() is None
+
+
+def test_wait_for_host_resources_noop_after_stop(monkeypatch, tmp_path):
+    """On the happy path ``stop()`` already ran (``_started=False``); the
+    finally's wait_for_host_resources must be a no-op (no re-wait / re-detach)."""
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    proc.returncode = 0
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    mc.stop()
+    assert mc.wait_for_host_resources(timeout=30) is None
+
+
+def test_wait_for_host_resources_waits_then_collects_and_detaches(monkeypatch, tmp_path):
+    """Ctrl+C teardown: vm_monitor writes host_resources.xlsx (first export
+    step) within the short wait; the controller collects it, DETACHES (no
+    SIGTERM), and leaves vm_monitor to finish the slow SVG/xlsx as an orphan
+    that _emergency_kill won't reap."""
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    hr = tmp_path / "host_resources.xlsx"
+    proc = _HostResProc(hr, write_on_poll=2)
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    found = mc.wait_for_host_resources(timeout=30)
+    assert found == hr
+    assert hr.exists()
+    assert mc._detached is True  # detached -> _emergency_kill skips it
+    assert proc.terminated is False  # no SIGTERM mid-export
+    assert mc._started is False
+    mc._emergency_kill()  # atexit backstop must be a no-op for a detached proc
+    assert proc.terminated is False
+
+
+def test_wait_for_host_resources_handles_proc_exit_without_report(monkeypatch, tmp_path):
+    """vm_monitor exited (crashed before export) without writing host_resources
+    -> return None + detach (no hanging wait past proc exit)."""
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()
+    proc.returncode = 0  # already exited, no host_resources written
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    found = mc.wait_for_host_resources(timeout=30)
+    assert found is None
+    assert mc._detached is True
+    assert mc._started is False
+
+
+def test_wait_for_host_resources_times_out_detaches_and_warns(monkeypatch, tmp_path, caplog):
+    """host_resources never appears + vm_monitor still alive -> timeout, DETACH
+    (never kill), and warn with the `vm-monitor raw-report` recovery command
+    (raw CSVs are still on disk, so the artifact is regeneratable post-hoc)."""
+    monkeypatch.setattr("bench_core.observability.monitor.time", _Clock())
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    proc = _FakeProc()  # never exits, never writes host_resources
+    monkeypatch.setattr("bench_core.observability.monitor.subprocess.Popen", lambda *a, **kw: proc)
+    mc = MonitorController(
+        _cfg(stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path), report_timeout=1),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    found = mc.wait_for_host_resources(timeout=30)
+    assert found is None
+    assert mc._detached is True  # detached, not killed
+    assert proc.terminated is False
+    assert proc.killed is False
+    assert any("vm-monitor raw-report" in r.message for r in caplog.records)
+
+
+def _make_src_xlsx(path):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "VM_Stats"
+    ws.cell(row=1, column=1, value="vm")
+    ws.cell(row=2, column=1, value="fc-1")
+    wb.create_sheet("NUMA_Overview")
+    wb["NUMA_Overview"].cell(row=1, column=1, value="node0")
+    wb.save(path)
+
+
+def test_merge_source_returns_report_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    src = tmp_path / "resource_report.xlsx"
+    _make_src_xlsx(src)
+    mc = MonitorController(
+        _cfg(merge_report=True, stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path)),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.start()
+    mc.report_xlsx = src  # pretend stop() found it
+    assert mc.merge_source() == src
+
+
+def test_merge_source_none_when_no_report(monkeypatch, tmp_path):
+    mc = MonitorController(_cfg(), _StubProvider(vmm_type="firecracker"))
+    # report_xlsx is None -> None, no raise
+    assert mc.merge_source() is None
+
+
+def test_merge_source_none_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr("bench_core.observability.monitor.shutil.which", lambda _: "/fake/vm-monitor")
+    src = tmp_path / "resource_report.xlsx"
+    _make_src_xlsx(src)
+    mc = MonitorController(
+        _cfg(merge_report=False, stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path)),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.report_xlsx = src
+    assert mc.merge_source() is None
+
+
+def test_merge_source_none_when_missing(monkeypatch, tmp_path, caplog):
+    mc = MonitorController(
+        _cfg(merge_report=True, stress_file=str(tmp_path / "lock"), log_dir=str(tmp_path)),
+        _StubProvider(vmm_type="firecracker"),
+    )
+    mc.report_xlsx = tmp_path / "does-not-exist.xlsx"
+    # must not raise; warns and returns None
+    assert mc.merge_source() is None
+    assert any("report missing" in r.message.lower() for r in caplog.records)
