@@ -1,0 +1,777 @@
+"""Unit tests for the oversub benchmark driver's pure helpers.
+
+The driver's pure helpers are module-level functions in bench_core.oversub,
+so pytest imports them directly (no conftest path hack). The subprocess +
+main() path is covered by the --dry-run integration test (Task 7)."""
+
+from __future__ import annotations
+
+import csv
+
+import json
+
+from pathlib import Path
+
+import yaml
+
+import os
+
+import subprocess
+
+import sys
+
+from bench_core.oversub import (
+    build_trial_config,
+    default_running_concurrency,
+    parse_ratios,
+)
+
+from bench_core.oversub import compute_valid, parse_run_summary
+
+from bench_core.oversub import aggregate_ratio_summary, trial_row, write_outputs
+
+from bench_core.oversub import main
+
+import pytest  # noqa: E402
+
+from bench_core.oversub import (  # noqa: E402
+    _coerce_cmd,
+    _coerce_modes,
+    _coerce_ratios,
+    load_sweep_config,
+)
+
+
+def test_parse_ratios_basic():
+    assert parse_ratios("1,2,3") == [1, 2, 3]
+
+
+def test_parse_ratios_ignores_spaces_and_blanks():
+    assert parse_ratios(" 1 , 2 ,3,") == [1, 2, 3]
+
+
+def test_parse_ratios_rejects_non_positive():
+    with pytest.raises(ValueError):
+        parse_ratios("0,2")
+    with pytest.raises(ValueError):
+        parse_ratios("")
+
+
+def _base_yaml() -> dict:
+    return {
+        "workflow_type": "replay",
+        "sandbox": {"total_count": 384},
+        "replay": {"running_concurrency": 384, "mode": "lifecycle"},
+        "create_batch": {"size": 96, "interval": 1},
+        "test": {"duration": 3600, "round_size": 384, "round_count": 1, "benchmark_mode": "round_robin"},
+        "report": {"output_dir": "results/replay", "filename_prefix": "replay_bench", "format": "both"},
+        "aenv": {"template": "t", "env": {"E2B_API_URL": "http://x"}},
+    }
+
+
+def test_default_running_concurrency_from_replay():
+    assert default_running_concurrency(_base_yaml()) == 384
+
+
+def test_default_running_concurrency_falls_back_to_total_count():
+    base = _base_yaml()
+    del base["replay"]["running_concurrency"]
+    base["sandbox"]["total_count"] = 200
+    assert default_running_concurrency(base) == 200
+
+
+def test_build_trial_config_overrides_and_preserves_base():
+    base = _base_yaml()
+    cfg = build_trial_config(
+        base,
+        mode="exec_only",
+        ratio=2,
+        n=384,
+        test_duration=600,
+        trial_dir="out/t1",
+        prefix="replay_bench",
+    )
+    # Overrides applied.
+    assert cfg["sandbox"]["total_count"] == 768  # k*N = 2*384
+    assert cfg["replay"]["running_concurrency"] == 384  # N stays fixed
+    assert cfg["replay"]["trajectory_limit"] == 384  # N: fixed issue set across ratios
+    assert cfg["replay"]["mode"] == "exec_only"
+    assert cfg["test"]["round_size"] == 768  # scale with total_count
+    assert cfg["test"]["round_count"] == 1  # passed through from base (not overridden)
+    assert cfg["test"]["duration"] == 600
+    assert cfg["report"]["output_dir"] == "out/t1"
+    assert cfg["report"]["filename_prefix"] == "replay_bench"
+    # Base fields preserved (backend block, create_batch pass through).
+    assert cfg["aenv"]["template"] == "t"
+    assert cfg["create_batch"] == {"size": 96, "interval": 1}
+    # The base dict is not mutated (deep copy).
+    assert base["sandbox"]["total_count"] == 384
+    assert base["replay"]["mode"] == "lifecycle"
+
+
+def test_build_trial_config_round_yaml_round_trips():
+    """Generated trial.yaml must load back to the same overrides (real subprocess input)."""
+    base = _base_yaml()
+    cfg = build_trial_config(
+        base,
+        mode="lifecycle",
+        ratio=3,
+        n=384,
+        test_duration=120,
+        trial_dir="out/t2",
+        prefix="rb",
+    )
+    text = yaml.safe_dump(cfg, sort_keys=False)
+    reloaded = yaml.safe_load(text)
+    assert reloaded["sandbox"]["total_count"] == 1152
+    assert reloaded["test"]["round_size"] == 1152
+    assert reloaded["test"]["round_count"] == 1
+    assert reloaded["replay"]["running_concurrency"] == 384
+
+
+def test_build_trial_config_passes_through_round_count():
+    """round_count is the user's work-amount knob (whichever-first with
+    test.duration); the driver must NOT override it. A base with round_count=3
+    must reach trial.yaml as 3 (so a user can request 3 passes, or 0 for a
+    sustained-until-duration window)."""
+    base = _base_yaml()
+    base["test"]["round_count"] = 3
+    cfg = build_trial_config(base, mode="lifecycle", ratio=2, n=384, test_duration=600, trial_dir="out", prefix="rb")
+    assert cfg["test"]["round_count"] == 3  # passed through, not reset
+    # and a sustained base (round_count=0) is respected too
+    base["test"]["round_count"] = 0
+    cfg = build_trial_config(base, mode="lifecycle", ratio=2, n=384, test_duration=600, trial_dir="out", prefix="rb")
+    assert cfg["test"]["round_count"] == 0
+
+
+def test_default_running_concurrency_rejects_bad():
+    # absent -> 0 -> ValueError
+    with pytest.raises(ValueError):
+        default_running_concurrency({})
+    # present-but-null total_count -> coerced to 0 -> ValueError (Fix 1)
+    with pytest.raises(ValueError):
+        default_running_concurrency({"sandbox": {"total_count": None}})
+    # explicit 0 -> ValueError
+    with pytest.raises(ValueError):
+        default_running_concurrency({"sandbox": {"total_count": 0}})
+
+
+def _summary(
+    total=768,
+    succeeded=768,
+    failed=0,
+    wall_sec=940.0,
+    peak_active=380,
+    maximum=384,
+    mode="lifecycle",
+    test_duration=1000,
+):
+    return {
+        "replay_mode": mode,
+        "test_duration": test_duration,
+        "wall_sec": wall_sec,
+        "throughput": {"total": total, "succeeded": succeeded, "failed": failed},
+        "admission": {"maximum": maximum, "peak_active": peak_active} if peak_active is not None else None,
+    }
+
+
+def test_parse_run_summary_round_trips(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(_summary()), encoding="utf-8")
+    assert parse_run_summary(p)["throughput"]["total"] == 768
+
+
+def test_compute_valid_happy_path():
+    s = _summary()
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is True
+
+
+def test_compute_valid_nonzero_return_code():
+    s = _summary()
+    assert compute_valid(s, return_code=2, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_summary_error_fails_even_with_clean_rc():
+    # A merged sharded summary carries no single rc: a dead shard surfaces in
+    # ``error`` (and the surviving shards can still clear the count floor).
+    # --reuse passes rc=0 for a summary it finds on disk, so the error gate is
+    # what keeps a crashed trial from being reused as valid.
+    s = _summary()
+    s["error"] = "shard 3: exit code -9"
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_no_work_done():
+    s = _summary(total=0, succeeded=0)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_ran_only_a_few_sandboxes():
+    # Run-to-completion: a trial that only reached a handful of the N running
+    # slots (crash/early-exit) fails the work floor `total >= 0.9 * N`.
+    s = _summary(total=50, succeeded=50, wall_sec=20.0)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_just_under_floor_still_invalid():
+    # total = 340 < 0.9*384 = 345.6 -> did not run most of the fleet -> invalid.
+    s = _summary(total=340, succeeded=340, wall_sec=50.0)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_peak_active_exceeds_n():
+    s = _summary(peak_active=400)  # 400 > N=384 -> over-admitted -> invalid.
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_compute_valid_exec_only_drops_peak_active_clause():
+    # exec_only: admission is null -> peak_active clause skipped; the work floor
+    # (total >= 0.9*N) still applies. A healthy exec_only run runs ~N sandboxes.
+    s = _summary(peak_active=None, mode="exec_only", wall_sec=950.0, total=384)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is True
+
+
+def test_compute_valid_failure_tolerance_allows_wrap_noise():
+    # 10 failures / 768 total = ~1.3%; tolerance 0.05 -> valid; tolerance 0.0 -> invalid.
+    s = _summary(total=768, succeeded=758, failed=10, wall_sec=950.0)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.05) is True
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0) is False
+
+
+def test_build_trial_config_multiplier_switches_to_fixed():
+    """multiplier (M) set -> trial.yaml carries replay.multiplier and flips to
+    fixed (stop-when-done). total_count/round_size still scale for config-object
+    compatibility even though fixed+M ignores them."""
+    base = _base_yaml()
+    cfg = build_trial_config(
+        base, mode="exec_ephemeral", ratio=2, n=384, test_duration=600, trial_dir="out", prefix="rb", multiplier=5
+    )
+    assert cfg["replay"]["multiplier"] == 5
+    assert cfg["test"]["benchmark_mode"] == "fixed"
+    # Still scaled (compat), unused under fixed+M.
+    assert cfg["sandbox"]["total_count"] == 768  # 2 * 384
+    assert cfg["test"]["round_size"] == 768
+
+
+def test_build_trial_config_no_multiplier_keeps_benchmark_mode():
+    """No multiplier -> no replay.multiplier key and benchmark_mode passes through
+    from the base (round_robin here), so the trial runs the base's mode unchanged."""
+    base = _base_yaml()
+    cfg = build_trial_config(base, mode="lifecycle", ratio=2, n=384, test_duration=600, trial_dir="out", prefix="rb")
+    assert "multiplier" not in cfg["replay"]
+    assert cfg["test"]["benchmark_mode"] == "round_robin"  # base value preserved
+
+
+def test_compute_valid_multiplier_aware_happy():
+    """M=5, ratio=2, N=384 -> expected trajectory completions = 5*2*384 = 3840.
+    Since run_summary schema 2, throughput.total = trajectory ATTEMPTS and
+    throughput.succeeded = completions (dimensionally consistent; schema 1
+    emitted total = slot count = 768 and a negative failed). The floor must
+    read succeeded (3840 >= 0.9*3840): attempts shrink when slots give up on
+    persistent create-failure, so only completions measure the work done.
+    exec_ephemeral has no admission controller (peak_active=None), so the
+    over-admission clause is skipped, and the failure_rate clause is skipped
+    for M>1 (the succeeded-floor is the sole M gate)."""
+    s = _summary(total=3840, succeeded=3840, failed=0, mode="exec_ephemeral", peak_active=None)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0, multiplier=5, ratio=2) is True
+
+
+def test_compute_valid_multiplier_under_run():
+    """Same M/ratio/N (expected = 3840 completions) but only 2000 trajectories
+    completed: slots exited early (give-up / crash) after 2400 attempts, so
+    succeeded=2000 < 0.9*3840=3456 -> under-run -> invalid. Reading total
+    (attempts=2400) against the floor would also fail here, but only succeeded
+    fails for the RIGHT reason (completed work vs M*k*N). Mirrors reference B's
+    ``total == target_count`` check."""
+    s = _summary(total=2400, succeeded=2000, failed=400, mode="exec_ephemeral", peak_active=None)
+    assert compute_valid(s, return_code=0, n=384, failure_tolerance=0.0, multiplier=5, ratio=2) is False
+
+
+def _trial_row(mode, ratio, repeat, *, wall=100.0, tps=10.0, peak=380, valid=True, failed=0, total=768):
+    s = _summary(total=total, succeeded=total - failed, failed=failed, wall_sec=wall, peak_active=peak, mode=mode)
+    s["throughput"]["tasks_per_sec"] = tps  # thread tps so throughput-degradation medians are non-zero
+    return trial_row(
+        mode=mode,
+        ratio=ratio,
+        repeat=repeat,
+        running_concurrency=384,
+        target_count=ratio * 384,
+        summary=s,
+        return_code=0,
+        valid=valid,
+        reused=False,
+        trial_dir="t",
+        run_summary_path="s.json",
+    )
+
+
+def test_trial_row_fields_match_csv_schema():
+    r = _trial_row("lifecycle", 2, 1)
+    assert r["mode"] == "lifecycle"
+    assert r["ratio"] == 2
+    assert r["oversubscription_ratio"] == 2
+    assert r["target_count"] == 768
+    assert r["running_concurrency"] == 384
+    assert r["failure_rate"] == 0.0
+    assert r["peak_active"] == 380
+    assert r["valid"] is True
+    assert r["test_duration"] == 1000
+
+
+def test_aggregate_ratio_summary_medians_and_degradation():
+    trials = [
+        _trial_row("lifecycle", 1, 1, wall=100, tps=10),
+        _trial_row("lifecycle", 1, 2, wall=120, tps=9),
+        _trial_row("lifecycle", 2, 1, wall=200, tps=5),
+        _trial_row("lifecycle", 2, 2, wall=180, tps=6),
+    ]
+    rows = aggregate_ratio_summary(trials)
+    by = {(r["mode"], r["ratio"]): r for r in rows}
+    r1 = by[("lifecycle", 1)]
+    r2 = by[("lifecycle", 2)]
+    assert r1["attempted"] == 2 and r1["successful"] == 2
+    assert r1["median_wall_sec"] == 110.0  # median(100,120)
+    # k=2 baseline is k=1: degradation vs median_wall 110 -> (190-110)/110*100
+    assert abs(r2["median_wall_sec"] - 190.0) < 0.01
+    assert abs(r2["time_degradation_vs_1_1_pct"] - (190 - 110) / 110 * 100) < 0.01
+    # throughput gain: median(5,6)=5.5 vs 9.5 -> (5.5-9.5)/9.5*100
+    assert abs(r2["throughput_gain_vs_1_1_pct"] - (5.5 - 9.5) / 9.5 * 100) < 0.01
+
+
+def test_aggregate_ratio_summary_degradation_needs_k1_baseline():
+    """No k=1 in a mode -> degradation columns absent (0.0), not a crash."""
+    trials = [_trial_row("exec_only", 2, 1, wall=200, tps=5, peak=None)]
+    rows = aggregate_ratio_summary(trials)
+    assert len(rows) == 1
+    # No k=1 baseline -> degradation defaults to 0.0 (no baseline to compare).
+    assert rows[0]["time_degradation_vs_1_1_pct"] == 0.0
+
+
+def _traj_row(mode, ratio, *, exec_sec, n_steps, n_failed=0):
+    return {"mode": mode, "ratio": ratio, "exec_sec": exec_sec, "n_steps": n_steps, "n_failed": n_failed}
+
+
+def test_aggregate_ratio_summary_cmd_exec_stats():
+    trials = [_trial_row("lifecycle", 1, 1), _trial_row("lifecycle", 2, 1, wall=200, tps=5)]
+    traj_rows = [
+        # ratio 1: per-cmd avg = (4+6)/(10+10) = 0.5; per-run means median(0.4,0.6) = 0.5
+        _traj_row("lifecycle", 1, exec_sec=4.0, n_steps=10),
+        _traj_row("lifecycle", 1, exec_sec=6.0, n_steps=10),
+        # a failed run is excluded (truncated exec would drag the mean down)
+        _traj_row("lifecycle", 1, exec_sec=0.1, n_steps=10, n_failed=2),
+        # ratio 2: avg = 12/10 = 1.2 -> degradation (1.2-0.5)/0.5*100 = 140%
+        _traj_row("lifecycle", 2, exec_sec=12.0, n_steps=10),
+        # a zero-step / None-exec run is ignored, not a ZeroDivisionError
+        _traj_row("lifecycle", 2, exec_sec=None, n_steps=0),
+    ]
+    rows = aggregate_ratio_summary(trials, traj_rows)
+    by = {(r["mode"], r["ratio"]): r for r in rows}
+    assert by[("lifecycle", 1)]["avg_cmd_exec_sec"] == 0.5
+    assert by[("lifecycle", 1)]["median_cmd_exec_sec"] == 0.5
+    assert by[("lifecycle", 1)]["cmd_exec_degradation_vs_1_1_pct"] == 0.0
+    assert abs(by[("lifecycle", 2)]["avg_cmd_exec_sec"] - 1.2) < 1e-6
+    assert abs(by[("lifecycle", 2)]["cmd_exec_degradation_vs_1_1_pct"] - 140.0) < 0.01
+
+
+def test_aggregate_ratio_summary_cmd_exec_defaults_without_traj_rows():
+    """Older callers pass no traj rows -> cmd columns default to 0.0, no crash."""
+    rows = aggregate_ratio_summary([_trial_row("lifecycle", 1, 1)])
+    assert rows[0]["avg_cmd_exec_sec"] == 0.0
+    assert rows[0]["median_cmd_exec_sec"] == 0.0
+    assert rows[0]["cmd_exec_degradation_vs_1_1_pct"] == 0.0
+
+
+def _seed_stress_index(stamp, *, stress_sec, create_sec=0.0, kill_sec=0.0, n_runs=4, omit_breakdown=0):
+    """Write a trajectories/index.json with ``n_runs`` runs.
+
+    The last ``omit_breakdown`` runs carry no ``time_breakdown_sec`` -- the
+    older-index / failed-create shape that must not be scored as a zero-second
+    completion.
+    """
+    traj_dir = stamp / "trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    trajectories = []
+    for i in range(n_runs):
+        row = {
+            "trajectory_id": f"t{i}",
+            "sandbox_index": i,
+            "n_steps": 3,
+            "n_failed": 0,
+            "n_timeout": 0,
+            "success_rate": 1.0,
+            "elapsed_sec": create_sec + stress_sec + kill_sec,
+        }
+        if i < n_runs - omit_breakdown:
+            row["time_breakdown_sec"] = {"create": create_sec, "kill": kill_sec, "stress": stress_sec}
+        trajectories.append(row)
+    (traj_dir / "index.json").write_text(
+        json.dumps({"n_trajectories": n_runs, "trajectories": trajectories}), encoding="utf-8"
+    )
+
+
+def _stress_trial(
+    tmp_path,
+    *,
+    ratio,
+    tps,
+    mode="exec_ephemeral",
+    repeat=1,
+    create_sec=0.0,
+    kill_sec=0.0,
+    omit_breakdown=0,
+    stress_sec=10.0,
+):
+    stamp = tmp_path / f"{mode}-r{ratio}-rep{repeat}" / "rb_20260905-140000"
+    _seed_stress_index(
+        stamp, stress_sec=stress_sec, create_sec=create_sec, kill_sec=kill_sec, omit_breakdown=omit_breakdown
+    )
+    s = _summary(total=4, succeeded=4, failed=0, wall_sec=100.0, peak_active=2, mode=mode)
+    s["throughput"]["tasks_per_sec"] = tps
+    return trial_row(
+        mode=mode,
+        ratio=ratio,
+        repeat=repeat,
+        running_concurrency=2,
+        target_count=ratio * 2,
+        summary=s,
+        return_code=0,
+        valid=True,
+        reused=False,
+        trial_dir=str(stamp),
+        run_summary_path=str(stamp / "rb_run_summary.json"),
+    )
+
+
+def test_stress_rate_excludes_create_kill(tmp_path):
+    """create/kill move the e2e rate but not stress_tasks_per_sec."""
+    rows = [
+        _stress_trial(tmp_path, ratio=1, tps=0.04),
+        _stress_trial(tmp_path, ratio=2, repeat=1, tps=0.004, create_sec=100.0, kill_sec=50.0),
+        _stress_trial(tmp_path, ratio=2, repeat=2, tps=0.02),  # same ratio, no create/kill cost
+    ]
+    write_outputs(rows, output_root=tmp_path)
+    trials = {
+        (r["ratio"], r["repeat"]): r for r in csv.DictReader((tmp_path / "trial-summary.csv").read_text().splitlines())
+    }
+    assert float(trials[("1", "1")]["mean_stress_sec"]) == 10.0
+    # Admission-free workers = target_count (k*2): 2*4/40 and 4*4/40.
+    assert float(trials[("1", "1")]["stress_tasks_per_sec"]) == 0.2
+    assert float(trials[("2", "1")]["stress_tasks_per_sec"]) == 0.4
+    # The e2e rates differ, the stress-only rates do not: create/kill is out.
+    assert trials[("2", "1")]["tasks_per_sec"] != trials[("2", "2")]["tasks_per_sec"]
+    assert trials[("2", "1")]["stress_tasks_per_sec"] == trials[("2", "2")]["stress_tasks_per_sec"]
+    ratio_rows = {r["ratio"]: r for r in csv.DictReader((tmp_path / "ratio-summary.csv").read_text().splitlines())}
+    assert float(ratio_rows["2"]["median_stress_tasks_per_sec"]) == 0.4
+    assert float(ratio_rows["2"]["stress_throughput_gain_vs_1_1_pct"]) == 100.0
+    assert float(ratio_rows["2"]["throughput_gain_vs_1_1_pct"]) == -70.0  # median(0.004, 0.02) vs 0.04
+
+
+def test_stress_gain_blank_when_a_ratio_has_no_measured_window(tmp_path):
+    """Unmeasured is blank (n/a), never a fabricated 0.0 rate / -100% gain."""
+    write_outputs(
+        [
+            _stress_trial(tmp_path, ratio=1, tps=0.04),
+            _stress_trial(tmp_path, ratio=2, tps=0.02, stress_sec=0.0),
+        ],
+        output_root=tmp_path,
+    )
+    trials = {r["ratio"]: r for r in csv.DictReader((tmp_path / "trial-summary.csv").read_text().splitlines())}
+    assert trials["2"]["stress_tasks_per_sec"] == ""
+    rows = {r["ratio"]: r for r in csv.DictReader((tmp_path / "ratio-summary.csv").read_text().splitlines())}
+    assert rows["2"]["median_stress_tasks_per_sec"] == ""
+    assert rows["2"]["stress_throughput_gain_vs_1_1_pct"] == ""
+
+
+def test_stress_rate_uses_target_count_for_interleaved_lifecycle(tmp_path):
+    """lifecycle re-acquires the slot per step, so its windows overlap k-fold."""
+    write_outputs([_stress_trial(tmp_path, ratio=2, tps=0.004, mode="lifecycle")], output_root=tmp_path)
+    trial = next(iter(csv.DictReader((tmp_path / "trial-summary.csv").read_text().splitlines())))
+    # k*N = 4 workers, not running_concurrency = 2: one run's window also spans
+    # the other tenant served between its steps.
+    assert float(trial["stress_tasks_per_sec"]) == 0.4
+
+
+def test_stress_rate_counts_only_fully_successful_runs():
+    """A zero-step or partly-failed run is not a completion, even when measured."""
+    from bench_core.oversub import _stress_rate_stats
+
+    rows = [
+        {"mode": "exec_ephemeral", "ratio": 1, "repeat": 1, "stress_sec": 10.0, "success_rate": 1.0},
+        {"mode": "exec_ephemeral", "ratio": 1, "repeat": 1, "stress_sec": 10.0, "success_rate": None},
+        {"mode": "exec_ephemeral", "ratio": 1, "repeat": 1, "stress_sec": 10.0, "success_rate": 0.5},
+    ]
+    trials = [{"mode": "exec_ephemeral", "ratio": 1, "repeat": 1, "target_count": 2}]
+    stats = _stress_rate_stats(rows, trials)
+    assert stats[("exec_ephemeral", 1, 1)]["stress_tasks_per_sec"] == 0.067  # 2*1/30 (only 1 success)
+
+
+def test_stress_rate_ignores_unmeasured_runs(tmp_path):
+    """A run without a stress breakdown is absent, not a 0-second completion."""
+    write_outputs([_stress_trial(tmp_path, ratio=1, tps=0.04, omit_breakdown=2)], output_root=tmp_path)
+    trial = next(iter(csv.DictReader((tmp_path / "trial-summary.csv").read_text().splitlines())))
+    assert float(trial["mean_stress_sec"]) == 10.0
+    assert float(trial["stress_tasks_per_sec"]) == 0.2  # 2 measured runs, not 4
+
+
+def test_write_outputs_emits_all_four_files(tmp_path):
+    trials = [_trial_row("lifecycle", 1, 1), _trial_row("lifecycle", 2, 1, wall=200, tps=5)]
+    # Seed a fake trajectories/index.json in one trial's (fake) run_summary path dir.
+    write_outputs(trials, output_root=tmp_path)
+    assert (tmp_path / "trial-summary.csv").exists()
+    assert (tmp_path / "ratio-summary.csv").exists()
+    assert (tmp_path / "trajectory-detail.csv").exists()
+    assert (tmp_path / "benchmark-report.json").exists()
+    # trial-summary has one row per trial.
+    tsv = (tmp_path / "trial-summary.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert len(tsv) == 1 + 2  # header + 2 trials
+    # benchmark-report.json is valid JSON with the trials array.
+    import json as _j
+
+    rep = _j.loads((tmp_path / "benchmark-report.json").read_text(encoding="utf-8"))
+    assert "configuration" in rep and "trials" in rep and "ratio_summary" in rep
+
+
+def test_trajectory_detail_has_rows(tmp_path):
+    # Seed a trial dir with trajectories/index.json next to the run_summary path.
+    trial_stamp = tmp_path / "t" / "rb_20260905-140000"
+    traj_dir = trial_stamp / "trajectories"
+    traj_dir.mkdir(parents=True)
+    idx = {
+        "n_trajectories": 1,
+        "trajectories": [
+            {
+                "trajectory_id": "t0",
+                "sandbox_index": 0,
+                "n_steps": 3,
+                "n_failed": 0,
+                "n_timeout": 0,
+                "success_rate": 1.0,
+                "elapsed_sec": 1.5,
+                "time_breakdown_sec": {
+                    "slice_total": 1.2,
+                    "exec": 0.6,
+                    "resume": 0.3,
+                    "pause": 0.3,
+                    "requested_delay": 0.2,
+                    "create": 0.05,
+                    "kill": 0.05,
+                    "interaction_total": 1.4,
+                    "slot_contention_wait": 0.0,
+                    "resume_rate_pacing_wait": 0.0,
+                    "pause_rate_pacing_wait": 0.0,
+                    "running_slot_held": 1.2,
+                },
+                "create_error_type": None,
+                "kill_error_type": None,
+                "file": "t0/replay_result.json",
+            }
+        ],
+    }
+    (traj_dir / "index.json").write_text(json.dumps(idx), encoding="utf-8")
+    # Build a trial row whose run_summary_path points at the run_summary inside that stamp dir.
+    s = _summary(total=4, succeeded=4, failed=0, wall_sec=100.0, peak_active=380, mode="lifecycle", test_duration=1000)
+    s["throughput"]["tasks_per_sec"] = 10.0
+    row = trial_row(
+        mode="lifecycle",
+        ratio=2,
+        repeat=1,
+        running_concurrency=384,
+        target_count=768,
+        summary=s,
+        return_code=0,
+        valid=True,
+        reused=False,
+        trial_dir=str(trial_stamp),
+        run_summary_path=str(trial_stamp / "rb_run_summary.json"),
+    )
+    write_outputs([row], output_root=tmp_path)
+    detail = (tmp_path / "trajectory-detail.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert len(detail) == 2  # header + 1 trajectory row
+    assert "t0" in detail[1]
+    # the per-trajectory timing breakdown columns surface in the CSV with the
+    # seeded values -- a reader can attribute elapsed_sec to exec/resume/pause/...
+    reader = csv.DictReader((tmp_path / "trajectory-detail.csv").read_text(encoding="utf-8").splitlines())
+    r = list(reader)[0]
+    assert r["exec_sec"] == "0.6"
+    assert r["resume_sec"] == "0.3"
+    assert r["pause_sec"] == "0.3"
+    assert r["slice_total_sec"] == "1.2"
+    assert r["requested_delay_sec"] == "0.2"
+    assert r["create_sec"] == "0.05"
+    assert r["kill_sec"] == "0.05"
+    assert r["running_slot_held_sec"] == "1.2"
+    # The renamed rate-pacing short keys must surface end-to-end: present in the
+    # index.json time_breakdown_sec (the canonical caliber) and emitted as their
+    # own trajectory-detail CSV columns; no legacy *_queue_wait names remain.
+    bd = idx["trajectories"][0]["time_breakdown_sec"]
+    assert "resume_rate_pacing_wait" in bd and "pause_rate_pacing_wait" in bd
+    assert "resume_queue_wait" not in bd and "pause_queue_wait" not in bd
+    assert "resume_rate_pacing_wait_sec" in r and "pause_rate_pacing_wait_sec" in r
+    assert "resume_queue_wait_sec" not in r and "pause_queue_wait_sec" not in r
+    # benchmark-report.json trajectory_details also populated
+    import json as _j
+
+    rep = _j.loads((tmp_path / "benchmark-report.json").read_text(encoding="utf-8"))
+    assert len(rep["trajectory_details"]) == 1
+    td = rep["trajectory_details"][0]
+    assert td["trajectory_id"] == "t0"
+    assert td["exec_sec"] == 0.6
+    assert td["pause_sec"] == 0.3
+
+
+def test_trajectory_detail_old_index_compat(tmp_path):
+    """An older trajectories/index.json (no time_breakdown_sec, e.g. produced
+    before this enrichment) must still yield a row -- the breakdown columns are
+    present in the header but blank -- rather than crash. Backward compat for
+    consuming pre-existing trial outputs."""
+    trial_stamp = tmp_path / "t" / "rb_20260905-150000"
+    (trial_stamp / "trajectories").mkdir(parents=True)
+    idx = {
+        "n_trajectories": 1,
+        "trajectories": [
+            {
+                "trajectory_id": "old0",
+                "sandbox_index": 0,
+                "n_steps": 1,
+                "n_failed": 0,
+                "n_timeout": 0,
+                "success_rate": 1.0,
+                "elapsed_sec": 2.0,
+                "create_error_type": None,
+                "kill_error_type": None,
+                "file": "old0/replay_result.json",
+            }
+        ],
+    }
+    (trial_stamp / "trajectories" / "index.json").write_text(json.dumps(idx), encoding="utf-8")
+    s = _summary(total=4, succeeded=4, failed=0, wall_sec=100.0, peak_active=380, mode="lifecycle", test_duration=1000)
+    s["throughput"]["tasks_per_sec"] = 10.0
+    row = trial_row(
+        mode="lifecycle",
+        ratio=1,
+        repeat=1,
+        running_concurrency=384,
+        target_count=384,
+        summary=s,
+        return_code=0,
+        valid=True,
+        reused=False,
+        trial_dir=str(trial_stamp),
+        run_summary_path=str(trial_stamp / "rb_run_summary.json"),
+    )
+    write_outputs([row], output_root=tmp_path)
+    reader = csv.DictReader((tmp_path / "trajectory-detail.csv").read_text(encoding="utf-8").splitlines())
+    rows = list(reader)
+    assert len(rows) == 1
+    assert rows[0]["trajectory_id"] == "old0"
+    # breakdown columns exist in the header but are blank (no source data).
+    assert "exec_sec" in reader.fieldnames
+    assert rows[0]["exec_sec"] in ("", None)
+    assert rows[0]["pause_sec"] in ("", None)
+
+
+def test_trajectory_detail_action_series(tmp_path):
+    # action_series is trajectory-level in index.json; the driver keeps it on
+    # every run row in benchmark-report.json (and in replay_result.json per
+    # trajectory) but OMITS it from trajectory-detail.csv so a multi-line
+    # command cell doesn't bloat every Excel row.
+    trial_stamp = tmp_path / "t" / "rb_20260905-160000"
+    traj_dir = trial_stamp / "trajectories"
+    traj_dir.mkdir(parents=True)
+    idx = {
+        "n_trajectories": 1,
+        "trajectories": [
+            {
+                "trajectory_id": "t0",
+                "n_steps": 2,
+                "n_failed": 0,
+                "n_timeout": 0,
+                "success_rate": 1.0,
+                "elapsed_sec": 1.5,
+                "time_breakdown_sec": {
+                    k: 0.1
+                    for k in (
+                        "slice_total",
+                        "exec",
+                        "resume",
+                        "pause",
+                        "requested_delay",
+                        "create",
+                        "kill",
+                        "interaction_total",
+                        "slot_contention_wait",
+                        "natural_delay",
+                        "capacity_wait",
+                        "rate_pacing_wait",
+                        "inflight_wait",
+                        "resume_rate_pacing_wait",
+                        "pause_rate_pacing_wait",
+                        "resume_inflight_wait",
+                        "pause_inflight_wait",
+                        "running_slot_held",
+                    )
+                },
+                "create_error_type": None,
+                "kill_error_type": None,
+                "action_series": "echo one\necho two",
+                "runs": [
+                    {
+                        "sandbox_index": 0,
+                        "round_id": 0,
+                        "elapsed_sec": 1.5,
+                        "n_steps": 2,
+                        "n_failed": 0,
+                        "n_timeout": 0,
+                        "success_rate": 1.0,
+                        "create_error_type": None,
+                        "kill_error_type": None,
+                        "time_breakdown_sec": {},
+                    },
+                    {
+                        "sandbox_index": 1,
+                        "round_id": 0,
+                        "elapsed_sec": 1.6,
+                        "n_steps": 2,
+                        "n_failed": 0,
+                        "n_timeout": 0,
+                        "success_rate": 1.0,
+                        "create_error_type": None,
+                        "kill_error_type": None,
+                        "time_breakdown_sec": {},
+                    },
+                ],
+                "file": "t0/replay_result.json",
+            }
+        ],
+    }
+    (traj_dir / "index.json").write_text(json.dumps(idx), encoding="utf-8")
+    s = _summary(total=4, succeeded=4, failed=0, wall_sec=100.0, peak_active=380, mode="lifecycle", test_duration=1000)
+    s["throughput"]["tasks_per_sec"] = 10.0
+    row = trial_row(
+        mode="lifecycle",
+        ratio=2,
+        repeat=1,
+        running_concurrency=384,
+        target_count=768,
+        summary=s,
+        return_code=0,
+        valid=True,
+        reused=False,
+        trial_dir=str(trial_stamp),
+        run_summary_path=str(trial_stamp / "rb_run_summary.json"),
+    )
+    write_outputs([row], output_root=tmp_path)
+    # Read with newline="" so any quoted field round-trips through csv.DictReader
+    # (read_text().splitlines() strips the line terminators the csv reader needs).
+    with open(tmp_path / "trajectory-detail.csv", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    assert len(rows) == 2  # two runs -> two CSV rows
+    # action_series is intentionally absent from the CSV columns (multi-line
+    # command content would bloat every Excel row); it stays in the JSON report.
+    assert "action_series" not in reader.fieldnames
+    for r in rows:
+        assert "action_series" not in r
+    # still surfaces in benchmark-report.json trajectory_details
+    rep = json.loads((tmp_path / "benchmark-report.json").read_text(encoding="utf-8"))
+    assert all(td["action_series"] == "echo one\necho two" for td in rep["trajectory_details"])
