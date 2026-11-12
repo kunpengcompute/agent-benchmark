@@ -18,6 +18,18 @@ python -m pip install -e .
 
 `vm_monitor` itself needs `psutil`, `pandas`, `openpyxl`, `PyYAML`, `python-dotenv` (declared in `pyproject.toml`). The external collection tools (devkit, ksys, …) are **not** pip packages — they are vendor/kernel tools you install separately and point at via `.env`.
 
+## 30-second quick start
+
+Timer mode runs on any Linux host, no benchmark needed:
+
+```bash
+sudo vm-monitor -t 60 -i 2 --vmm qemu
+```
+
+With no VMs running, `VM_Stats` / `Per-VM` come out empty but `Host resources`, `NUMA` and `Disk IO` still populate — that is not a failure.
+
+**Running bench-core?** You do not call `vm-monitor` yourself — bench-core auto-starts it around the stress phase and writes to `<report.output_dir>/vm_monitor/` (see [bench-core integration](#bench-core-integration-auto-vm-monitor)). This guide is for standalone use and for reading those outputs.
+
 ## Modes
 
 Three run modes (mutually exclusive on the timing/sync axis):
@@ -89,7 +101,7 @@ Each subclass extends `VMMonitorBase` and supplies `get_process_names()` / `extr
 
 ## `.env` configuration
 
-Loaded by `vm_monitor/config.py::load_env_config`. Place a `.env` in the cwd you launch `vm-monitor` from:
+Loaded by `vm_monitor/config.py::load_env_config`. Place a `.env` in the cwd you launch `vm-monitor` from. When bench-core drives the monitor, the subprocess inherits bench-core's cwd (no `cwd=` is passed) — so the `.env` must sit in the directory you run `bench-core` from, not next to any vm_monitor source.
 
 ```env
 # DevKit CLI (shared by devkit_top_down + devkit_mem)
@@ -204,6 +216,8 @@ devkit split (target `devkit` — the two sub-tools share `DEVKIT_PATH`):
 
 ## Outputs
 
+Two xlsx files, one rule: open `resource_report.xlsx` → `Summary` for a single-screen overview; reach for `host_resources.xlsx` when you need per-sample time-series drill-down.
+
 ```
 logs_<timestamp>/
 ├── qemu_monitor.csv         # raw per-sample VM records (or firecracker_monitor.csv)
@@ -243,34 +257,20 @@ exports in ~370 MB, an 8 h one in ~690 MB).
 
 > The xlsx is written **last** deliberately — `bench-core`'s `MonitorController` polls for `resource_report.xlsx` as the "all artifacts written" signal and reaps the subprocess the moment it appears. SVG runs before xlsx so it isn't dropped by that reap.
 
+> `raw_data/` CSVs are pre-converted, **not raw kernel units**: `host_mem_raw.csv` is MB (not kB), `vm_cpu_raw.csv` is jiffies, `disk_io_raw.csv` is 512-byte sectors. Rate derivation formulas: [metrics-reference §2.7](../dev/metrics-reference.md#27-collection-sources-calculation-formulas).
+
+## Reading the outputs (5 minutes)
+
+- `resource_report.xlsx` → `Summary`: single-screen peak/avg snapshot. First stops: `Host Peak CPU`, `VM Peak Total CPU`, `Swap Peak Usage %`, `Dirty Peak`, `Disk Write Peak`.
+- `resource_report.xlsx` → `NUMA_Overview`: per-node `Avg CPU (%)` and `Peak Used (MB)` — memory skewing to one socket shows up here.
+- `resource_report.xlsx` → `VM_Stats`: per-VM CPU and memory footprint — which VM is the heavy one.
+- `host_resources.xlsx`: the same story as per-sample time series (5 sheets + charts) for drill-down and trend claims.
+- `svg/*.svg`: one dark-themed curve per dimension; eyeball for step changes.
+- `raw_data/*.csv`: the per-sample source of truth for custom analysis (mind the units note above).
+
 ## Sampling cost
 
 Per-VM cost is dominated by `numa_maps` + `smaps_rollup`, which walk the target's page tables (~35 ms per GiB with 4 KiB pages, ~12 ms per GiB when THP-backed, measured per VM at a 192-VM fleet). The monitor budgets that pass to 25 % of one core per sample interval and round-robins the fleet: when a full pass does not fit (large, page-heavy fleets) each VM's memory fields refresh every `stride` samples and carry forward, while CPU% and jiffies are still read for every VM on every sample. A stride > 1 is logged once at INFO; small and THP-backed fleets refresh every sample as before.
-
-## Python API
-
-```python
-from vm_monitor import QEMUMonitor, FirecrackerMonitor, VMMonitorBase
-
-# QEMU
-mon = QEMUMonitor()
-mon.target_numa_nodes = [0, 1]
-mon.start_monitoring(duration_seconds=60, interval_seconds=3)
-mon.analyze_and_export("qemu.csv", "summary.csv")
-
-# Firecracker
-fc = FirecrackerMonitor()
-fc.start_monitoring(duration_seconds=60, interval_seconds=3)
-
-# Custom VMM
-class MyMonitor(VMMonitorBase):
-    def get_process_names(self): return ("my-vmm",)
-    def extract_vm_id(self, pid, cmdline): return f"myvm-{pid}"
-    def get_monitor_title(self): return "My VMM Monitoring"
-    def get_no_vm_message(self): return "No running instances"
-    def get_csv_filename_prefix(self): return "my_vmm"
-    def get_vms_realtime(self): ...
-```
 
 ## bench-core integration (auto vm-monitor)
 
@@ -299,6 +299,8 @@ monitor:
 
 `--no-vm-monitor` on the CLI short-circuits it off. Missing binary/tools or an unwritable lock dir degrade to a warning + skip — never compromises the bench.
 
+How to tell it actually ran: check that `<report.output_dir>/vm_monitor/resource_report.xlsx` exists. If the `vm_monitor/` dir is absent or has no xlsx, host collection was skipped — grep the bench-core log for `vm_monitor disabled` / `[WARN]` for the reason.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -310,4 +312,29 @@ monitor:
 | No VMs detected | Wrong `--vmm`, or VM processes not yet started (stress-sync mode still waiting) |
 | Disk I/O all zero | `--disks` filtered out physical devices, or no I/O during the window |
 
-For full metric definitions (every sheet's columns + `/proc`/`/sys` sources & formulas), see [Metrics Reference](../dev/metrics-reference.md).
+## Advanced: Python API
+
+```python
+from vm_monitor import QEMUMonitor, FirecrackerMonitor, VMMonitorBase
+
+# QEMU
+mon = QEMUMonitor()
+mon.target_numa_nodes = [0, 1]
+mon.start_monitoring(duration_seconds=60, interval_seconds=3)
+mon.analyze_and_export("qemu.csv", "summary.csv")
+
+# Firecracker
+fc = FirecrackerMonitor()
+fc.start_monitoring(duration_seconds=60, interval_seconds=3)
+
+# Custom VMM
+class MyMonitor(VMMonitorBase):
+    def get_process_names(self): return ("my-vmm",)
+    def extract_vm_id(self, pid, cmdline): return f"myvm-{pid}"
+    def get_monitor_title(self): return "My VMM Monitoring"
+    def get_no_vm_message(self): return "No running instances"
+    def get_csv_filename_prefix(self): return "my_vmm"
+    def get_vms_realtime(self): ...
+```
+
+For full metric definitions (every sheet's columns + `/proc`/`/sys` sources & formulas), see [Metrics Reference](../dev/metrics-reference.md); for "my benchmark slowed down — which metric do I read?", start at [§3 Bottleneck identification](../dev/metrics-reference.md#3-using-metrics-for-bottleneck-identification).

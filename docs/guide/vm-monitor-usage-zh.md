@@ -18,6 +18,18 @@ python -m pip install -e .
 
 `vm_monitor` 本身依赖 `psutil`、`pandas`、`openpyxl`、`PyYAML`、`python-dotenv`（在 `pyproject.toml` 中声明）。外部采集工具（devkit、ksys 等）**不是** pip 包——它们是厂商/内核工具，需自行安装并通过 `.env` 指定路径。
 
+## 30 秒快速上手
+
+计时模式在任何 Linux 主机上都可跑，无需 benchmark：
+
+```bash
+sudo vm-monitor -t 60 -i 2 --vmm qemu
+```
+
+没有 VM 运行时，`VM_Stats` / `Per-VM` 会是空的，但 `Host resources`、`NUMA`、`Disk IO` 照常产出——这不是故障。
+
+**在跑 bench-core？** 你不需要手动调用 `vm-monitor`——bench-core 会自动包裹压测阶段启动它，输出到 `<report.output_dir>/vm_monitor/`（见 [bench-core 集成](#bench-core-集成自动-vm-monitor)）。本指南面向独立使用与产物解读。
+
 ## 运行模式
 
 三种模式（在时序/同步轴上互斥）：
@@ -89,7 +101,7 @@ sudo vm-monitor -t 300 -i 2 --vmm firecracker --enable-capture --auto-skip \
 
 ## `.env` 配置
 
-由 `vm_monitor/config.py::load_env_config` 加载。在启动 `vm-monitor` 的 cwd 下放置 `.env`：
+由 `vm_monitor/config.py::load_env_config` 加载。在启动 `vm-monitor` 的 cwd 下放置 `.env`。bench-core 驱动时子进程继承 bench-core 的 cwd（未传 `cwd=`）——因此 `.env` 必须放在**运行 `bench-core` 的目录**，而不是 vm_monitor 源码目录里：
 
 ```env
 # DevKit CLI（devkit_top_down 与 devkit_mem 共用）
@@ -208,6 +220,8 @@ devkit 拆分（target `devkit` —— 两个子工具共用 `DEVKIT_PATH`）：
 
 ## 输出
 
+两个 xlsx、一条规则：单屏总览打开 `resource_report.xlsx` → `Summary`；要逐采样时序下钻再打开 `host_resources.xlsx`。
+
 ```
 logs_<timestamp>/
 ├── qemu_monitor.csv         # 原始每采样 VM 记录（或 firecracker_monitor.csv）
@@ -246,34 +260,20 @@ logs_<timestamp>/
 
 > xlsx 被**最后**写入是有意为之——`bench-core` 的 `MonitorController` 以 `resource_report.xlsx` 作为"全部产物已写入"的信号，在其出现的瞬间收割子进程。SVG 先于 xlsx 运行，以免被该收割切断。
 
+> `raw_data/` 的 CSV 是**预转换过的，不是内核原始单位**：`host_mem_raw.csv` 是 MB（不是 kB）、`vm_cpu_raw.csv` 是 jiffies、`disk_io_raw.csv` 是 512 字节扇区。速率推导公式见 [metrics-reference §2.7](../dev/metrics-reference.md#27-collection-sources-calculation-formulas)。
+
+## 读懂输出（5 分钟）
+
+- `resource_report.xlsx` → `Summary`：单屏峰值/均值快照。先看 `Host Peak CPU`、`VM Peak Total CPU`、`Swap Peak Usage %`、`Dirty Peak`、`Disk Write Peak`。
+- `resource_report.xlsx` → `NUMA_Overview`：每节点 `Avg CPU (%)` 与 `Peak Used (MB)`——内存偏向单个 socket 在这里现形。
+- `resource_report.xlsx` → `VM_Stats`：每 VM 的 CPU 与内存足迹——定位最重的那个 VM。
+- `host_resources.xlsx`：同一批指标按逐采样时序展开（5 个 sheet + 图表），用于下钻与趋势判断。
+- `svg/*.svg`：每个维度一条深色主题曲线，肉眼扫阶跃变化。
+- `raw_data/*.csv`：自定义分析的逐采样数据源（注意上面的单位说明）。
+
 ## 采样开销
 
 单 VM 采样的主要开销来自 `numa_maps` + `smaps_rollup` 的页表遍历（192 VM 集群实测：4 KiB 页约 35 ms/GiB，THP 后备约 12 ms/GiB）。监控器把这一轮遍历限制在每采样周期 25% 单核的预算内，并在整个 VM 集群上轮转：装不下时（大集群、页表重）每个 VM 的内存字段每 `stride` 个采样刷新一次并沿用上次实测值，而 CPU% 与 jiffies 仍在每个采样周期对每个 VM 读取。`stride > 1` 只在 INFO 级别打一次日志；小集群与 THP 后备集群和以前一样每个采样周期全量刷新。
-
-## Python API
-
-```python
-from vm_monitor import QEMUMonitor, FirecrackerMonitor, VMMonitorBase
-
-# QEMU
-mon = QEMUMonitor()
-mon.target_numa_nodes = [0, 1]
-mon.start_monitoring(duration_seconds=60, interval_seconds=3)
-mon.analyze_and_export("qemu.csv", "summary.csv")
-
-# Firecracker
-fc = FirecrackerMonitor()
-fc.start_monitoring(duration_seconds=60, interval_seconds=3)
-
-# 自定义 VMM
-class MyMonitor(VMMonitorBase):
-    def get_process_names(self): return ("my-vmm",)
-    def extract_vm_id(self, pid, cmdline): return f"myvm-{pid}"
-    def get_monitor_title(self): return "My VMM Monitoring"
-    def get_no_vm_message(self): return "No running instances"
-    def get_csv_filename_prefix(self): return "my_vmm"
-    def get_vms_realtime(self): ...
-```
 
 ## bench-core 集成（自动 vm-monitor）
 
@@ -302,6 +302,8 @@ monitor:
 
 CLI 的 `--no-vm-monitor` 会短路关闭。缺失二进制/工具或锁目录不可写时降级为告警 + 跳过——绝不影响 bench 本身。
 
+怎么确认它真的跑了：检查 `<report.output_dir>/vm_monitor/resource_report.xlsx` 是否存在。若 `vm_monitor/` 目录缺失或没有 xlsx，说明主机采集被跳过——在 bench-core 日志里 grep `vm_monitor disabled` / `[WARN]` 找原因。
+
 ## 故障排查
 
 | 现象 | 原因 / 修复 |
@@ -313,4 +315,30 @@ CLI 的 `--no-vm-monitor` 会短路关闭。缺失二进制/工具或锁目录�
 | 未检测到 VM | `--vmm` 选错，或 VM 进程尚未启动（压测同步模式仍在等待） |
 | 磁盘 I/O 全为 0 | `--disks` 过滤掉了物理设备，或窗口期内确无 I/O |
 
-完整指标定义（每个 sheet 的列 + `/proc`/`/sys` 来源与公式）见 [Metrics Reference](../dev/metrics-reference.md)。
+## 高级：Python API
+
+```python
+from vm_monitor import QEMUMonitor, FirecrackerMonitor, VMMonitorBase
+
+# QEMU
+mon = QEMUMonitor()
+mon.target_numa_nodes = [0, 1]
+mon.start_monitoring(duration_seconds=60, interval_seconds=3)
+mon.analyze_and_export("qemu.csv", "summary.csv")
+
+# Firecracker
+fc = FirecrackerMonitor()
+fc.start_monitoring(duration_seconds=60, interval_seconds=3)
+
+# 自定义 VMM
+class MyMonitor(VMMonitorBase):
+    def get_process_names(self): return ("my-vmm",)
+    def extract_vm_id(self, pid, cmdline): return f"myvm-{pid}"
+    def get_monitor_title(self): return "My VMM Monitoring"
+    def get_no_vm_message(self): return "No running instances"
+    def get_csv_filename_prefix(self): return "my_vmm"
+    def get_vms_realtime(self): ...
+```
+
+完整指标定义（每个 sheet 的列 + `/proc`/`/sys` 来源与公式）见 [Metrics Reference](../dev/metrics-reference.md)；
+"benchmark 变慢了该看哪个指标"请从 [§3 瓶颈定位](../dev/metrics-reference.md#3-using-metrics-for-bottleneck-identification) 开始。
