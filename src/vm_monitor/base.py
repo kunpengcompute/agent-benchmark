@@ -1517,3 +1517,959 @@ class VMMonitorBase(ABC):
     # (at 1s sub-sample cadence, ~5s of "never seen this spec" -> likely a typo).
     _HOSTPROC_MISS_THRESHOLD = 5
 
+    def collect_host_procs(self):
+        """CPU cores + PSS for each user-specified host process (collect_ublk_daemon
+        generalized to a list of name specs).
+
+        Per spec: resolve the pid lazily via _resolve_hostproc_pid (cached in
+        self._hostproc_pids[label]; re-resolved on /proc/<pid>/stat miss so a
+        late start or restart is picked up), read utime+stime via
+        _read_pid_jiffies and PSS via _read_pss_mb, enqueue raw cumulative
+        counters to hostproc_cpu_raw.csv (the drain thread writes the long CSV),
+        and append a derived {ts, name, cores, pss_mb} row to hostproc_history
+        for the sheet. On miss: DEBUG (transient); after
+        _HOSTPROC_MISS_THRESHOLD consecutive misses while never yet seen,
+        WARNING once ("check comm/cmdline spec") -- surfaces a typo'd spec
+        instead of a silently-empty CSV. Multi-match at resolve time: WARNING
+        once per spec ("matches N pids, tracking first"). All warnings re-arm
+        when the pid is (re)found.
+        """
+        if not self._hostproc_specs:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        now = time.perf_counter()
+        for label, comm, substr in self._hostproc_specs:
+            pid = self._hostproc_pids.get(label)
+            if pid is None:
+                pid, count = self._resolve_hostproc_pid(comm, substr)
+                if pid is not None:
+                    self._hostproc_pids[label] = pid
+                    self._hostproc_warned_missing.discard(label)
+                    self._hostproc_missing_streak[label] = 0
+                    self._hostproc_ever_seen.add(label)
+                    if count > 1 and label not in self._hostproc_warned_multi:
+                        logger.warning(
+                            "host-proc spec %r matched %d pids; tracking pid %d (first match)",
+                            f"{comm}{(':' + substr) if substr else ''}",
+                            count,
+                            pid,
+                        )
+                        self._hostproc_warned_multi.add(label)
+                else:
+                    # transient / late start / typo'd spec -- DEBUG per sample,
+                    # escalate to a one-time WARNING after a streak.
+                    streak = self._hostproc_missing_streak.get(label, 0) + 1
+                    self._hostproc_missing_streak[label] = streak
+                    logger.debug("host-proc %r not found (streak %d)", label, streak)
+                    if (
+                        streak >= self._HOSTPROC_MISS_THRESHOLD
+                        and label not in self._hostproc_warned_missing
+                        and label not in self._hostproc_ever_seen
+                    ):
+                        logger.warning(
+                            "host-proc spec %r not found after %d samples; "
+                            "check comm/cmdline (history will be empty until it appears)",
+                            f"{comm}{(':' + substr) if substr else ''}",
+                            streak,
+                        )
+                        self._hostproc_warned_missing.add(label)
+                    continue
+            js = self._read_pid_jiffies(pid)
+            if js is None:
+                # process exited/restarted -> re-resolve next sample.
+                self._hostproc_pids[label] = None
+                self._hostproc_prev.pop(label, None)
+                self._hostproc_last_t.pop(label, None)
+                logger.debug("host-proc %r pid %d gone; will re-resolve", label, pid)
+                continue
+            pss_mb = self._read_pss_mb(pid) if self._collects("pss") else 0.0
+            if self._proc_raw is not None:
+                self._proc_raw.enqueue_hostproc(ts, label, pid, js[0], js[1], pss_mb)
+            jiffies = js[0] + js[1]
+            cores = 0.0
+            prev = self._hostproc_prev.get(label)
+            if prev is not None:
+                dt = max(1e-6, now - self._hostproc_last_t.get(label, now))
+                cores = round(max(0, jiffies - prev) / _CLK_TCK / dt, 3)
+            self._hostproc_prev[label] = jiffies
+            self._hostproc_last_t[label] = now
+            self.hostproc_history.append({"ts": ts, "name": label, "cores": cores, "pss_mb": round(pss_mb, 2)})
+
+    # ===================== Collect Host Page-Cache Pressure =====================
+    def collect_host_pressure(self, meminfo: dict | None = None, vmstat: dict | None = None, stat: dict | None = None):
+        """Collect host page-cache pressure + runnable/blocked procs per sample.
+
+        Sources (all generic /proc, no sandbox-runtime coupling):
+        - /proc/meminfo: AnonPages, file cache (Cached+Buffers-Shmem),
+          SReclaimable. ``meminfo`` is the pre-read dict shared across one
+          collect_sample cycle (also consumed by collect_swap_stats and
+          collect_host_mem_detail); read here when None.
+        - /proc/vmstat: pgscan_*/pgsteal_*/workingset_refault_file deltas ->
+          page_scan / page_reclaim / file_refault MiB/s. ``vmstat`` is the
+          shared pre-read dict; read here when None. Rates divide by the
+          ACTUAL monotonic elapsed window between samples (not self.interval).
+          Also derives direct_reclaim_mib_s (pgscan_direct + throttle -- the
+          blocking subset, excludes background kswapd) and allocstall_per_s
+          (allocations that stalled waiting on reclaim, count/s). allocstall is
+          summed across the per-zone-type variants (allocstall_normal/_dma32/
+          ...) since modern /proc/vmstat exposes no plain allocstall sum.
+        - /proc/stat: ``stat`` is the pre-parsed dict shared across one
+          collect_sample cycle (also consumed by the raw /proc CSV dumper); read
+          here via _read_proc_stat() when None. Yields instantaneous iowait%
+          (delta vs prior sample's cumulative jiffies) + procs_running/blocked.
+        Also reads dirty throttle thresholds once (lazy) from /proc/sys/vm.
+        First sample (no prior baseline) records zero rates.
+        """
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if meminfo is None:
+            meminfo = self._read_meminfo()
+        mi = meminfo
+        anon_mb = round(mi.get("AnonPages", 0), 2)
+        sreclaimable_mb = round(mi.get("SReclaimable", 0), 2)
+        file_cache_mb = round(max(0.0, mi.get("Cached", 0) + mi.get("Buffers", 0) - mi.get("Shmem", 0)), 2)
+
+        # Page-cache pressure from /proc/vmstat deltas. Divide by ACTUAL
+        # monotonic elapsed (not self.interval) so MiB/s is correct even when
+        # the sampling cadence drifts. First sample: no prior baseline -> 0.
+        if vmstat is None:
+            vmstat = self._read_vmstat()
+        vs = vmstat
+        cur_pressure = {
+            "pgscan_kswapd": vs.get("pgscan_kswapd", 0),
+            "pgscan_direct": vs.get("pgscan_direct", 0),
+            "pgscan_direct_throttle": vs.get("pgscan_direct_throttle", 0),
+            "pgsteal_kswapd": vs.get("pgsteal_kswapd", 0),
+            "pgsteal_direct": vs.get("pgsteal_direct", 0),
+            "workingset_refault_file": vs.get("workingset_refault_file", 0),
+            # allocstall per-zone-type variants (allocstall_normal/_dma32/...).
+            # Modern /proc/vmstat exposes ONLY these, not a plain sum; copy
+            # whatever variants are present -- _compute_pressure_rates sums
+            # the allocstall_* keys.
+            **{k: vs.get(k, 0) for k in vs if k.startswith("allocstall_")},
+        }
+        now = time.monotonic()
+        if self._last_pressure is not None and self._last_pressure_monotonic is not None:
+            elapsed = now - self._last_pressure_monotonic
+            if elapsed <= 0:
+                elapsed = self.interval if self.interval > 0 else 1.0
+        else:
+            elapsed = self.interval
+        pressure = _compute_pressure_rates(cur_pressure, self._last_pressure, elapsed)
+        self._last_pressure = cur_pressure
+        self._last_pressure_monotonic = now
+
+        # iowait% + runnable/blocked procs from /proc/stat (delta-based iowait).
+        # stat is the shared parse from collect_sample (or a fresh read here when
+        # called standalone); avoids a second /proc/stat open per cycle.
+        if stat is None:
+            stat = self._read_proc_stat()
+        procs_running = stat.get("procs_running", 0)
+        procs_blocked = stat.get("procs_blocked", 0)
+        iowait_pct = 0.0
+        cpu_vals = stat.get("cpu") or []
+        if cpu_vals:
+            # First 8 fields (user..steal) are the real total; guest(8)/guest_nice(9)
+            # are already folded into user/nice by the kernel (man 5 proc) -- summing
+            # all 10 double-counts and dilutes iowait%.
+            total = sum(cpu_vals[:8])
+            iowait = cpu_vals[4] if len(cpu_vals) > 4 else 0
+            if self._last_cpu_total is not None and total > self._last_cpu_total:
+                dt = total - self._last_cpu_total
+                di = iowait - (self._last_cpu_iowait or 0)
+                iowait_pct = round(max(0, di) / dt * 100, 1) if dt > 0 else 0.0
+            self._last_cpu_total = total
+            self._last_cpu_iowait = iowait
+
+        # Dirty throttle thresholds (read once; sysctls are effectively static)
+        if not self._dirty_limits_read:
+            self.dirty_background_limit_mb, self.dirty_limit_mb = self._read_dirty_limits_mb(mi)
+            self._dirty_limits_read = True
+
+        self.host_pressure_history.append(
+            {
+                "ts": ts,
+                "page_scan_mib_s": pressure["page_scan_mib_s"],
+                "page_reclaim_mib_s": pressure["page_reclaim_mib_s"],
+                "file_refault_mib_s": pressure["file_refault_mib_s"],
+                "anon_pages_mb": anon_mb,
+                "file_cache_mb": file_cache_mb,
+                "sreclaimable_mb": sreclaimable_mb,
+                "iowait_pct": iowait_pct,
+                "procs_running": procs_running,
+                "procs_blocked": procs_blocked,
+                "direct_reclaim_mib_s": pressure["direct_reclaim_mib_s"],
+                "allocstall_per_s": pressure["allocstall_per_s"],
+            }
+        )
+        if pressure["page_scan_mib_s"] > self.peak_page_scan_mib_s:
+            self.peak_page_scan_mib_s = pressure["page_scan_mib_s"]
+        if pressure["page_reclaim_mib_s"] > self.peak_page_reclaim_mib_s:
+            self.peak_page_reclaim_mib_s = pressure["page_reclaim_mib_s"]
+        if pressure["file_refault_mib_s"] > self.peak_file_refault_mib_s:
+            self.peak_file_refault_mib_s = pressure["file_refault_mib_s"]
+
+    def _read_dirty_limits_mb(self, meminfo: dict) -> tuple[float, float]:
+        """Return (dirty_background_limit, dirty_limit) in MB.
+
+        Reads /proc/sys/vm/dirty_bytes + dirty_background_bytes first (absolute
+        byte limits). When those are 0 (kernel falls back to ratio mode), uses
+        dirty_ratio / dirty_background_ratio * MemTotal. Returns (0, 0) if the
+        sysctls are unavailable (non-Linux hosts in tests).
+        """
+        try:
+            with open("/proc/sys/vm/dirty_bytes") as f:
+                dirty_bytes = int(f.read().strip() or 0)
+            with open("/proc/sys/vm/dirty_background_bytes") as f:
+                bg_bytes = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            dirty_bytes = bg_bytes = 0
+        if dirty_bytes > 0:
+            return round(bg_bytes / 2**20, 2), round(dirty_bytes / 2**20, 2)
+        try:
+            with open("/proc/sys/vm/dirty_ratio") as f:
+                dirty_ratio = int(f.read().strip() or 0)
+            with open("/proc/sys/vm/dirty_background_ratio") as f:
+                bg_ratio = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            dirty_ratio = bg_ratio = 0
+        memtotal = meminfo.get("MemTotal", 0)
+        if dirty_ratio > 0 and memtotal > 0:
+            return round(bg_ratio / 100 * memtotal, 2), round(dirty_ratio / 100 * memtotal, 2)
+        return 0.0, 0.0
+
+    # ===================== Collect VM Total Memory =====================
+    def collect_vm_total_memory(self, vms: list[dict]) -> dict:
+        """Aggregate total memory consumption of all VMs per sample
+
+        Sums memory_mb across all VMs and per_numa breakdown.
+        Also aggregates swapcache per NUMA node.
+        Stores result in vm_total_memory_history for timeline export.
+
+        Args:
+            vms: List of VM dicts from get_vms_realtime()
+
+        Returns:
+            Dict with total_mb, vm_count, per_numa breakdown, timestamp,
+            plus swapcache_mb and swapcache_per_numa aggregates.
+        """
+        total_mb = sum(vm["memory_mb"] for vm in vms)
+        swapcache_mb = sum(vm.get("memory_swapcache_mb", 0) for vm in vms)
+        per_numa = defaultdict(float)
+        swapcache_per_numa = defaultdict(float)
+        for vm in vms:
+            for node_id, mem in vm.get("memory_per_numa", {}).items():
+                per_numa[node_id] += mem.get("total_mb", 0)
+            for node_id, sc in vm.get("memory_swapcache_per_numa", {}).items():
+                swapcache_per_numa[node_id] += sc
+
+        entry = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_mb": round(total_mb, 2),
+            "vm_count": len(vms),
+            "per_numa": {k: round(v, 2) for k, v in per_numa.items()},
+            "swapcache_mb": round(swapcache_mb, 2),
+            "swapcache_per_numa": {k: round(v, 2) for k, v in swapcache_per_numa.items()},
+        }
+        self.vm_total_memory_history.append(entry)
+        return entry
+
+    def _read_meminfo(self) -> dict:
+        """Read /proc/meminfo and return dict of field -> MB values
+
+        All values in /proc/meminfo are in kB; this method converts to MB.
+        Returns empty dict if file is unavailable.
+        """
+        result = {}
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        key = parts[0].rstrip(":")
+                        value_kb = int(parts[1])
+                        result[key] = round(value_kb / 1024, 2)
+        except (FileNotFoundError, PermissionError):
+            pass
+        return result
+
+    def _read_vmstat(self) -> dict:
+        """Read /proc/vmstat and return dict of field -> raw integer values
+
+        Returns empty dict if file is unavailable.
+        """
+        result = {}
+        try:
+            with open("/proc/vmstat") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            result[parts[0]] = int(parts[1])
+                        except ValueError:
+                            pass
+        except (FileNotFoundError, PermissionError):
+            pass
+        return result
+
+    def _read_proc_stat(self) -> dict:
+        """Parse /proc/stat into a structured dict for the raw dumper + pressure.
+
+        Captures the aggregate ``cpu`` line and every ``cpuN`` line as positional
+        jiffy lists (user/nice/system/idle/iowait/irq/softirq/steal/guest/
+        guest_nice), plus ctxt / btime / processes / procs_running /
+        procs_blocked / softirq (total + sub-counters). The ``intr`` line is
+        skipped (low density, hundreds of columns). Returns {} on non-Linux /
+        unreadable. Shared between collect_host_pressure (needs cpu + procs) and
+        _ProcRawWriter (needs everything) so /proc/stat is opened once per cycle.
+        """
+        result: dict = {}
+        try:
+            with open("/proc/stat") as f:
+                for line in f:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    key = parts[0]
+                    if key == "cpu":
+                        result["cpu"] = [int(x) for x in parts[1:11]]
+                    elif key.startswith("cpu") and key[3:].isdigit():
+                        result.setdefault("cpus", {})[key[3:]] = [int(x) for x in parts[1:11]]
+                    elif key in ("ctxt", "btime", "processes", "procs_running", "procs_blocked") and len(parts) > 1:
+                        result[key] = int(parts[1])
+                    elif key == "softirq":
+                        result["softirq"] = [int(x) for x in parts[1:]]
+                    # "intr " line intentionally skipped
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
+            pass
+        return result
+
+    def _read_numa_cpu_map(self) -> dict[int, list[int]]:
+        """node -> [cpu ids] from /sys/devices/system/node/nodeN/cpulist.
+
+        Boot-constant topology; read ONCE per run (cached in self._numa_cpu_map
+        via _numa_cpu_map_cached) and dumped to numa_cpu_map.csv so an agent can
+        join host_percpu_raw.csv back to per-NUMA CPU%. Returns {} on non-Linux.
+        Mirrors the cpulist range-parse collect_numa_cpu used to do per cycle.
+        """
+        node_to_cpus: dict[int, list[int]] = {}
+        for node in self.available_numa_nodes:
+            try:
+                with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+                    cpulist = f.read().strip()
+            except (OSError, ValueError):
+                continue
+            cpus: list[int] = []
+            for part in cpulist.split(","):
+                try:
+                    if "-" in part:
+                        s, e = part.split("-")
+                        cpus.extend(range(int(s), int(e) + 1))
+                    elif part:
+                        cpus.append(int(part))
+                except ValueError:
+                    continue
+            if cpus:
+                node_to_cpus[node] = cpus
+        return node_to_cpus
+
+    def _numa_cpu_map_cached(self) -> dict[int, list[int]]:
+        """Lazy cached accessor for the boot-constant node->cpu topology."""
+        if self._numa_cpu_map is None:
+            self._numa_cpu_map = self._read_numa_cpu_map()
+        return self._numa_cpu_map
+
+    def _read_pid_jiffies(self, pid: int) -> tuple[int, int] | None:
+        """(utime, stime) jiffies from /proc/<pid>/stat; None if unreadable.
+
+        Raw cumulative counters -- the agent derives per-VM CPU% via delta over
+        the monotonic interval. rsplit(')', 1) skips the comm field (may contain
+        spaces/parens); rest[11]/rest[12] = utime/stime (fields 14/15, 0-indexed
+        11/12 after comm). Same read as spotbox read_fc_jiffies; shared with
+        collect_ublk_daemon so the /proc/<pid>/stat parse lives in one place.
+        """
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                rest = f.read().rsplit(")", 1)[1].split()
+            return int(rest[11]), int(rest[12])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def _attach_pid_jiffies(self, vm: dict) -> dict:
+        """Attach raw utime/stime jiffies for vm_cpu_raw.csv and set CPU%.
+
+        Both per-VM collection paths (serial <4 VMs, parallel) route through
+        this; an unreadable pid leaves the jiffy keys off (the writer skips
+        it) and reports 0% CPU, matching psutil's behavior for a dead pid.
+        """
+        pid = vm["pid"]
+        ut_st = self._read_pid_jiffies(pid)
+        if ut_st is not None:
+            vm["utime"], vm["stime"] = ut_st
+        vm["cpu_percent"] = self._cpu_percent_from_jiffies(pid, ut_st[0] + ut_st[1] if ut_st else None)
+        return vm
+
+    def _cpu_percent_from_jiffies(self, pid: int, ticks: int | None) -> float:
+        """CPU% of one core (100 = one full core) from cumulative utime+stime.
+
+        Same quantity psutil.Process.cpu_percent() returns -- delta ticks /
+        SC_CLK_TCK / elapsed -- but reuses the /proc/<pid>/stat read already
+        done for vm_cpu_raw.csv instead of constructing a psutil.Process per
+        VM (measured ~35 us/VM saved). The first sample of a pid has no
+        baseline and reports 0.0, exactly like psutil's seed call.
+        """
+        if ticks is None:
+            return 0.0
+        now = time.monotonic()
+        prev = self._proc_cpu_prev.get(pid)
+        self._proc_cpu_prev[pid] = (ticks, now)
+        if prev is None or now <= prev[1]:
+            return 0.0
+        cpu = (ticks - prev[0]) / _CLK_TCK / (now - prev[1]) * 100.0
+        return round(max(0.0, min(cpu, 10000.0)), 2)
+
+    def get_vm_memory_from_numastat(self, pid):
+        """Get process NUMA memory statistics.
+
+        Uses /proc/<pid>/numa_maps (fast, ~0.01s) first.
+        Falls back to numastat -p <pid> (slow, ~0.1-0.5s) if numa_maps fails.
+        """
+        # Fast path: read numa_maps directly (~50x faster than subprocess)
+        result = self.get_vm_memory_from_numa_maps(pid)
+        if result.get("_parsed", False):
+            # numa_maps was successfully read — accept result even if total_mb=0
+            result.pop("_parsed", None)  # remove internal flag before returning
+            return result
+
+        # Slow fallback: subprocess numastat
+        result = {"total_mb": 0.0, "huge_mb": 0.0, "private_mb": 0.0, "heap_mb": 0.0, "stack_mb": 0.0, "per_node": {}}
+        try:
+            output = subprocess.run(["numastat", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+            if output.returncode != 0:
+                return result
+
+            lines = output.stdout.strip().split("\n")
+            node_ids = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # Extract node IDs from header line (handles both "Node0" and "Node 0" formats)
+                node_matches = re.findall(r"Node\s*(\d+)", line)
+                if node_matches:
+                    for nid_str in node_matches:
+                        nid = int(nid_str)
+                        if nid not in node_ids:
+                            node_ids.append(nid)
+
+            for line in lines:
+                vals = re.findall(r"[\d.]+", line)
+                if not vals or len(vals) < len(node_ids) + 1:
+                    continue
+                total_val = float(vals[-1])
+                if line.startswith("Huge"):
+                    result["huge_mb"] = total_val
+                    for i, n in enumerate(node_ids):
+                        result["per_node"][n] = result["per_node"].get(n, {})
+                        result["per_node"][n]["huge_mb"] = float(vals[i])
+                elif line.startswith("Heap"):
+                    result["heap_mb"] = total_val
+                    for i, n in enumerate(node_ids):
+                        result["per_node"][n] = result["per_node"].get(n, {})
+                        result["per_node"][n]["heap_mb"] = float(vals[i])
+                elif line.startswith("Stack"):
+                    result["stack_mb"] = total_val
+                    for i, n in enumerate(node_ids):
+                        result["per_node"][n] = result["per_node"].get(n, {})
+                        result["per_node"][n]["stack_mb"] = float(vals[i])
+                elif line.startswith("Private"):
+                    result["private_mb"] = total_val
+                    for i, n in enumerate(node_ids):
+                        result["per_node"][n] = result["per_node"].get(n, {})
+                        result["per_node"][n]["private_mb"] = float(vals[i])
+                elif line.startswith("Total") and "---" not in line:
+                    result["total_mb"] = total_val
+                    for i, n in enumerate(node_ids):
+                        result["per_node"][n] = result["per_node"].get(n, {})
+                        result["per_node"][n]["total_mb"] = float(vals[i])
+        except:
+            pass
+        return result
+
+    # ===================== VM Memory from numa_maps (Fast Path) =====================
+    def get_vm_memory_from_numa_maps(self, pid: int) -> dict:
+        """Read /proc/<pid>/numa_maps to get per-NUMA process memory statistics.
+
+        ~50x faster than numastat subprocess (0.01s vs 0.1-0.5s per process).
+        Falls back gracefully: returns empty dict on error, triggering numastat fallback.
+
+        Returns:
+            Same structure as get_vm_memory_from_numastat(), plus:
+            - swapcache_mb: total swapcache pages converted to MB
+            - swapcache_per_node: per-node swapcache breakdown
+        """
+        try:
+            with open(f"/proc/{pid}/numa_maps", "r") as f:
+                result = parse_numa_maps(f.read(), _PAGE_SIZE // 1024)
+        except Exception:
+            # Unreadable (process gone / permission): zero fields and no
+            # _parsed flag, so get_vm_memory_from_numastat falls back to numastat.
+            return parse_numa_maps("", _PAGE_SIZE // 1024)
+
+        # Mark that numa_maps was successfully parsed (even if total_mb=0)
+        result["_parsed"] = True
+
+        # Round all values for consistency
+        result["total_mb"] = round(result["total_mb"], 2)
+        result["huge_mb"] = round(result["huge_mb"], 2)
+        result["private_mb"] = round(result["private_mb"], 2)
+        result["heap_mb"] = round(result["heap_mb"], 2)
+        result["stack_mb"] = round(result["stack_mb"], 2)
+        result["swapcache_mb"] = round(result["swapcache_mb"], 2)
+        for node_id in result["per_node"]:
+            for k in result["per_node"][node_id]:
+                result["per_node"][node_id][k] = round(result["per_node"][node_id][k], 2)
+        for node_id in result["swapcache_per_node"]:
+            result["swapcache_per_node"][node_id] = round(result["swapcache_per_node"][node_id], 2)
+
+        return result
+
+    # ==================== Shared VM Metrics Helpers ====================
+    def _fallback_memory_mb(self, pid: int) -> float:
+        """Try psutil memory_info() as fallback when numa_maps + numastat both fail.
+
+        Attempts PSS first, then RSS. Returns 0.0 if both fail.
+        """
+        try:
+            p = psutil.Process(pid)
+            mem_info = p.memory_info()
+            return round(mem_info.pss / 1024 / 1024, 2)
+        except Exception:
+            try:
+                p = psutil.Process(pid)
+                mem_info = p.memory_info()
+                return round(mem_info.rss / 1024 / 1024, 2)
+            except Exception:
+                return 0.0
+
+    def _read_pss_mb(self, pid: int) -> float:
+        """PSS (MB) from /proc/<pid>/smaps_rollup (kernel >= 4.14).
+
+        PSS splits shared pages across sharers, so a fleet aggregate is the
+        true marginal memory cost (template pages shared by all VMs counted
+        once-ish), unlike RSS/numa_maps Total which double-count. Per-VM
+        collection no longer routes here -- the fleet path reads PSS + RSS
+        together via :meth:`_read_pss_rss_mb` (one open, RSS rides the walk);
+        this single-gauge reader stays for the host-proc collector.
+        """
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith("Pss:"):
+                        return round(int(line.split()[1]) / 1024, 2)
+        except OSError:
+            pass
+        return 0.0
+
+    def _read_pss_rss_mb(self, pid: int) -> tuple[float, float]:
+        """PSS + RSS (MB) from a single /proc/<pid>/smaps_rollup open.
+
+        smaps_rollup emits Pss: and Rss: lines from the same page-table walk,
+        so the rss collector rides pss's existing open at zero extra I/O
+        (one /proc open per VM per sample either way). Falls back to the
+        cheap /proc/<pid>/status VmRSS read only when pss is disabled.
+        A vanished process returns (0.0, 0.0): a missing smaps_rollup
+        contributes genuinely 0 MB to the fleet timeline, not a hole.
+        """
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as f:
+                pss_mb = rss_mb = 0.0
+                for line in f:
+                    if line.startswith("Pss:"):
+                        pss_mb = round(int(line.split()[1]) / 1024, 2)
+                    elif line.startswith("Rss:"):
+                        rss_mb = round(int(line.split()[1]) / 1024, 2)
+                return pss_mb, rss_mb
+        except OSError:
+            return 0.0, 0.0
+
+    def _read_rss_mb(self, pid: int) -> float:
+        """RSS (MB) from VmRSS in /proc/<pid>/status.
+
+        A single VmRSS counter line -- cheap (no page-table walk, unlike
+        smaps_rollup PSS). Matches spotbox_monitor's fc_rss_gb source. Gated by
+        the 'rss' collector (--no-rss).
+        """
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return round(int(line.split()[1]) / 1024, 2)
+        except OSError:
+            pass
+        return 0.0
+
+    def _extract_numastat_fields(self, numastat_mem: dict) -> dict:
+        """Extract standard VM metric fields from numastat/numa_maps result dict.
+
+        Returns a flat dict with memory_mb, memory_huge_mb, etc.
+        """
+        return {
+            "memory_mb": numastat_mem.get("total_mb", 0.0),
+            "memory_huge_mb": numastat_mem.get("huge_mb", 0.0),
+            "memory_private_mb": numastat_mem.get("private_mb", 0.0),
+            "memory_heap_mb": numastat_mem.get("heap_mb", 0.0),
+            "memory_per_numa": numastat_mem.get("per_node", {}),
+            "memory_swapcache_mb": numastat_mem.get("swapcache_mb", 0.0),
+            "memory_swapcache_per_numa": numastat_mem.get("swapcache_per_node", {}),
+        }
+
+    def _finalize_vm_collection(
+        self, vms: list[dict], current_pids: set, current_total_mem: float, current_total_cpu: float
+    ):
+        """Common post-processing: update peak trackers, clean dead PIDs from cache."""
+        if current_total_mem > self.peak_total_memory_mb:
+            self.peak_total_memory_mb = current_total_mem
+        if current_total_cpu > self.peak_total_cpu:
+            self.peak_total_cpu = current_total_cpu
+
+        # Clean dead processes from the CPU baseline (a restarted pid re-seeds
+        # on its next sample instead of reporting a bogus delta).
+        dead_pids = [p for p in self._proc_cpu_prev if p not in current_pids]
+        for p in dead_pids:
+            self._proc_cpu_prev.pop(p, None)
+
+        self.heavy_refresh.end_cycle(len(vms))
+
+    # ==================== Parallel VM Metrics Collection ====================
+    def _matches_vm_process(self, proc_name: str, cmdline: str) -> bool:
+        """Decide whether a process belongs to a VM we monitor.
+
+        Default: substring match of ``get_process_names()`` against the process
+        name. Subclasses whose name overruns the kernel's 15-char ``comm``
+        (``/proc/<pid>/stat`` field 2, where psutil's ``name()`` comes from)
+        must override and disambiguate on ``cmdline`` instead.
+        """
+        return any(name in proc_name for name in self.get_process_names())
+
+    def _cmdline_may_match(self, proc_name: str) -> bool:
+        """Whether ``proc_name`` may still match on its command line alone.
+
+        The default ``_matches_vm_process`` only looks at the process name, so
+        a comm that does not match can never become a candidate and its
+        ``/proc/<pid>/cmdline`` is not worth reading. Subclasses that match on
+        argv (CubeSandbox tells cube shims apart from runc shims by cmdline)
+        override this to name the comm family whose cmdline must be read.
+        """
+        return False
+
+    def _discover_vm_processes(self) -> list[dict]:
+        """Phase 1: Discover VM processes by scanning /proc directly (serial).
+
+        psutil.process_iter(["pid", "name", "cmdline", "status"]) builds a
+        Process object and reads the command line of EVERY process on the
+        host -- measured 590 ms/cycle at 6.8k processes, 275 ms at 3.2k.
+        This scan reads only /proc/<pid>/stat for all pids and touches
+        /proc/<pid>/cmdline only for pids that can possibly match (comm hit,
+        or a subclass that opts in via ``_cmdline_may_match``): 210 ms and
+        76 ms at the same host sizes. Candidate fields are identical to the
+        psutil version: ``proc_name`` is the kernel comm (what psutil.name()
+        returns, 15-char capped) and ``status`` is psutil's status string.
+
+        Returns:
+            List of dicts with pid, proc_name, cmdline, status, vm_name.
+        """
+        candidates = []
+
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            stat = read_comm_state(pid)
+            if stat is None:
+                continue
+            proc_name, state, start_time = stat
+
+            if self._matches_vm_process(proc_name, "") or self._cmdline_may_match(proc_name):
+                cmdline = read_cmdline(pid)
+                if cmdline is None or not self._matches_vm_process(proc_name, cmdline):
+                    continue
+            else:
+                continue
+
+            candidates.append(
+                {
+                    "pid": pid,
+                    "pid_start": start_time,
+                    "proc_name": proc_name,
+                    "cmdline": cmdline,
+                    "status": PROC_STATUSES.get(state, "?"),
+                    "vm_name": self.extract_vm_id(pid, cmdline),
+                }
+            )
+
+        return candidates
+
+    def _read_heavy_vm_fields(self, pid: int) -> dict:
+        """Per-VM memory fields: numa_maps + PSS + RSS (one page-table walk).
+
+        PSS and RSS share a single smaps_rollup open (it emits both Pss: and
+        Rss: lines), so the rss collector adds zero I/O when pss is on.
+        """
+        # NUMA memory via numa_maps fast path + numastat fallback
+        numastat_mem = self.get_vm_memory_from_numastat(pid)
+        fields = self._extract_numastat_fields(numastat_mem)
+        if self._collects("pss"):
+            # One smaps_rollup open serves both. The rss_mb key is set only
+            # when the 'rss' collector is on, so --no-rss omits it (empty CSV
+            # cell -> fc_rss_gb column + chart dropped downstream) instead of
+            # writing a fake 0.0 that reads as "fleet RSS is zero".
+            pss_mb, rss_mb = self._read_pss_rss_mb(pid)
+            fields["pss_mb"] = pss_mb
+            if self._collects("rss"):
+                fields["rss_mb"] = rss_mb
+        elif self._collects("rss"):
+            # --no-pss but RSS wanted: cheap /proc/<pid>/status VmRSS read
+            # (single counter line, no page-table walk). pss_mb stays absent,
+            # so fc_pss_gb + the Per-VM PSS block are omitted; fc_rss_gb kept.
+            fields["rss_mb"] = self._read_rss_mb(pid)
+
+        # If numa_maps + numastat both fail, fall back to psutil
+        if fields["memory_mb"] <= 0:
+            fields["memory_mb"] = self._fallback_memory_mb(pid)
+        return fields
+
+    def _collect_vm_metrics_serial(self, vm_candidates: list[dict]) -> list[dict]:
+        """Phase 2 serial: collect per-VM metrics one by one.
+
+        Used as fallback when VM count is small (<4) to avoid
+        ThreadPoolExecutor overhead. Produces the same return structure
+        as _collect_vm_metrics_parallel().
+
+        Args:
+            vm_candidates: List of dicts from _discover_vm_processes()
+
+        Returns:
+            List of complete VM dicts (same structure as get_vms_realtime()).
+        """
+        for pid in self.heavy_refresh.prepare(vm_candidates, self.interval):
+            self._proc_cpu_prev.pop(pid, None)  # recycled pid: reseed its baseline
+        vms = []
+        current_pids = set()
+        current_total_mem = 0.0
+        current_total_cpu = 0.0
+
+        for candidate in vm_candidates:
+            pid = candidate["pid"]
+            current_pids.add(pid)
+
+            fields, heavy_cpu = self.heavy_refresh.fields_for(pid, self._read_heavy_vm_fields)
+            if heavy_cpu is not None:
+                self.heavy_refresh.record(pid, fields, heavy_cpu)
+            current_total_mem += fields["memory_mb"]
+
+            vm = self._attach_pid_jiffies(
+                {
+                    "pid": pid,
+                    "name": candidate["vm_name"],
+                    "cpu_percent": 0.0,  # set from jiffies in _attach_pid_jiffies
+                    **fields,
+                    "status": candidate["status"],
+                }
+            )
+            current_total_cpu += vm["cpu_percent"]
+            vms.append(vm)
+
+        self._finalize_vm_collection(vms, current_pids, current_total_mem, current_total_cpu)
+        return vms
+
+    def _collect_vm_metrics_parallel(self, vm_candidates: list[dict]) -> list[dict]:
+        """Phase 2 parallel: collect per-VM metrics using ThreadPoolExecutor.
+
+        Step A (parallel): each worker reads the heavy memory files for the
+        VMs due this cycle (and carries forward the cached fields for the
+        rest) plus the per-pid jiffies. Step B (serial): cache the freshly
+        measured fields, sum fleet totals, and feed the CPU-budget estimate.
+
+        Args:
+            vm_candidates: List of dicts from _discover_vm_processes()
+
+        Returns:
+            List of complete VM dicts (same structure as get_vms_realtime()).
+        """
+        if not vm_candidates:
+            return []
+
+        # Small VM count: skip thread pool overhead
+        if len(vm_candidates) < 4:
+            return self._collect_vm_metrics_serial(vm_candidates)
+
+        for pid in self.heavy_refresh.prepare(vm_candidates, self.interval):
+            self._proc_cpu_prev.pop(pid, None)  # recycled pid: reseed its baseline
+        max_workers = min(_VM_COLLECT_WORKERS, len(vm_candidates))
+
+        # Step A: parallel heavy reads + jiffies for every VM
+        vm_results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(self._collect_single_vm, c): c for c in vm_candidates}
+            for future in as_completed(future_map):
+                try:
+                    vm_results.append(future.result())
+                except Exception:
+                    continue
+
+        # Step B: cache fresh fields, aggregate fleet totals
+        current_pids = set()
+        current_total_mem = 0.0
+        current_total_cpu = 0.0
+
+        for vm, fields, heavy_cpu in vm_results:
+            pid = vm["pid"]
+            current_pids.add(pid)
+            if heavy_cpu is not None:
+                self.heavy_refresh.record(pid, fields, heavy_cpu)
+            current_total_mem += vm["memory_mb"]
+            current_total_cpu += vm["cpu_percent"]
+
+        vms = [vm for vm, _, _ in vm_results]
+        self._finalize_vm_collection(vms, current_pids, current_total_mem, current_total_cpu)
+        return vms
+
+    def _collect_single_vm(self, candidate: dict) -> tuple[dict, dict, float | None]:
+        """Collect metrics for a single VM candidate (callable from ThreadPoolExecutor).
+
+        Returns ``(vm_result_dict, heavy_fields, heavy_cpu_sec)``; the fields
+        and their measured cost are returned separately so the serial Step B
+        can cache them without unpacking the record dict again.
+        """
+        pid = candidate["pid"]
+        fields, heavy_cpu = self.heavy_refresh.fields_for(pid, self._read_heavy_vm_fields)
+        result = self._attach_pid_jiffies(
+            {
+                "pid": pid,
+                "name": candidate["vm_name"],
+                "cpu_percent": 0.0,  # set from jiffies in _attach_pid_jiffies
+                **fields,
+                "status": candidate["status"],
+            }
+        )
+        return result, fields, heavy_cpu
+
+    # ==================== Template Methods ====================
+    def collect_sample(self):
+        """Collect one sample (full refresh each time).
+
+        Disk I/O and ublk device count are NOT collected here -- they are
+        sub-sampled at a 1-second cadence by _disk_subsample_sleep (called
+        during the main loop's sleep), so disk_history and ublk_history carry
+        true per-second bandwidth regardless of the general sampling interval.
+        """
+        if self._collects("hugepage"):
+            self.collect_hugepage_stats()
+        if self._collects("numa_cpu"):
+            self.collect_numa_cpu()
+        if self._collects("host_stats"):
+            self.collect_host_stats()
+        # /proc/meminfo + /proc/vmstat + /proc/stat are shared across swap_stats,
+        # host_mem_detail, host_pressure, and the always-on raw CSV dumper -- read
+        # once per cycle regardless of which /proc consumers are enabled (the raw
+        # dump is unconditional, so the old "skip when no consumer enabled" gate
+        # is dead code now). stat feeds both host_pressure and the raw dumper, so
+        # /proc/stat is opened exactly once per cycle.
+        meminfo = self._read_meminfo()
+        vmstat = self._read_vmstat()
+        stat = self._read_proc_stat()
+        # One sample timestamp shared across host_*_raw.csv + vm_cpu_raw.csv rows
+        # so an agent can join them by timestamp (was: proc and vm enqueued with
+        # separate now() calls, skewed across get_vms_realtime).
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        # Lazy-start the background raw dumper on the first sample, then enqueue
+        # the dicts already in hand -- zero extra /proc reads for the dump, and
+        # enqueue is O(1) so the sampling path never blocks on file I/O.
+        if self.log_dir and self._proc_raw is None:
+            self._proc_raw = _ProcRawWriter(self.log_dir)
+        if self._proc_raw is not None:
+            self._proc_raw.enqueue_proc(ts, meminfo, vmstat, stat)
+            # node->cpu topology is boot-constant; dump once (writer is idempotent).
+            self._proc_raw.enqueue_numa_map(self._numa_cpu_map_cached())
+        if self._collects("swap"):
+            self.collect_swap_stats(meminfo=meminfo, vmstat=vmstat)
+        if self._collects("host_mem_detail"):
+            self.collect_host_mem_detail(meminfo=meminfo)
+        if self._collects("pressure"):
+            self.collect_host_pressure(meminfo=meminfo, vmstat=vmstat, stat=stat)
+        if self._collects("numa_memory"):
+            numa_nodes = self.get_numa_nodes_memory()  # same cycle as swap/hugepage
+            if self._proc_raw is not None and numa_nodes:
+                self._proc_raw.enqueue_numa_mem(ts, numa_nodes)
+        vms = self.get_vms_realtime()
+        self.last_vm_count = len(vms)
+
+        # Per-VM raw /proc/<pid>/stat jiffies (utime+stime) for vm_cpu_raw.csv.
+        # Each VM already carries utime/stime from _attach_pid_jiffies (both
+        # collection paths); enqueue is O(1), the drain thread writes the long
+        # CSV.
+        if self._proc_raw is not None and vms:
+            self._proc_raw.enqueue_vm(ts, vms)
+
+        # Aggregate VM total memory
+        if self._collects("vm_total"):
+            self.collect_vm_total_memory(vms)
+
+        timestamp = datetime.now()
+        sample_data = []
+
+        if not vms:
+            return []
+
+        for vm in vms:
+            record = {
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "vm_name": vm["name"],
+                "pid": vm["pid"],
+                "cpu_percent": vm["cpu_percent"],
+                "memory_mb": vm["memory_mb"],
+                "pss_mb": vm.get("pss_mb", 0),
+                "rss_mb": vm.get("rss_mb", 0),
+                "memory_huge_mb": vm.get("memory_huge_mb", 0),
+                "memory_private_mb": vm.get("memory_private_mb", 0),
+                "memory_heap_mb": vm.get("memory_heap_mb", 0),
+                "memory_per_numa": vm.get("memory_per_numa", {}),
+                "memory_swapcache_mb": vm.get("memory_swapcache_mb", 0),
+                "memory_swapcache_per_numa": vm.get("memory_swapcache_per_numa", {}),
+                "status": vm["status"],
+            }
+            sample_data.append(record)
+            self.data.append(record)
+        return sample_data
+
+    def _disk_subsample_sleep(self, seconds: float) -> None:
+        """Sleep for ``seconds``, sampling disk I/O + ublk count every 1s.
+
+        Disk bandwidth is computed over a 1-second window regardless of the
+        general sampling interval (``self.interval``), so r_mb_s / w_mb_s are
+        true per-second rates -- burst peaks are not smeared over a longer
+        interval. Disk and ublk are sampled together each tick so disk_history
+        and ublk_history stay index-aligned for the Disk IO sheet (both carry
+        real per-row timestamps, so the timeline x-axis is real elapsed
+        seconds, not ``index * interval``). Returns early when
+        ``self.running`` is cleared (stop signal). No-op when ``seconds <= 0``.
+        """
+        if seconds <= 0 or not self.running:
+            return
+        end = time.monotonic() + seconds
+        while self.running:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+            if not self.running:
+                break
+            if self._collects("disk"):
+                self.collect_disk_stats()
+            if self._collects("ublk"):
+                self.collect_ublk_count()
+            if self._collects("ublk_daemon"):
+                self.collect_ublk_daemon()
+            if self._collects("hostproc") and self._hostproc_specs:
+                self.collect_host_procs()
+
