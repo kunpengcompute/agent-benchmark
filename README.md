@@ -99,7 +99,8 @@ oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.
   （`exec_only` / `lifecycle` / `exec_ephemeral`）。
 - **阶段阶梯**：`--create-only` / `--detect` 都会留下运行中的沙箱，收尾用 `--cleanup`。从
   `fake` → `docker` → `e2b`/`aenv` 逐级验证，比一上来就连生产后端省时间。
-- **主机资源采集**交给外部 `vm-monitor` 程序；没装时内核跳过主机采集，任务级指标照常产出。
+- **主机资源采集**由内置的 `vm-monitor` 程序承担（`src/vm_monitor/`，随 `pip install -e .`
+  注册）；二进制缺失时内核跳过主机采集，任务级指标照常产出。
 
 ## 文档
 
@@ -109,6 +110,9 @@ oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.
 | [bench-core usage guide (EN)](docs/guide/bench-core-usage.md) | 英文同内容 |
 | [oversub-bench 使用指南（中文）](docs/guide/oversub-bench-usage-zh.md) | 五步上手、sweep 配置、读结果、故障排查 |
 | [oversub-bench usage guide (EN)](docs/guide/oversub-bench-usage.md) | 英文同内容 |
+| [vm-monitor 使用指南（中文）](docs/guide/vm-monitor-usage-zh.md) | 宿主机资源采集 CLI、`.env` 工具路径、采集模式 |
+| [vm-monitor usage guide (EN)](docs/guide/vm-monitor-usage.md) | 英文同内容 |
+| [Metrics Reference](docs/dev/metrics-reference.md) | 内核与 vm_monitor 指标定义、`/proc`+`/sys` 采集来源与公式 |
 
 ## 开发
 

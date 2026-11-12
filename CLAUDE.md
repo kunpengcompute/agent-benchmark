@@ -25,13 +25,14 @@ agent trajectories against a backend. The bundled 55-trajectory pool
 default `replay.trajectory_dir` / `replay.template_manifest`, so a replay config
 runs out of the box.
 
-Host-level resource collection is delegated to an external **`vm-monitor`**
-program (not part of this repo). The kernel calls it as a subprocess around the
-stress phase; when the binary is absent the kernel skips host collection and
+Host-level resource collection is provided by the bundled **`vm_monitor`**
+package (`src/vm_monitor/`, registered as the `vm-monitor` CLI by
+`pip install -e .`). The kernel calls it as a subprocess around the stress
+phase; when the binary is absent the kernel skips host collection and
 task-level metrics still produce. The kernel-side call layer
 (`bench_core/observability/monitor.py`, oversub `start_host_monitor` /
-`ShardStressBracket`, the `monitor:` config section, `--no-vm-monitor`) lives in
-this repo; the `vm-monitor` package itself does not.
+`ShardStressBracket`, the `monitor:` config section, `--no-vm-monitor`) lives
+in `bench_core`; the collector itself is `src/vm_monitor/`.
 
 `agent_replay/` is an early replay implementation kept for reference only and
 will be deprecated; new work goes in `src/`.
@@ -83,7 +84,7 @@ Define success criteria, loop until verified. Turn tasks into verifiable goals:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .          # registers bench-core + oversub-bench + oversub-compare; pulls core deps
+python -m pip install -e .          # registers bench-core + oversub-bench + oversub-compare + vm-monitor; pulls core deps
 
 bench-core --provider fake --config config/common/browser.yaml --create-only -n 1   # smoke (no SDK)
 python -m pytest                     # full suite
@@ -102,7 +103,8 @@ provider; `--provider fake` needs none.
 `bench_core` / `env_provider` without an editable install. The `[project.scripts]`
 entries are `bench-core = "bench_core.bench_cli:main"`,
 `oversub-bench = "bench_core.oversub_run:main"`,
-`oversub-compare = "bench_core.compare_sweeps:main"`.
+`oversub-compare = "bench_core.compare_sweeps:main"`,
+`vm-monitor = "vm_monitor.cli:main"`.
 
 ## Architecture
 
@@ -226,6 +228,7 @@ One bar: **the next reader (or you in three months) changes the code correctly w
 | `bench-core` (`bench_core.bench_cli:main`) | host-agnostic kernel | `--config`, `--provider {fake,e2b,docker,aenv,cubesandbox}`, `--create-only`, `--detect`, `--warmup-only`, `--cleanup`, `-n`, `--test-duration`, `--no-vm-monitor`, `--log-level {debug,info,warning}` |
 | `oversub-bench` (`bench_core.oversub_run:main`) | oversub sweep driver | `--sweep-config`, `--config`, `--provider`, `--ratios`, `--modes`, `--running-concurrency`, `--multiplier`, `--shards`, `--repeats`, `--test-duration`, `--output-root`, `--reuse`, `--dry-run`, `--no-vm-monitor` |
 | `oversub-compare` (`bench_core.compare_sweeps:main`) | join sweep dirs into a comparison report | manifest-driven |
+| `vm-monitor` (`vm_monitor.cli:main`) | host-level resource collector (Linux, run as root) | `-t`, `-i`, `--vmm {qemu,firecracker,cubesandbox}`, `--stress-file`, `--enable-capture`, `--host-proc`, `--log-rotation`, `raw-report <log_dir>` |
 
 ### bench-core phase ladder
 
@@ -254,12 +257,16 @@ One bar: **the next reader (or you in three months) changes the code correctly w
 ```
 src/bench_core/              host-agnostic kernel + oversub driver
 src/env_provider/            provider contract + e2b/docker/aenv/cubesandbox/fake impls
+src/vm_monitor/              host-level resource collector (vm-monitor CLI: base + sampling,
+                             procfs, vmm/ adapters, capture/, export/ incl. export/raw/)
 config/common/               backend-agnostic workflow configs (one file per workflow)
 config/oversub/              oversub sweep profiles + compare manifest
+config/tools/                getfre_config.yaml (getfre collector template)
 artifacts/traces/replays/    55 bundled trajectories (.replay.json)
 artifacts/traces/image-map.json   trajectory -> template manifest (default template_manifest)
 artifacts/images/            image manifest + download-images.sh + build_template.py
-docs/guide/                  bench-core and oversub-bench usage guides (EN + zh)
+docs/guide/                  bench-core, oversub-bench and vm-monitor usage guides (EN + zh)
+docs/dev/                    metrics-reference.md (kernel + vm_monitor metrics & formulas)
 agent_replay/                early replay impl, kept for reference (to be deprecated)
 ```
 
@@ -269,3 +276,5 @@ bench-core reports go to each config's `report.output_dir` + `filename_prefix`. 
 
 - [docs/guide/bench-core-usage-zh.md](docs/guide/bench-core-usage-zh.md) / [docs/guide/bench-core-usage.md](docs/guide/bench-core-usage.md) — install→config→CLI→cleanup→troubleshooting (CN / EN)
 - [docs/guide/oversub-bench-usage-zh.md](docs/guide/oversub-bench-usage-zh.md) / [docs/guide/oversub-bench-usage.md](docs/guide/oversub-bench-usage.md) — oversub sweep driver + oversub-compare (CN / EN)
+- [docs/guide/vm-monitor-usage-zh.md](docs/guide/vm-monitor-usage-zh.md) / [docs/guide/vm-monitor-usage.md](docs/guide/vm-monitor-usage.md) — vm-monitor collector CLI, `.env` tool paths, capture modes (CN / EN)
+- [docs/dev/metrics-reference.md](docs/dev/metrics-reference.md) — bench_core kernel + vm_monitor sheet metrics, `/proc` & `/sys` collection sources, calculation formulas
