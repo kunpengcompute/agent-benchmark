@@ -998,6 +998,5 @@ timeline sheet's presence to tell them apart (absent sheet = not collected).
 
 ## Related documentation
 
-- [Usage Guide – Log Collection Tools](usage-guide.md#log-collection-tools): `.env` paths + flags for devkit / ksys / ub_watch / smap_bw / getfre.
-- [bench-core usage (中文)](bench-core-usage-zh.md): `bench-core` install → config → CLI → cleanup → troubleshooting.
-- [System design](design.md) / [design-en.md](design-en.md): architecture and data flow.
+- [vm-monitor usage guide](../guide/vm-monitor-usage.md): `.env` paths + flags for devkit / ksys / ub_watch / smap_bw / getfre.
+- [bench-core usage (中文)](../guide/bench-core-usage-zh.md): `bench-core` install → config → CLI → cleanup → troubleshooting.

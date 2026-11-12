@@ -313,4 +313,4 @@ CLI 的 `--no-vm-monitor` 会短路关闭。缺失二进制/工具或锁目录�
 | 未检测到 VM | `--vmm` 选错，或 VM 进程尚未启动（压测同步模式仍在等待） |
 | 磁盘 I/O 全为 0 | `--disks` 过滤掉了物理设备，或窗口期内确无 I/O |
 
-完整指标定义（每个 sheet 的列 + `/proc`/`/sys` 来源与公式）见 [Metrics Reference](metrics-reference.md)。
+完整指标定义（每个 sheet 的列 + `/proc`/`/sys` 来源与公式）见 [Metrics Reference](../dev/metrics-reference.md)。

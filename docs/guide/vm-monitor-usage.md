@@ -310,4 +310,4 @@ monitor:
 | No VMs detected | Wrong `--vmm`, or VM processes not yet started (stress-sync mode still waiting) |
 | Disk I/O all zero | `--disks` filtered out physical devices, or no I/O during the window |
 
-For full metric definitions (every sheet's columns + `/proc`/`/sys` sources & formulas), see [Metrics Reference](metrics-reference.md).
+For full metric definitions (every sheet's columns + `/proc`/`/sys` sources & formulas), see [Metrics Reference](../dev/metrics-reference.md).
