@@ -2473,3 +2473,805 @@ class VMMonitorBase(ABC):
             if self._collects("hostproc") and self._hostproc_specs:
                 self.collect_host_procs()
 
+    def display_realtime_table(self, sample_data, elapsed_time, duration, check_method=""):
+        """Display real-time table"""
+        # Use more reliable clear screen method
+        print("\033[2J\033[H\033[?25h", end="", flush=True)
+        width = 100
+        print("=" * width, flush=True)
+        print(f"{self.get_monitor_title()} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        print(
+            f"Elapsed: {elapsed_time} | Target: {duration if duration else 'Infinite'} | Detection Method: {check_method}",
+            flush=True,
+        )
+        print("=" * width, flush=True)
+
+        # Real-time display of specified NUMA node CPU
+        numa_str = ""
+        for node in self.target_numa_nodes:
+            hist = self.numa_cpu_history[node]
+            current = hist[-1] if hist else 0.0
+            peak = self.numa_cpu_peak[node]
+            numa_str += f"NUMA{node} CPU: {current:.1f}% (Peak {peak:.1f}%)  "
+        print(numa_str.strip(), flush=True)
+
+        # Total Hugepages
+        huge_usage = (
+            round((self.hugepage_used_mb / self.hugepage_total_mb * 100), 1) if self.hugepage_total_mb > 0 else 0.0
+        )
+        print(
+            f"Hugepage Memory: Total {self.hugepage_total_mb:.0f} MB  Used {self.hugepage_used_mb:.0f} MB ({huge_usage:.1f}%)  Free {self.hugepage_free_mb:.0f} MB",
+            flush=True,
+        )
+
+        # Per-NUMA node hugepage statistics
+        if self.hugepage_per_numa:
+            print("Per-NUMA Node Hugepages:", flush=True)
+            for node_id in sorted(self.hugepage_per_numa.keys()):
+                hp = self.hugepage_per_numa[node_id]
+                print(
+                    f"    NUMA {node_id:>2d} | Total {hp['total_mb']:>8.0f} MB | Used {hp['used_mb']:>8.0f} MB ({hp['usage_pct']:>5.1f}%) | Free {hp['free_mb']:>8.0f} MB",
+                    flush=True,
+                )
+
+        # Host machine total resources
+        if self.host_cpu_history:
+            host_cpu = self.host_cpu_history[-1]
+            host_mem = self.host_mem_history[-1]
+            print(
+                f"Host Machine: CPU {host_cpu:.1f}% (Peak {self.peak_host_cpu:.1f}%) | Memory {host_mem['used_mb']:.0f}/{host_mem['total_mb']:.0f} MB ({host_mem['usage']:.1f}%, Peak {self.peak_host_mem_mb:.0f} MB)",
+                flush=True,
+            )
+
+        # Swap
+        if self.swap_history:
+            s = self.swap_history[-1]
+            cap = s["capacity"]
+            if cap["total_mb"] > 0:
+                cch = s["cache"]
+                act = s["activity"]
+                in_fmt = f"{act['swap_in_rate']:>6.1f}" if act["swap_in_rate"] > 0 else "    -"
+                out_fmt = f"{act['swap_out_rate']:>6.1f}" if act["swap_out_rate"] > 0 else "    -"
+                print(
+                    f"Swap:      {cap['used_mb']:>6.0f}/{cap['total_mb']:>6.0f} MB ({cap['usage_pct']:>5.1f}%)"
+                    f" | Cached {cch['cached_mb']:>6.1f} MB"
+                    f" | In/Out {in_fmt}/{out_fmt} MiB/s",
+                    flush=True,
+                )
+            else:
+                print("Swap:      Not enabled", flush=True)
+
+        # Disk I/O + dirty/writeback (host memory detail)
+        if self.disk_history:
+            dh = self.disk_history[-1]["disks"]
+            total_write = sum(d.get("w_mb_s", 0) for d in dh.values())
+            total_read = sum(d.get("r_mb_s", 0) for d in dh.values())
+            ublk = self.ublk_history[-1]["ublk_devices"] if self.ublk_history else 0
+            dirty = self.host_mem_detail_history[-1]["dirty_mb"] if self.host_mem_detail_history else 0
+            print(
+                f"Disk:      Read {total_read:>6.1f} MB/s | Write {total_write:>6.1f} MB/s (Peak {self.peak_disk_write_mb_s:.1f})"
+                f" | Dirty {dirty:>6.1f} MB (Peak {self.peak_dirty_mb:.1f}) | ublk {ublk}",
+                flush=True,
+            )
+
+        # Page-cache pressure + runnable/blocked procs
+        if self.host_pressure_history:
+            p = self.host_pressure_history[-1]
+            print(
+                f"Pressure:  Scan {p['page_scan_mib_s']:>6.1f} | Reclaim {p['page_reclaim_mib_s']:>6.1f}"
+                f" | Refault {p['file_refault_mib_s']:>6.1f} MiB/s"
+                f" | iowait {p['iowait_pct']:>4.1f}% | run/blk {p['procs_running']}/{p['procs_blocked']}"
+                f" | Anon {p['anon_pages_mb']:.0f} File {p['file_cache_mb']:.0f} MB",
+                flush=True,
+            )
+
+        # SwapCache per NUMA
+        if self.numa_memory_history:
+            latest_numa = self.numa_memory_history[-1]["nodes"]
+            if latest_numa:
+                sc_parts = []
+                total_sc = 0.0
+                for n in latest_numa:
+                    sc = n.get("swap_cached_mb", 0)
+                    total_sc += sc
+                    sc_parts.append(f"NUMA{n['node']} {sc:.1f} MB")
+                sc_str = " | ".join(sc_parts)
+                print(f"SwapCache: Total {total_sc:.1f} MB | {sc_str}", flush=True)
+
+        self.print_numa_real_time()
+
+        if not sample_data:
+            print(self.get_no_vm_message(), flush=True)
+            return
+
+        # Table header
+        header = f"{'VM Name':<28} {'PID':<10} {'CPU%':<10} {'Memory(MB)':<12} {'Hugepage(MB)':<12} {'Status':<10}"
+        print(header, flush=True)
+        print("-" * width, flush=True)
+
+        sorted_vms = sorted(sample_data, key=lambda x: x["cpu_percent"], reverse=True)
+        for vm in sorted_vms[:15]:
+            name = vm["vm_name"][:27] if len(vm["vm_name"]) > 27 else vm["vm_name"]
+            huge_mb = vm.get("memory_huge_mb", 0.0)
+            row = (
+                f"{name:<28} {vm['pid']:<10} {vm['cpu_percent']:<10.2f} "
+                f"{vm['memory_mb']:<12.2f} {huge_mb:<12.2f} {vm['status']:<10}"
+            )
+            print(row, flush=True)
+
+        if len(sorted_vms) > 15:
+            print(f"... {len(sorted_vms) - 15} more virtual machines ...", flush=True)
+
+        print("-" * width, flush=True)
+        print(f"Total: {len(sample_data)} virtual machines | Data points: {len(self.data)}", flush=True)
+
+        # VM total memory
+        if self.vm_total_memory_history:
+            vt = self.vm_total_memory_history[-1]
+            numa_parts = [f"NUMA{k}: {v:.0f} MB" for k, v in sorted(vt["per_numa"].items())]
+            numa_str = " | ".join(numa_parts) if numa_parts else "N/A"
+            print(f"VM Total Memory: {vt['total_mb']:.0f} MB ({vt['vm_count']} VMs) | {numa_str}", flush=True)
+
+        print("Press Ctrl+C to stop monitoring", flush=True)
+
+    def check_stress_process(self, stress_pattern):
+        try:
+            for proc in psutil.process_iter(["cmdline", "name"]):
+                try:
+                    cl = " ".join(proc.info["cmdline"] or [])
+                    if stress_pattern in cl or stress_pattern in (proc.info["name"] or ""):
+                        return True
+                except:
+                    continue
+            return False
+        except:
+            return False
+
+    def check_stress_file(self, file_path):
+        return os.path.exists(file_path)
+
+    def _close_proc_raw(self) -> None:
+        """Join the background raw dumper and close its file handles.
+
+        Called at monitoring end so the host_*_raw.csv / vm_cpu_raw.csv /
+        disk_io_raw.csv / numa_cpu_map.csv files are fully flushed before export
+        begins (the xlsx exporters never touch these filenames, so ordering is
+        belt-and-braces, not a correctness dependency).
+        """
+        if self._proc_raw is not None:
+            self._proc_raw.close()
+            self._proc_raw = None
+
+    def wait_for_stress_and_monitor(self, check_type, check_target, interval_seconds=5, duration_seconds=None):
+        """Wait for stress test to start, then monitor for specified duration.
+
+        Args:
+            check_type: 'process' or 'file'
+            check_target: process name or file path
+            interval_seconds: sampling interval
+            duration_seconds: optional max duration (monitor stops after this even if stress still running)
+        """
+        print(f"Waiting for stress test to start... (Detection method: {check_type}={check_target})")
+        self.interval = interval_seconds
+        self._last_diskstats = None  # avoid stale disk deltas across monitoring restarts
+        self._last_disk_monotonic = None  # disk sub-sampler resets its own baseline
+        self._last_pressure = None  # avoid stale vmstat pressure deltas
+        self._last_pressure_monotonic = None  # pressure rate divisor baseline
+        self._last_swap_monotonic = None  # swap rate divisor baseline
+        self._last_cpu_total = None  # avoid stale /proc/stat iowait baseline
+        self._dirty_limits_read = False  # re-read dirty sysctls on restart
+        if duration_seconds:
+            print(f"Duration limit: {duration_seconds}s (will stop after this time)")
+        stress_started = False
+        while not stress_started:
+            stress_started = (
+                self.check_stress_process(check_target)
+                if check_type == "process"
+                else self.check_stress_file(check_target)
+            )
+            if not stress_started:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Waiting for stress test to start...")
+                time.sleep(2)
+
+        print("Stress test detected! Starting monitoring...")
+        self.running = True
+        start_time = time.time()
+
+        def handler(sig, frame):
+            print("\n\nStop signal received, ending monitoring...")
+            self.running = False
+
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+
+        sys.stdout.flush()
+        time.sleep(0.5)
+
+        try:
+            while self.running:
+                loop_start = time.time()
+
+                elapsed = time.time() - start_time
+                if duration_seconds and elapsed >= duration_seconds:
+                    print(f"\nDuration limit ({duration_seconds}s) reached, stopping monitoring")
+                    self.running = False
+                    break
+
+                if check_type == "process" and not self.check_stress_process(check_target):
+                    print("\nStress process ended, stopping monitoring")
+                    self.running = False
+                    break
+                if check_type == "file" and not self.check_stress_file(check_target):
+                    print("\nStress file removed, stopping monitoring")
+                    self.running = False
+                    break
+
+                sample = self.collect_sample()
+                elapsed_str = str(timedelta(seconds=int(elapsed)))
+                dur_str = str(timedelta(seconds=int(duration_seconds))) if duration_seconds else "infinity"
+                self.display_realtime_table(sample, elapsed_str, dur_str, f"Stress Sync: {check_type}={check_target}")
+
+                sl = max(0, interval_seconds - (time.time() - loop_start))
+                if sl > 0 and self.running:
+                    # Disk bandwidth sub-samples at 1s during the sleep, so
+                    # r_mb_s / w_mb_s stay per-second-accurate at any interval.
+                    self._disk_subsample_sleep(sl)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._close_proc_raw()
+        return self.data
+
+    def start_monitoring(self, duration_seconds=None, interval_seconds=5):
+        self.interval = interval_seconds
+        self._last_diskstats = None  # avoid stale disk deltas across monitoring restarts
+        self._last_disk_monotonic = None  # disk sub-sampler resets its own baseline
+        self._last_pressure = None  # avoid stale vmstat pressure deltas
+        self._last_pressure_monotonic = None  # pressure rate divisor baseline
+        self._last_swap_monotonic = None  # swap rate divisor baseline
+        self._last_cpu_total = None  # avoid stale /proc/stat iowait baseline
+        self._dirty_limits_read = False  # re-read dirty sysctls on restart
+        self.running = True
+        start_time = time.time()
+
+        def handler(sig, frame):
+            print("\nStopping monitoring...")
+            self.running = False
+
+        signal.signal(signal.SIGINT, handler)
+
+        print("Starting VM monitoring...")
+        print(
+            f"Sampling interval: {interval_seconds}s | {'Run indefinitely' if not duration_seconds else f'Duration: {duration_seconds}s'}"
+        )
+
+        sys.stdout.flush()
+        time.sleep(0.5)
+
+        try:
+            while self.running:
+                loop_start = time.time()
+                sample = self.collect_sample()
+                elapsed = time.time() - start_time
+                elapsed_str = str(timedelta(seconds=int(elapsed)))
+                dur_str = str(timedelta(seconds=int(duration_seconds))) if duration_seconds else "infinity"
+                self.display_realtime_table(sample, elapsed_str, dur_str, "Timer Mode")
+
+                if duration_seconds and elapsed >= duration_seconds:
+                    print("\nTimer duration reached, monitoring complete")
+                    self.running = False
+                    break
+
+                sl = max(0, interval_seconds - (time.time() - loop_start))
+                if sl > 0 and self.running:
+                    # Disk bandwidth sub-samples at 1s during the sleep, so
+                    # r_mb_s / w_mb_s stay per-second-accurate at any interval.
+                    self._disk_subsample_sleep(sl)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._close_proc_raw()
+        return self.data
+
+    # ==================== Export and Analysis Methods ====================
+    def export_raw_csv(self, filename=None):
+        if not filename:
+            filename = f"{self.get_csv_filename_prefix()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+            fieldnames = [
+                "timestamp",
+                "vm_name",
+                "pid",
+                "cpu_percent",
+                "memory_mb",
+                "pss_mb",
+                "rss_mb",
+                "memory_huge_mb",
+                "memory_private_mb",
+                "memory_heap_mb",
+                "memory_per_numa",
+                "memory_swapcache_mb",
+                "memory_swapcache_per_numa",
+                "status",
+            ]
+            w = csv.DictWriter(f, fieldnames, extrasaction="ignore")
+            w.writeheader()
+            if self.data:
+                w.writerows(self.data)
+        print(f"\n[OK] Raw data: {filename} ({len(self.data)} rows)")
+        return filename
+
+    def calculate_vm_stats(self):
+        vm_data = defaultdict(list)
+        for r in self.data:
+            vm_data[r["vm_name"]].append(r)
+        stats = []
+        for name, recs in sorted(vm_data.items()):
+            cpus = [r["cpu_percent"] for r in recs]
+            mems = [r["memory_mb"] for r in recs]
+            psss = [r.get("pss_mb", 0) for r in recs]
+            rsss = [r.get("rss_mb", 0) for r in recs]
+            huge = [r.get("memory_huge_mb", 0) for r in recs]
+            private = [r.get("memory_private_mb", 0) for r in recs]
+            heap = [r.get("memory_heap_mb", 0) for r in recs]
+            stats.append(
+                {
+                    "vm_name": name,
+                    "pid": recs[0]["pid"],
+                    "sample_count": len(recs),
+                    "avg_cpu": round(sum(cpus) / len(cpus), 2),
+                    "max_cpu": round(max(cpus), 2),
+                    "avg_memory_mb": round(sum(mems) / len(mems), 2),
+                    "max_memory_mb": round(max(mems), 2),
+                    "min_memory_mb": round(min(mems), 2),
+                    "last_memory_mb": mems[-1],
+                    "avg_pss_mb": round(sum(psss) / len(psss), 2) if psss else 0,
+                    "max_pss_mb": round(max(psss), 2) if psss else 0,
+                    "avg_rss_mb": round(sum(rsss) / len(rsss), 2) if rsss else 0,
+                    "max_rss_mb": round(max(rsss), 2) if rsss else 0,
+                    "avg_huge_mb": round(sum(huge) / len(huge), 2) if huge else 0,
+                    "max_huge_mb": round(max(huge), 2) if huge else 0,
+                    "avg_private_mb": round(sum(private) / len(private), 2) if private else 0,
+                    "max_private_mb": round(max(private), 2) if private else 0,
+                    "avg_heap_mb": round(sum(heap) / len(heap), 2) if heap else 0,
+                    "max_heap_mb": round(max(heap), 2) if heap else 0,
+                }
+            )
+        return stats
+
+    def calculate_overall_stats(self, vm_stats):
+        ac = [v["avg_cpu"] for v in vm_stats]
+        am = [v["avg_memory_mb"] for v in vm_stats]
+        return {
+            "total_vms": len(vm_stats),
+            "overall_avg_cpu": round(sum(ac) / len(ac), 2) if ac else 0,
+            "overall_max_cpu": round(max([v["max_cpu"] for v in vm_stats]), 2) if vm_stats else 0,
+            "overall_avg_memory_mb": round(sum(am) / len(am), 2) if am else 0,
+            "overall_max_memory_mb": round(max([v["max_memory_mb"] for v in vm_stats]), 2) if vm_stats else 0,
+            "total_avg_memory_mb": round(sum(am), 2),
+            "total_avg_memory_gb": round(sum(am) / 1024, 2),
+        }
+
+    def export_summary_csv(self, vm_stats, overall_stats, filename=None):
+        if not filename:
+            filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["=== Host Machine Statistics ===", ""])
+            w.writerow(["Total VMs", f"{overall_stats['total_vms']}"])
+            w.writerow(["Alive VM Count", self.last_vm_count])
+
+            host_cpu_avg = (
+                round(sum(self.host_cpu_history) / len(self.host_cpu_history), 1) if self.host_cpu_history else 0
+            )
+            w.writerow(["Host Avg CPU%", host_cpu_avg])
+            w.writerow(["Host Peak CPU%", round(self.peak_host_cpu, 1)])
+            host_mem_avg_mb = (
+                round(sum(h["used_mb"] for h in self.host_mem_history) / len(self.host_mem_history), 2)
+                if self.host_mem_history
+                else 0
+            )
+            w.writerow(["Host Avg Memory MB", host_mem_avg_mb])
+            w.writerow(["Host Peak Memory MB", round(self.peak_host_mem_mb, 2)])
+            w.writerow(["Disk Write Peak MB/s", round(self.peak_disk_write_mb_s, 2)])
+            w.writerow(
+                [
+                    "Dirty Avg MB",
+                    round(
+                        sum(h["dirty_mb"] for h in self.host_mem_detail_history) / len(self.host_mem_detail_history), 2
+                    )
+                    if self.host_mem_detail_history
+                    else 0,
+                ]
+            )
+            w.writerow(["Dirty Peak MB", round(self.peak_dirty_mb, 2)])
+            w.writerow(["Writeback Peak MB", round(self.peak_writeback_mb, 2)])
+            w.writerow(["ublk Devices Peak", self.peak_ublk_devices])
+            w.writerow(["Page Scan Peak MiB/s", round(self.peak_page_scan_mib_s, 3)])
+            w.writerow(["Page Reclaim Peak MiB/s", round(self.peak_page_reclaim_mib_s, 3)])
+            w.writerow(["File Refault Peak MiB/s", round(self.peak_file_refault_mib_s, 3)])
+
+            for node in sorted(self.numa_cpu_history.keys()):
+                hist = self.numa_cpu_history[node]
+                avg = round(sum(hist) / len(hist), 1) if hist else 0
+                peak = self.numa_cpu_peak[node]
+                w.writerow([f"NUMA{node} Avg CPU%", avg])
+                w.writerow([f"NUMA{node} Peak CPU%", peak])
+
+            w.writerows(
+                [
+                    ["VM Avg CPU%", overall_stats["overall_avg_cpu"]],
+                    ["VM Max CPU%", overall_stats["overall_max_cpu"]],
+                    ["Peak Total CPU", round(self.peak_total_cpu, 1)],
+                    ["VM Avg Memory MB", overall_stats["overall_avg_memory_mb"]],
+                    ["VM Max Memory MB", overall_stats["overall_max_memory_mb"]],
+                    ["Total Memory MB (Avg)", overall_stats["total_avg_memory_mb"]],
+                ]
+            )
+            w.writerow(["Hugepage Total MB", round(self.hugepage_total_mb, 0)])
+            w.writerow(
+                [
+                    "Hugepage Avg Usage MB",
+                    round(sum(self.hugepage_used_history) / len(self.hugepage_used_history), 0)
+                    if self.hugepage_used_history
+                    else 0,
+                ]
+            )
+            w.writerow(["Hugepage Peak Usage MB", round(self.peak_hugepage_used_mb, 0)])
+            huge_usage_final = (
+                round((self.peak_hugepage_used_mb / self.hugepage_total_mb * 100), 1)
+                if self.hugepage_total_mb > 0
+                else 0
+            )
+            w.writerow(["Hugepage Peak Usage %", huge_usage_final])
+
+            if self.hugepage_per_numa_history:
+                w.writerow([])
+                w.writerow(["=== Per-NUMA Node Hugepage Statistics ==="])
+                numa_huge_summary = defaultdict(lambda: {"total": [], "used": [], "free": []})
+                for entry in self.hugepage_per_numa_history:
+                    for node_id, data in entry["nodes"].items():
+                        numa_huge_summary[node_id]["total"].append(data["total_mb"])
+                        numa_huge_summary[node_id]["used"].append(data["used_mb"])
+                        numa_huge_summary[node_id]["free"].append(data["free_mb"])
+
+                for node_id in sorted(numa_huge_summary.keys()):
+                    data = numa_huge_summary[node_id]
+                    avg_total = round(sum(data["total"]) / len(data["total"]), 0) if data["total"] else 0
+                    avg_used = round(sum(data["used"]) / len(data["used"]), 0) if data["used"] else 0
+                    avg_free = round(sum(data["free"]) / len(data["free"]), 0) if data["free"] else 0
+                    avg_usage = round(avg_used / avg_total * 100, 1) if avg_total > 0 else 0
+                    w.writerow([f"NUMA{node_id} Hugepage Total MB", avg_total])
+                    w.writerow([f"NUMA{node_id} Hugepage Avg Used MB", avg_used])
+                    w.writerow([f"NUMA{node_id} Hugepage Avg Free MB", avg_free])
+                    w.writerow([f"NUMA{node_id} Hugepage Avg Usage %", avg_usage])
+
+            # Swap Capacity
+            swap_avg_used_mb = (
+                round(sum(s["capacity"]["used_mb"] for s in self.swap_history) / len(self.swap_history), 0)
+                if self.swap_history
+                else 0
+            )
+            swap_total = self.swap_history[0]["capacity"]["total_mb"] if self.swap_history else 0
+            swap_peak_pct = round(self.peak_swap_used_mb / swap_total * 100, 1) if swap_total > 0 else 0
+            w.writerow(["Swap Total Capacity MB", round(swap_total, 0)])
+            w.writerow(["Swap Avg Usage MB", swap_avg_used_mb])
+            w.writerow(["Swap Peak Usage MB", round(self.peak_swap_used_mb, 0)])
+            w.writerow(["Swap Peak Usage %", swap_peak_pct])
+
+            # Swap Cache
+            swap_avg_cached_mb = (
+                round(sum(s["cache"]["cached_mb"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_avg_cached_ratio = (
+                round(sum(s["cache"]["cached_ratio_pct"] for s in self.swap_history) / len(self.swap_history), 1)
+                if self.swap_history
+                else 0
+            )
+            w.writerow(["Swap Cached Avg MB", swap_avg_cached_mb])
+            w.writerow(["Swap Cached Peak MB", round(self.peak_swap_cached_mb, 2)])
+            w.writerow(["Swap Cached Avg Ratio %", swap_avg_cached_ratio])
+
+            # Swap Activity
+            swap_avg_in_rate = (
+                round(sum(s["activity"]["swap_in_rate"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_avg_out_rate = (
+                round(sum(s["activity"]["swap_out_rate"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_peak_in_rate = (
+                round(max(s["activity"]["swap_in_rate"] for s in self.swap_history), 2) if self.swap_history else 0
+            )
+            swap_peak_out_rate = (
+                round(max(s["activity"]["swap_out_rate"] for s in self.swap_history), 2) if self.swap_history else 0
+            )
+            swap_total_in = (
+                round(self.swap_history[-1]["activity"]["pswpin_cumulative"] * _PAGE_SIZE / 2**20, 2)
+                if self.swap_history
+                else 0
+            )
+            swap_total_out = (
+                round(self.swap_history[-1]["activity"]["pswpout_cumulative"] * _PAGE_SIZE / 2**20, 2)
+                if self.swap_history
+                else 0
+            )
+            w.writerow(["Swap Avg In Rate (MiB/s)", swap_avg_in_rate])
+            w.writerow(["Swap Avg Out Rate (MiB/s)", swap_avg_out_rate])
+            w.writerow(["Swap Peak In Rate (MiB/s)", swap_peak_in_rate])
+            w.writerow(["Swap Peak Out Rate (MiB/s)", swap_peak_out_rate])
+            w.writerow(["Swap Total In (MiB)", swap_total_in])
+            w.writerow(["Swap Total Out (MiB)", swap_total_out])
+
+            # SwapCache per NUMA
+            if self.numa_memory_history:
+                sc_summary = defaultdict(list)
+                for entry in self.numa_memory_history:
+                    for n in entry["nodes"]:
+                        sc_summary[n["node"]].append(n.get("swap_cached_mb", 0))
+                w.writerow([])
+                w.writerow(["=== SwapCache per NUMA Node ==="])
+                for node_id in sorted(sc_summary.keys()):
+                    vals = sc_summary[node_id]
+                    avg_sc = round(sum(vals) / len(vals), 2)
+                    peak_sc = round(max(vals), 2)
+                    w.writerow([f"NUMA{node_id} SwapCache Avg MB", avg_sc])
+                    w.writerow([f"NUMA{node_id} SwapCache Peak MB", peak_sc])
+
+            # VM Total Memory
+            if self.vm_total_memory_history:
+                w.writerow([])
+                w.writerow(["=== VM Total Memory ==="])
+                total_vals = [h["total_mb"] for h in self.vm_total_memory_history]
+                avg_total = round(sum(total_vals) / len(total_vals), 2)
+                peak_total = round(max(total_vals), 2)
+                w.writerow(["VM Total Memory Avg MB", avg_total])
+                w.writerow(["VM Total Memory Peak MB", peak_total])
+                all_nodes = set()
+                for h in self.vm_total_memory_history:
+                    all_nodes.update(h["per_numa"].keys())
+                for node_id in sorted(all_nodes):
+                    node_vals = [h["per_numa"].get(node_id, 0) for h in self.vm_total_memory_history]
+                    avg_node = round(sum(node_vals) / len(node_vals), 2)
+                    w.writerow([f"NUMA{node_id} VM Memory Avg MB", avg_node])
+
+            w.writerow([])
+            w.writerow(["=== Single VM Statistics ==="])
+            w.writerow(
+                [
+                    "VM",
+                    "PID",
+                    "Samples",
+                    "avgCPU",
+                    "maxCPU",
+                    "avgMem",
+                    "maxMem",
+                    "minMem",
+                    "lastMem",
+                    "avgHuge",
+                    "maxHuge",
+                    "avgPrivate",
+                    "maxPrivate",
+                    "avgHeap",
+                    "maxHeap",
+                ]
+            )
+            for v in vm_stats:
+                w.writerow(
+                    [
+                        v["vm_name"],
+                        v["pid"],
+                        v["sample_count"],
+                        v["avg_cpu"],
+                        v["max_cpu"],
+                        v["avg_memory_mb"],
+                        v["max_memory_mb"],
+                        v["min_memory_mb"],
+                        v["last_memory_mb"],
+                        v.get("avg_huge_mb", 0),
+                        v.get("max_huge_mb", 0),
+                        v.get("avg_private_mb", 0),
+                        v.get("max_private_mb", 0),
+                        v.get("avg_heap_mb", 0),
+                        v.get("max_heap_mb", 0),
+                    ]
+                )
+        print(f"[OK] Summary report: {filename}")
+        return filename
+
+    def print_summary_report(self, vm_stats, overall_stats):
+        print("\n" + "=" * 85)
+        print(f"{self.get_monitor_title()} Summary Report")
+        print("=" * 85)
+        print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.data:
+            print(f"Period: {self.data[0]['timestamp']} ~ {self.data[-1]['timestamp']}")
+
+        self.print_final_numa_stats()
+
+        print("\n[Specified NUMA Node CPU Statistics]")
+        for node in sorted(self.numa_cpu_history.keys()):
+            hist = self.numa_cpu_history[node]
+            avg = round(sum(hist) / len(hist), 1) if hist else 0
+            peak = self.numa_cpu_peak[node]
+            print(f"  NUMA {node:>2d} | Avg CPU: {avg:>5.1f}% | Peak CPU: {peak:>5.1f}%")
+
+        print("\n[Host Machine Total Resources]")
+        host_cpu_avg = round(sum(self.host_cpu_history) / len(self.host_cpu_history), 1) if self.host_cpu_history else 0
+        host_mem_avg_mb = (
+            round(sum(h["used_mb"] for h in self.host_mem_history) / len(self.host_mem_history), 2)
+            if self.host_mem_history
+            else 0
+        )
+        host_mem_total_mb = round(self.host_mem_history[0]["total_mb"], 0) if self.host_mem_history else 0
+        print(f"  Host Avg CPU:  {host_cpu_avg:.1f}% (Peak {self.peak_host_cpu:.1f}%)")
+        print(
+            f"  Host Avg Memory: {host_mem_avg_mb:.0f}/{host_mem_total_mb:.0f} MB (Peak {self.peak_host_mem_mb:.0f} MB)"
+        )
+        print(f"  Disk Write Peak:    {self.peak_disk_write_mb_s:.1f} MB/s")
+        print(f"  Dirty Peak:         {self.peak_dirty_mb:.1f} MB | Writeback Peak: {self.peak_writeback_mb:.1f} MB")
+        print(f"  ublk Devices Peak:  {self.peak_ublk_devices}")
+        print(
+            f"  Page Pressure Peak: Scan {self.peak_page_scan_mib_s:.1f} | Reclaim {self.peak_page_reclaim_mib_s:.1f}"
+            f" | Refault {self.peak_file_refault_mib_s:.1f} MiB/s"
+        )
+        print("")
+        print(f"  Total VMs:    {overall_stats['total_vms']}")
+        print(f"  Alive VMs:     {self.last_vm_count}")
+        print(f"  Avg CPU:       {overall_stats['overall_avg_cpu']}%")
+        print(f"  Max CPU:       {overall_stats['overall_max_cpu']}%")
+        print(f"  Peak Total CPU:     {round(self.peak_total_cpu, 1)}%")
+        print(f"  Avg Memory:      {overall_stats['overall_avg_memory_mb']} MB")
+        print(
+            f"  Total Memory (Avg):   {overall_stats['total_avg_memory_mb']} MB ({overall_stats['total_avg_memory_gb']} GB)"
+        )
+        print("[Hugepage Memory Info]")
+        print(f"  Hugepage Total:     {self.hugepage_total_mb:.0f} MB")
+        avg_huge = (
+            round(sum(self.hugepage_used_history) / len(self.hugepage_used_history), 0)
+            if self.hugepage_used_history
+            else 0
+        )
+        huge_usage = (
+            round((self.peak_hugepage_used_mb / self.hugepage_total_mb * 100), 1) if self.hugepage_total_mb > 0 else 0
+        )
+        print(f"  Hugepage Avg Usage:    {avg_huge} MB")
+        print(f"  Hugepage Peak Usage:    {self.peak_hugepage_used_mb:.0f} MB ({huge_usage:.1f}%)")
+
+        if self.hugepage_per_numa_history:
+            print("\n[Per-NUMA Node Hugepage Statistics]")
+            numa_huge_summary = defaultdict(lambda: {"total": [], "used": [], "free": []})
+            for entry in self.hugepage_per_numa_history:
+                for node_id, data in entry["nodes"].items():
+                    numa_huge_summary[node_id]["total"].append(data["total_mb"])
+                    numa_huge_summary[node_id]["used"].append(data["used_mb"])
+                    numa_huge_summary[node_id]["free"].append(data["free_mb"])
+
+            for node_id in sorted(numa_huge_summary.keys()):
+                data = numa_huge_summary[node_id]
+                avg_total = round(sum(data["total"]) / len(data["total"]), 0) if data["total"] else 0
+                avg_used = round(sum(data["used"]) / len(data["used"]), 0) if data["used"] else 0
+                avg_free = round(sum(data["free"]) / len(data["free"]), 0) if data["free"] else 0
+                avg_usage = round(avg_used / avg_total * 100, 1) if avg_total > 0 else 0
+                print(
+                    f"  NUMA {node_id:>2d} | Total {avg_total:>8.0f} MB | Used {avg_used:>8.0f} MB ({avg_usage:>5.1f}%) | Free {avg_free:>8.0f} MB"
+                )
+
+        if self.swap_history:
+            swap_avg_used_mb = (
+                round(sum(s["capacity"]["used_mb"] for s in self.swap_history) / len(self.swap_history), 0)
+                if self.swap_history
+                else 0
+            )
+            swap_total_mb = self.swap_history[0]["capacity"]["total_mb"] if self.swap_history else 0
+            swap_peak_pct = round(self.peak_swap_used_mb / swap_total_mb * 100, 1) if swap_total_mb > 0 else 0
+            swap_avg_cached_mb = (
+                round(sum(s["cache"]["cached_mb"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_avg_cached_ratio = (
+                round(sum(s["cache"]["cached_ratio_pct"] for s in self.swap_history) / len(self.swap_history), 1)
+                if self.swap_history
+                else 0
+            )
+            print("[Swap Partition]")
+            print(f"  Total:   {swap_total_mb:>8.0f} MB")
+            print(
+                f"  Avg Used | {swap_avg_used_mb:>8.0f} MB | Peak {self.peak_swap_used_mb:>8.0f} MB ({swap_peak_pct:>5.1f}%)"
+            )
+            print(
+                f"  Avg Cache| {swap_avg_cached_mb:>8.2f} MB | Peak {self.peak_swap_cached_mb:>8.2f} MB ({swap_avg_cached_ratio:>5.1f}%)"
+            )
+
+            swap_avg_in_rate = (
+                round(sum(s["activity"]["swap_in_rate"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_avg_out_rate = (
+                round(sum(s["activity"]["swap_out_rate"] for s in self.swap_history) / len(self.swap_history), 2)
+                if self.swap_history
+                else 0
+            )
+            swap_peak_in_rate = (
+                round(max(s["activity"]["swap_in_rate"] for s in self.swap_history), 2) if self.swap_history else 0
+            )
+            swap_peak_out_rate = (
+                round(max(s["activity"]["swap_out_rate"] for s in self.swap_history), 2) if self.swap_history else 0
+            )
+            swap_total_in = (
+                round(self.swap_history[-1]["activity"]["pswpin_cumulative"] * _PAGE_SIZE / 2**20, 2)
+                if self.swap_history
+                else 0
+            )
+            swap_total_out = (
+                round(self.swap_history[-1]["activity"]["pswpout_cumulative"] * _PAGE_SIZE / 2**20, 2)
+                if self.swap_history
+                else 0
+            )
+            print("[Swap Activity]")
+            print(
+                f"  Avg In  | {swap_avg_in_rate:>8.2f} MiB/s | Peak {swap_peak_in_rate:>8.2f} MiB/s | Total {swap_total_in:>10.2f} MiB"
+            )
+            print(
+                f"  Avg Out | {swap_avg_out_rate:>8.2f} MiB/s | Peak {swap_peak_out_rate:>8.2f} MiB/s | Total {swap_total_out:>10.2f} MiB"
+            )
+
+        # SwapCache per NUMA summary
+        if self.numa_memory_history:
+            print("[SwapCache per NUMA Node]")
+            sc_summary = defaultdict(list)
+            for entry in self.numa_memory_history:
+                for n in entry["nodes"]:
+                    sc_summary[n["node"]].append(n.get("swap_cached_mb", 0))
+            for node_id in sorted(sc_summary.keys()):
+                vals = sc_summary[node_id]
+                avg_sc = round(sum(vals) / len(vals), 2)
+                peak_sc = round(max(vals), 2)
+                print(f"  NUMA {node_id:>2d} | Avg SwapCache {avg_sc:>8.2f} MB | Peak {peak_sc:>8.2f} MB")
+
+        # VM total memory summary
+        if self.vm_total_memory_history:
+            print("[VM Total Memory]")
+            total_vals = [h["total_mb"] for h in self.vm_total_memory_history]
+            avg_total = round(sum(total_vals) / len(total_vals), 2)
+            peak_total = round(max(total_vals), 2)
+            print(f"  Avg Total: {avg_total:.0f} MB | Peak Total: {peak_total:.0f} MB")
+            all_nodes = set()
+            for h in self.vm_total_memory_history:
+                all_nodes.update(h["per_numa"].keys())
+            for node_id in sorted(all_nodes):
+                node_vals = [h["per_numa"].get(node_id, 0) for h in self.vm_total_memory_history]
+                avg_node = round(sum(node_vals) / len(node_vals), 2)
+                print(f"  NUMA {node_id:>2d} | Avg VM Memory {avg_node:>8.0f} MB")
+
+        if vm_stats:
+            print("\n[TOP10 CPU]")
+            for i, v in enumerate(sorted(vm_stats, key=lambda x: x["avg_cpu"], reverse=True)[:10], 1):
+                n = v["vm_name"][:29]
+                print(f"{i:2}. {n:<30} {v['avg_cpu']:6.2f}% (max {v['max_cpu']:.2f})")
+
+            print("\n[TOP10 Memory]")
+            for i, v in enumerate(sorted(vm_stats, key=lambda x: x["avg_memory_mb"], reverse=True)[:10], 1):
+                n = v["vm_name"][:29]
+                huge_mb = v.get("avg_huge_mb", 0)
+                print(f"{i:2}. {n:<30} {v['avg_memory_mb']:8.2f} MB (Hugepage {huge_mb:.2f} MB)")
+        print("=" * 85)
+
+    def analyze_and_export(self, raw=None, summary=None):
+        """Analyze collected data and export reports
+
+        Note: Imports exporters module lazily to avoid circular dependency.
+        """
+        vs = self.calculate_vm_stats()
+        os = self.calculate_overall_stats(vs)
+        rf = self.export_raw_csv(raw)
+        sf = self.export_summary_csv(vs, os, summary)
+        self.print_summary_report(vs, os)
+        return rf, sf
