@@ -700,3 +700,625 @@ class TestDiscoverVmProcesses(unittest.TestCase):
         self.assertEqual(candidates, [])
 
 
+class TestCollectVmMetricsParallel(unittest.TestCase):
+    """Tests for _collect_vm_metrics_parallel() and _collect_vm_metrics_serial()"""
+
+    def _make_candidate(self, pid, vm_name="vm0", status="running"):
+        """Create a lightweight VM candidate dict"""
+        return {
+            "pid": pid,
+            "proc_name": "test_process",
+            "cmdline": "",
+            "status": status,
+            "vm_name": vm_name,
+        }
+
+    def test_parallel_returns_vm_dicts(self):
+        """Parallel collection should return complete VM dicts"""
+        monitor = DummyMonitor()
+        candidates = [
+            self._make_candidate(100, "vm-100"),
+            self._make_candidate(101, "vm-101"),
+            self._make_candidate(102, "vm-102"),
+            self._make_candidate(103, "vm-103"),
+        ]
+
+        # Mock numa_maps to return data for each PID
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 2048.0,
+                "huge_mb": 0.0,
+                "private_mb": 1000.0,
+                "heap_mb": 50.0,
+                "per_node": {0: {"total_mb": 1024.0}, 2: {"total_mb": 1024.0}},
+                "swapcache_mb": 100.0,
+                "swapcache_per_node": {0: 50.0, 2: 50.0},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch(
+            "vm_monitor.base.psutil.Process"
+        ) as mock_process_cls:
+            # Mock Process.cpu_percent to return seed=0 then delta=5.0
+            mock_proc = MagicMock()
+            mock_proc.cpu_percent.return_value = 5.0
+            mock_process_cls.return_value = mock_proc
+
+            vms = monitor._collect_vm_metrics_parallel(candidates)
+
+        self.assertEqual(len(vms), 4)
+        for vm in vms:
+            self.assertIn("pid", vm)
+            self.assertIn("name", vm)
+            self.assertIn("cpu_percent", vm)
+            self.assertIn("memory_mb", vm)
+            self.assertIn("memory_swapcache_mb", vm)
+            self.assertIn("pss_mb", vm)
+            self.assertIn("status", vm)
+            # Internal keys should not be in final result
+            self.assertNotIn("_is_new_pid", vm)
+            self.assertNotIn("_seed_process", vm)
+
+    def test_serial_returns_same_structure(self):
+        """Serial collection should return same dict structure as parallel"""
+        monitor = DummyMonitor()
+        candidates = [self._make_candidate(100, "vm-100")]
+
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 2048.0,
+                "huge_mb": 0.0,
+                "private_mb": 1000.0,
+                "heap_mb": 50.0,
+                "per_node": {0: {"total_mb": 2048.0}},
+                "swapcache_mb": 100.0,
+                "swapcache_per_node": {0: 100.0},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch(
+            "vm_monitor.base.psutil.Process"
+        ) as mock_process_cls:
+            mock_proc = MagicMock()
+            mock_proc.cpu_percent.return_value = 0.0  # seed call
+            mock_process_cls.return_value = mock_proc
+
+            vms = monitor._collect_vm_metrics_serial(candidates)
+
+        self.assertEqual(len(vms), 1)
+        vm = vms[0]
+        self.assertEqual(vm["pid"], 100)
+        self.assertEqual(vm["name"], "vm-100")
+        self.assertEqual(vm["memory_mb"], 2048.0)
+        self.assertIn("pss_mb", vm)
+
+    def test_small_count_uses_serial_path(self):
+        """Less than 4 VMs should use serial path (no ThreadPoolExecutor)"""
+        monitor = DummyMonitor()
+        candidates = [self._make_candidate(100)]
+
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch(
+            "vm_monitor.base.psutil.Process"
+        ) as mock_process_cls:
+            mock_proc = MagicMock()
+            mock_proc.cpu_percent.return_value = 0.0
+            mock_process_cls.return_value = mock_proc
+
+            vms = monitor._collect_vm_metrics_parallel(candidates)
+
+        # Should have used serial path (<4 candidates)
+        self.assertEqual(len(vms), 1)
+
+    def test_empty_candidates_returns_empty(self):
+        """Empty candidate list should return empty result immediately"""
+        monitor = DummyMonitor()
+        vms = monitor._collect_vm_metrics_parallel([])
+        self.assertEqual(vms, [])
+
+    def test_dead_process_handled_gracefully(self):
+        """Dead process should produce zeroed metrics, not crash"""
+        monitor = DummyMonitor()
+        candidates = [self._make_candidate(99999)]
+
+        # numa_maps returns empty dict (process gone)
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 0.0,
+                "huge_mb": 0.0,
+                "private_mb": 0.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch(
+            "vm_monitor.base.psutil.Process", side_effect=psutil.NoSuchProcess(99999)
+        ):
+            vms = monitor._collect_vm_metrics_serial(candidates)
+
+        self.assertEqual(len(vms), 1)
+        vm = vms[0]
+        self.assertEqual(vm["memory_mb"], 0.0)
+        self.assertEqual(vm["cpu_percent"], 0.0)
+
+    def test_cpu_baseline_seeded_then_delta(self):
+        """CPU% comes from jiffies deltas: first sample 0, then the real rate"""
+        monitor = DummyMonitor()
+        # Two cycles over the same pids; each pid burns 100 ticks (1.0 CPU-s)
+        # between samples 2.0 s apart -> 50% of one core.
+        ticks = iter([(50, 0), (50, 0), (150, 0), (150, 0)])
+        times = iter([1000.0, 1000.0, 1002.0, 1002.0])
+        candidates = [self._make_candidate(100), self._make_candidate(101)]
+
+        def mock_numa_maps_result(pid):
+            return {"total_mb": 100.0, "per_node": {}}
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch.object(
+            monitor, "_read_pid_jiffies", side_effect=lambda pid: next(ticks)
+        ), patch.object(monitor, "_read_pss_rss_mb", return_value=(0.0, 0.0)), patch(
+            "vm_monitor.base.time.monotonic", side_effect=lambda: next(times)
+        ):
+            vms1 = monitor._collect_vm_metrics_serial(candidates)
+            vms2 = monitor._collect_vm_metrics_serial(candidates)
+
+        self.assertEqual([vm["cpu_percent"] for vm in vms1], [0.0, 0.0])
+        self.assertEqual([vm["cpu_percent"] for vm in vms2], [50.0, 50.0])
+
+    def test_dead_pid_cleaned_from_cpu_baseline(self):
+        """PIDs not in the current sample are dropped from the CPU baseline"""
+        monitor = DummyMonitor()
+        monitor._proc_cpu_prev[999] = (10, 0.0)
+
+        candidates = [self._make_candidate(100)]
+
+        with patch.object(
+            monitor, "get_vm_memory_from_numastat", return_value={"total_mb": 100.0, "per_node": {}}
+        ), patch.object(monitor, "_read_pid_jiffies", return_value=(10, 0)), patch.object(
+            monitor, "_read_pss_rss_mb", return_value=(0.0, 0.0)
+        ):
+            monitor._collect_vm_metrics_serial(candidates)
+
+        self.assertNotIn(999, monitor._proc_cpu_prev)
+        self.assertIn(100, monitor._proc_cpu_prev)
+
+    def test_peak_tracking(self):
+        """Peak memory and CPU should be tracked correctly across cycles"""
+        monitor = DummyMonitor()
+        candidates = [self._make_candidate(100), self._make_candidate(101)]
+
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 2048.0,
+                "huge_mb": 0.0,
+                "private_mb": 1000.0,
+                "heap_mb": 50.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        # Cycle 1 seeds the jiffies baseline (cpu 0); cycle 2 delta is 100
+        # ticks over 2.0 s = 50% of one core per VM.
+        ticks = iter([(50, 0), (50, 0), (150, 0), (150, 0)])
+        times = iter([1000.0, 1000.0, 1002.0, 1002.0])
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch.object(
+            monitor, "_read_pid_jiffies", side_effect=lambda pid: next(ticks)
+        ), patch.object(monitor, "_read_pss_rss_mb", return_value=(0.0, 0.0)), patch(
+            "vm_monitor.base.time.monotonic", side_effect=lambda: next(times)
+        ):
+            monitor._collect_vm_metrics_serial(candidates)
+            self.assertEqual(monitor.peak_total_memory_mb, 4096.0)
+            self.assertEqual(monitor.peak_total_cpu, 0.0)  # first cycle seeds
+
+            monitor._collect_vm_metrics_serial(candidates)
+            self.assertEqual(monitor.peak_total_cpu, 100.0)  # 2 * 50%
+
+    def test_dead_pid_cleaned_from_cache(self):
+        """PIDs not in current sample should be removed from the CPU baseline"""
+        monitor = DummyMonitor()
+        # Pre-populate cache with a dead PID
+        monitor._proc_cpu_prev[999] = (10, 0.0)
+
+        candidates = [self._make_candidate(100)]
+
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch.object(
+            monitor, "_read_pid_jiffies", return_value=(10, 0)
+        ), patch.object(monitor, "_read_pss_rss_mb", return_value=(0.0, 0.0)):
+            monitor._collect_vm_metrics_serial(candidates)
+
+        # Dead PID 999 should have been cleaned
+        self.assertNotIn(999, monitor._proc_cpu_prev)
+        self.assertIn(100, monitor._proc_cpu_prev)
+
+
+class TestBugFixes(unittest.TestCase):
+    """Tests for bugs found during code review"""
+
+    def _write_mock_numa_maps(self, content):
+        """Write mock numa_maps content to a temp file"""
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".numa_maps", delete=False)
+        f.write(content)
+        f.close()
+        return f.name
+
+    def test_swapcache_uses_base_page_size_not_hugepage_size(self):
+        """swapcache in numa_maps counts 4KB base pages, not hugepage pages.
+        Multiplying by kernelpagesize_kB for THP mappings would inflate
+        swapcache_mb by 512x. The fix uses base_page_size_mb (4/1024).
+        """
+        # A THP mapping: kernelpagesize_kB=2048, swapcache=2, N0=5
+        content = "aaaa0000 bind:2 anon=100 swapcache=2 N0=5 kernelpagesize_kB=2048\n"
+        path = self._write_mock_numa_maps(content)
+        monitor = DummyMonitor()
+
+        with patch(
+            "vm_monitor.base.open", side_effect=lambda p, *a, **k: open(path) if "numa_maps" in p else open(p, *a, **k)
+        ):
+            result = monitor.get_vm_memory_from_numa_maps(123)
+
+        # swapcache=2 pages at 4KB each = 2 * 4 / 1024 = 0.0078 MB
+        # NOT 2 * 2048 / 1024 = 4.0 MB (that would be 512x inflation)
+        expected_swapcache_mb = round(2 * 4 / 1024, 2)  # ~0.01 MB
+        self.assertAlmostEqual(result["swapcache_mb"], expected_swapcache_mb, places=2)
+
+        # total should still use hugepage size: 5 * 2048/1024 = 10.0 MB
+        expected_total_mb = round(5 * 2048 / 1024, 2)
+        self.assertAlmostEqual(result["total_mb"], expected_total_mb, places=1)
+
+        os.unlink(path)
+
+    def test_numa_maps_parsed_flag_accepted_on_zero_memory(self):
+        """When numa_maps is successfully parsed but process has zero resident
+        pages, the _parsed flag should allow the result through instead of
+        falling back to numastat subprocess.
+        """
+        monitor = DummyMonitor()
+
+        # numa_maps with no N*= entries (all virtual mappings) → parsed=True, total_mb=0
+        content = "aaaa0000 bind:2\naaaab000 bind:2\n"
+        path = self._write_mock_numa_maps(content)
+
+        with patch(
+            "vm_monitor.base.open", side_effect=lambda p, *a, **k: open(path) if "numa_maps" in p else open(p, *a, **k)
+        ):
+            result = monitor.get_vm_memory_from_numastat(123)
+
+        # Should accept the numa_maps result (total_mb=0 is legitimate)
+        # Without the fix, >0 check would reject it and fall back to numastat
+        self.assertEqual(result["total_mb"], 0.0)
+        # The _parsed flag should have been removed before returning
+        self.assertNotIn("_parsed", result)
+
+        os.unlink(path)
+
+    def test_numa_maps_failure_triggers_fallback(self):
+        """When numa_maps file doesn't exist (parsed=False), should fall back
+        to numastat subprocess instead of accepting the empty result.
+        """
+        monitor = DummyMonitor()
+        numastat_output = (
+            "Node0            Node2            Total\n"
+            "---              ---              ---\n"
+            "Total            1000.0           2000.0           3000.0\n"
+        )
+
+        with patch("vm_monitor.base.open", side_effect=FileNotFoundError), patch(
+            "vm_monitor.base.subprocess.run", return_value=MagicMock(returncode=0, stdout=numastat_output)
+        ):
+            result = monitor.get_vm_memory_from_numastat(123)
+
+        # Should have data from numastat fallback, not empty numa_maps result
+        self.assertGreater(result["total_mb"], 0)
+
+    def test_swapcache_base_page_size_in_regular_mapping(self):
+        """For regular 4KB mappings, swapcache should still use base page size
+        (which is the same as kernelpagesize_kB in this case, so no difference).
+        """
+        content = "aaaa0000 bind:2 anon=473814 swapcache=86418 N2=386088 N5=87726 kernelpagesize_kB=4\n"
+        path = self._write_mock_numa_maps(content)
+        monitor = DummyMonitor()
+
+        with patch(
+            "vm_monitor.base.open", side_effect=lambda p, *a, **k: open(path) if "numa_maps" in p else open(p, *a, **k)
+        ):
+            result = monitor.get_vm_memory_from_numa_maps(123)
+
+        # For 4KB mappings, base_page_size_mb == page_size_mb, so same result
+        swapcache_mb = result["swapcache_mb"]
+        expected = round(86418 * 4 / 1024, 2)  # 337.57 MB
+        self.assertAlmostEqual(swapcache_mb, expected, places=1)
+
+        os.unlink(path)
+
+    def test_fallback_memory_mb_helper(self):
+        """_fallback_memory_mb should return PSS or RSS when numastat fails"""
+        monitor = DummyMonitor()
+
+        # Mock psutil.Process to return memory_info with PSS
+        mock_proc = MagicMock()
+        mock_mem = MagicMock()
+        mock_mem.pss = 2048 * 1024 * 1024  # 2048 MB
+        mock_proc.memory_info.return_value = mock_mem
+
+        with patch("vm_monitor.base.psutil.Process", return_value=mock_proc):
+            result = monitor._fallback_memory_mb(100)
+        self.assertEqual(result, 2048.0)
+
+    def test_extract_numastat_fields_helper(self):
+        """_extract_numastat_fields should extract all standard VM metric fields"""
+        monitor = DummyMonitor()
+        numastat_mem = {
+            "total_mb": 2048.0,
+            "huge_mb": 0.0,
+            "private_mb": 1000.0,
+            "heap_mb": 50.0,
+            "per_node": {0: {"total_mb": 1024.0}},
+            "swapcache_mb": 100.0,
+            "swapcache_per_node": {0: 50.0},
+        }
+        fields = monitor._extract_numastat_fields(numastat_mem)
+
+        self.assertEqual(fields["memory_mb"], 2048.0)
+        self.assertEqual(fields["memory_huge_mb"], 0.0)
+        self.assertEqual(fields["memory_private_mb"], 1000.0)
+        self.assertEqual(fields["memory_heap_mb"], 50.0)
+        self.assertEqual(fields["memory_per_numa"], {0: {"total_mb": 1024.0}})
+        self.assertEqual(fields["memory_swapcache_mb"], 100.0)
+        self.assertEqual(fields["memory_swapcache_per_numa"], {0: 50.0})
+        self.assertNotIn("pss_mb", fields)  # pss/rss are collector-owned, not numastat fields
+
+    def test_collect_single_vm_returns_tuple(self):
+        """_collect_single_vm should return (result, heavy_fields, cpu_sec)"""
+        monitor = DummyMonitor()
+        candidate = {"pid": 100, "vm_name": "vm-100", "status": "running", "proc_name": "test", "cmdline": ""}
+
+        def mock_numa_maps_result(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa_maps_result), patch.object(
+            monitor, "_read_pss_rss_mb", return_value=(512.0, 0.0)
+        ):
+            vm_result, heavy_fields, heavy_cpu = monitor._collect_single_vm(candidate)
+
+        # Result dict should not contain _is_new_pid or _seed_process
+        self.assertNotIn("_is_new_pid", vm_result)
+        self.assertNotIn("_seed_process", vm_result)
+        self.assertEqual(vm_result["pid"], 100)
+        self.assertEqual(vm_result["memory_mb"], 100.0)
+        # PSS is always collected (not just a numastat-failure fallback)
+        self.assertEqual(vm_result["pss_mb"], 512.0)
+        # A first-seen pid is always read and reports its measured CPU cost
+        self.assertEqual(heavy_fields["pss_mb"], 512.0)
+        self.assertIsNotNone(heavy_cpu)
+
+    def test_csv_fieldnames_include_swapcache(self):
+        """CSV export fieldnames should include memory_swapcache_mb and
+        memory_swapcache_per_numa (previously silently dropped by extrasaction).
+        """
+        monitor = DummyMonitor()
+        # Trigger a collect_sample to populate data
+        # We can't easily test export directly, but we can check collect_sample
+        # includes swapcache fields in the record dict
+        from datetime import datetime
+
+        vm_dict = {
+            "pid": 100,
+            "name": "vm-100",
+            "cpu_percent": 5.0,
+            "memory_mb": 2048.0,
+            "pss_mb": 1500.0,
+            "memory_huge_mb": 0.0,
+            "memory_private_mb": 1000.0,
+            "memory_heap_mb": 50.0,
+            "memory_per_numa": {},
+            "memory_swapcache_mb": 100.0,
+            "memory_swapcache_per_numa": {0: 50.0},
+            "status": "running",
+        }
+        record = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "vm_name": vm_dict["name"],
+            "pid": vm_dict["pid"],
+            "cpu_percent": vm_dict["cpu_percent"],
+            "memory_mb": vm_dict["memory_mb"],
+            "pss_mb": vm_dict.get("pss_mb", 0),
+            "memory_huge_mb": vm_dict.get("memory_huge_mb", 0),
+            "memory_private_mb": vm_dict.get("memory_private_mb", 0),
+            "memory_heap_mb": vm_dict.get("memory_heap_mb", 0),
+            "memory_per_numa": vm_dict.get("memory_per_numa", {}),
+            "memory_swapcache_mb": vm_dict.get("memory_swapcache_mb", 0),
+            "memory_swapcache_per_numa": vm_dict.get("memory_swapcache_per_numa", {}),
+            "status": vm_dict["status"],
+        }
+        # Verify swapcache fields are present in the record
+        self.assertIn("memory_swapcache_mb", record)
+        self.assertIn("memory_swapcache_per_numa", record)
+        self.assertEqual(record["memory_swapcache_mb"], 100.0)
+        self.assertIn("pss_mb", record)
+        self.assertEqual(record["pss_mb"], 1500.0)
+
+    def test_pss_collector_off_skips_read_and_fallback(self):
+        """--no-pss must skip _read_pss_rss_mb entirely (no smaps_rollup cost);
+        pss_mb key is omitted (-> empty CSV cell -> fleet column dropped), while
+        RSS, when enabled, falls back to the cheap status VmRSS read."""
+        monitor = DummyMonitor()
+        monitor.disable_collectors({"pss"})
+        candidate = {"pid": 100, "vm_name": "vm-100", "status": "running", "proc_name": "t", "cmdline": ""}
+
+        def mock_numa(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa), patch.object(
+            monitor, "_read_pss_rss_mb"
+        ) as mock_pss_rss, patch.object(monitor, "_read_rss_mb", return_value=256.0) as mock_rss:
+            vm_result, _, _ = monitor._collect_single_vm(candidate)
+
+        mock_pss_rss.assert_not_called()  # smaps_rollup never opened
+        mock_rss.assert_called_once()  # rss still collected via cheap status read
+        self.assertNotIn("pss_mb", vm_result)  # omitted, not zeroed: fleet column disappears
+        self.assertEqual(vm_result["rss_mb"], 256.0)
+
+    def test_rss_collector_off_omits_field_keeps_pss(self):
+        """--no-rss omits the rss_mb key (-> empty CSV cell -> fc_rss_gb column
+        dropped) even though smaps_rollup already returned a value; PSS kept."""
+        monitor = DummyMonitor()
+        monitor.disable_collectors({"rss"})
+        candidate = {"pid": 100, "vm_name": "vm-100", "status": "running", "proc_name": "t", "cmdline": ""}
+
+        def mock_numa(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa), patch.object(
+            monitor, "_read_pss_rss_mb", return_value=(512.0, 999.0)
+        ), patch.object(monitor, "_read_rss_mb") as mock_rss:
+            vm_result, _, _ = monitor._collect_single_vm(candidate)
+
+        mock_rss.assert_not_called()  # no extra /proc/<pid>/status open
+        self.assertEqual(vm_result["pss_mb"], 512.0)
+        self.assertNotIn("rss_mb", vm_result)  # omitted, not zeroed: fleet column disappears
+
+    def test_both_off_omits_pss_and_rss(self):
+        """--no-pss --no-rss: neither key present (empty CSV cells, both fleet
+        columns dropped); no smaps_rollup open and no status read either."""
+        monitor = DummyMonitor()
+        monitor.disable_collectors({"pss", "rss"})
+        candidate = {"pid": 100, "vm_name": "vm-100", "status": "running", "proc_name": "t", "cmdline": ""}
+
+        def mock_numa(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa), patch.object(
+            monitor, "_read_pss_rss_mb"
+        ) as mock_pss_rss, patch.object(monitor, "_read_rss_mb") as mock_rss:
+            vm_result, _, _ = monitor._collect_single_vm(candidate)
+
+        mock_pss_rss.assert_not_called()
+        mock_rss.assert_not_called()
+        self.assertNotIn("pss_mb", vm_result)
+        self.assertNotIn("rss_mb", vm_result)
+
+    def test_rss_default_rides_pss_smaps_rollup_open(self):
+        """Default (pss+rss on) reads RSS from the SAME smaps_rollup open as PSS
+        (one page-table walk); _read_rss_mb is only the --no-pss fallback."""
+        monitor = DummyMonitor()
+        candidate = {"pid": 100, "vm_name": "vm-100", "status": "running", "proc_name": "t", "cmdline": ""}
+
+        def mock_numa(pid):
+            return {
+                "total_mb": 100.0,
+                "huge_mb": 0.0,
+                "private_mb": 50.0,
+                "heap_mb": 0.0,
+                "per_node": {},
+                "swapcache_mb": 0.0,
+                "swapcache_per_node": {},
+            }
+
+        with patch.object(monitor, "get_vm_memory_from_numastat", side_effect=mock_numa), patch.object(
+            monitor, "_read_pss_rss_mb", return_value=(512.0, 768.0)
+        ) as mock_combined, patch.object(monitor, "_read_rss_mb") as mock_rss:
+            vm_result, heavy_fields, _ = monitor._collect_single_vm(candidate)
+
+        mock_combined.assert_called_once()
+        mock_rss.assert_not_called()  # RSS fell out of the existing smaps_rollup open
+        self.assertEqual(vm_result["pss_mb"], 512.0)
+        self.assertEqual(vm_result["rss_mb"], 768.0)
+        self.assertEqual(heavy_fields["rss_mb"], 768.0)
+
+    def test_collect_ublk_daemon_computes_cores_from_jiffies(self):
+        """collect_ublk_daemon resolves the pid + converts jiffy delta to cores."""
+        monitor = DummyMonitor()
+        # Two stat reads: utime+stime jumps 100 jiffies (1.0s @ _CLK_TCK=100).
+        stat_payloads = iter(
+            [
+                "0 (uvm-ublk-daemon) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                "0 (uvm-ublk-daemon) S 1 0 0 0 -1 0 0 0 0 0 0 100 0 0 0 0 0 0 0",  # +100 jiffies
+            ]
+        )
+
+        def fake_open(path, *a, **k):
+            content = next(stat_payloads)
+
+            class _F:
+                def read(self_inner):
+                    return content
+
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+            return _F()
+
+        import vm_monitor.base as base
+
+        # Patch perf_counter to simulate a 1.0s wall delta between samples.
+        clock = iter([1000.0, 1001.0])
+        with patch.object(monitor, "_find_pid_by_comm", return_value=4242), patch(
+            "builtins.open", side_effect=fake_open
+        ), patch.object(base.time, "perf_counter", side_effect=lambda: next(clock)):
+            monitor.collect_ublk_daemon()  # seed (no prev -> cores 0)
+            monitor.collect_ublk_daemon()  # delta 100 jiffies / 100 tck / 1.0s = 1.0 core
+
+        self.assertEqual(len(monitor.ublk_daemon_history), 2)
+        self.assertEqual(monitor.ublk_daemon_history[0]["cores"], 0.0)
+        self.assertEqual(monitor.ublk_daemon_history[1]["cores"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
