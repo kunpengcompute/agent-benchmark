@@ -1,0 +1,565 @@
+# vm_monitor/cli.py
+"""
+Command Line Interface Entry Point
+
+Main entry point for VM monitor tool. Handles argparse parsing,
+initialization of monitor and log capture, and coordinates execution.
+Supports multiple VMM types: QEMU, Firecracker, CubeSandbox.
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+from datetime import datetime
+
+from .base import _discover_block_devices
+
+# Internal dependencies - all modules
+from .config import load_env_config, validate_and_prompt_missing
+from .capture.log_capture import DEFAULT_ROTATION_PERF_EVENTS, LogCapture
+from .export.raw.report import build_host_resources_xlsx
+from .export.resource_report import export_to_excel, print_capture_summary
+from .export.svg import export_svg_reports
+from .vmm.firecracker import FirecrackerMonitor
+from .vmm.qemu import QEMUMonitor
+from .vmm.cubesandbox import CubeSandboxMonitor
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_rotation_intervals(spec: str, fallback: int) -> dict:
+    """Parse ``--rotation-intervals 'devkit=20,ksys=30,perf=15'`` into a dict.
+
+    Tools omitted from the spec fall back to ``fallback`` (``--rotation-interval``).
+    Unknown keys are warned + dropped (never crash the bench on a typo); ``devkit``,
+    ``ksys``, ``perf``, ``uprof`` are the valid tools.
+    """
+    valid = {"devkit", "ksys", "perf", "uprof"}
+    result = {}
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" not in token:
+            logger.warning("--rotation-intervals: '%s' is not key=value, skipping", token)
+            continue
+        tool, _, val = token.partition("=")
+        tool = tool.strip()
+        if tool not in valid:
+            logger.warning("--rotation-intervals: unknown tool '%s' (valid: %s), skipping", tool, sorted(valid))
+            continue
+        try:
+            result[tool] = max(1, int(val.strip()))
+        except ValueError:
+            logger.warning("--rotation-intervals: '%s' is not an int for tool '%s', skipping", val.strip(), tool)
+    return result
+
+
+def _parse_rotation_tools(spec: str) -> list[str] | None:
+    """Parse ``--rotation-tools 'devkit,perf'`` into a tool-name list.
+
+    Unknown names are warned + dropped; an empty result (only-invalid names)
+    falls back to None = rotate every tool. Order does not matter: LogCapture
+    keeps the canonical slot order.
+    """
+    valid = {"devkit", "ksys", "perf", "uprof"}
+    tools = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token not in valid:
+            logger.warning("--rotation-tools: unknown tool '%s' (valid: %s), skipping", token, sorted(valid))
+            continue
+        if token not in tools:
+            tools.append(token)
+    return tools or None
+
+
+# Unified flag_stem -> internal_name map (user refinement: single source of
+# truth for stem<->internal translation). target "base" disables a
+# VMMonitorBase /proc collector via m.disable_collectors(); "devkit" disables
+# a LogCapture devkit sub-tool via its disabled_devkit set. Stems are hyphenated
+# (the CLI/YAML surface); internal names are snake_case (the method/attribute
+# surface). bench_core forwards monitor.skip tokens as --no-{stem}; unknown
+# tokens are warned + dropped there.
+COLLECTOR_FLAGS = [
+    ("hugepage", "hugepage", "base"),
+    ("numa-cpu", "numa_cpu", "base"),
+    ("host-stats", "host_stats", "base"),
+    ("swap", "swap", "base"),
+    ("host-mem-detail", "host_mem_detail", "base"),
+    ("pressure", "pressure", "base"),
+    ("numa-memory", "numa_memory", "base"),
+    ("vm-total", "vm_total", "base"),
+    ("disk", "disk", "base"),
+    ("ublk", "ublk", "base"),
+    ("pss", "pss", "base"),
+    ("rss", "rss", "base"),
+    ("ublk-daemon", "ublk_daemon", "base"),
+    ("hostproc", "hostproc", "base"),
+    ("devkit-mem", "devkit_mem", "devkit"),
+    ("devkit-topdown", "devkit_top_down", "devkit"),
+]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the vm-monitor CLI parser (extracted for unit testing)."""
+    parser = argparse.ArgumentParser(
+        description="VM Monitoring Tool (supports QEMU, Firecracker, CubeSandbox)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+[Mode 1: Stress Sync Monitoring]
+  sudo python3 vm_monitor.py --stress-file /tmp/bench_running.lock --vmm qemu
+    -> Wait for lock file to appear then start monitoring
+
+[Mode 2: Timer Monitoring]
+  sudo python3 vm_monitor.py -t 60 -i 2 --vmm qemu
+    -> Monitor for 60 seconds
+
+[Mode 3: With Log Collection]
+  sudo python3 vm_monitor.py -t 60 -i 2 --enable-capture --vmm qemu
+    -> Monitor for 60 seconds with parallel log collection
+
+[VMM Types]
+  --vmm qemu          Monitor QEMU VMs (qemu-kvm, qemu-system)
+  --vmm firecracker    Monitor Firecracker microVMs
+  --vmm cubesandbox   Monitor CubeSandbox microVMs (containerd-shim-cube-rs)
+
+[Selective Collectors]
+  --no-swap / --no-hugepage / --no-pressure / --no-host-mem-detail /
+  --no-numa-memory / --no-numa-cpu / --no-host-stats / --no-vm-total /
+  --no-disk / --no-ublk : skip a /proc collector (its sheet/SVG is omitted).
+  --no-pss : skip per-VM PSS (no smaps_rollup walk). The fc_pss_gb fleet
+             column + Per-VM PSS block are omitted from host_resources.xlsx.
+             RSS, when enabled, falls back to the cheap /proc/<pid>/status
+             VmRSS read (fc_rss_gb kept).
+  --no-rss : skip per-VM RSS. The fc_rss_gb fleet column is omitted; PSS (and
+             its fc_pss_gb column) unaffected.
+  --no-ublk-daemon : skip uvm-ublk-daemon CPU tracking (Disk_IO col).
+  --no-hostproc : skip user-specified host-process CPU/PSS tracking.
+  --no-devkit-mem / --no-devkit-topdown : run only one devkit sub-tool.
+  --host-proc comm[:cmdline_substr] : monitor a host process by name
+                (repeatable). e.g. --host-proc server:release/server tracks
+                the agentENV server daemon. Cores+PSS -> HostProc sheet +
+                hostproc_cpu_raw.csv.
+  All default ON; disabling degrades gracefully (empty history -> sheet skipped).
+        """,
+    )
+
+    # VMM type selection
+    parser.add_argument(
+        "--vmm",
+        type=str,
+        choices=["qemu", "firecracker", "cubesandbox"],
+        default="qemu",
+        help="VMM type to monitor (default: qemu)",
+    )
+
+    # Stress sync modes
+    sync = parser.add_mutually_exclusive_group()
+    sync.add_argument("--stress-process", type=str, help="Stress process name")
+    sync.add_argument("--stress-file", type=str, help="Stress marker file (e.g., /tmp/bench_running.lock)")
+
+    # Timing parameters
+    parser.add_argument("-t", "--time", type=int, default=60, help="Timer duration seconds (default 60)")
+    parser.add_argument("-i", "--interval", type=int, default=2, help="Sampling interval (default 2 seconds)")
+
+    # Output parameters
+    parser.add_argument("-o", "--output", type=str, help="Output prefix")
+    parser.add_argument(
+        "--numa",
+        type=str,
+        default="all",
+        help="NUMA nodes to monitor: 'all' (default) = every node, or comma-separated 0,1",
+    )
+    parser.add_argument(
+        "--remote-numa",
+        type=int,
+        default=5,
+        help="Designated 'remote borrowing' NUMA node (the node this platform uses to "
+        "borrow memory from a remote socket; NUMA5 on the reference 4-socket box). "
+        "Added to the focus set for free-memory monitoring. Use a negative value to "
+        "disable injecting any remote node (default 5).",
+    )
+    parser.add_argument(
+        "--disks",
+        type=str,
+        default="all",
+        help="Block devices to monitor for I/O, comma-separated (e.g. sda,nvme0n1). "
+        "Use 'all' (default) to auto-discover every physical block device on the host; "
+        "virtual/software layers (loop, ram, sr, zram, md, dm) are excluded.",
+    )
+    parser.add_argument("--log-dir", type=str, help="Log output directory (default: logs_${timestamp}/ in current dir)")
+
+    # SVG time-curve export
+    parser.add_argument(
+        "--no-svg",
+        action="store_true",
+        help="Skip writing dark-themed SVG time-curve reports (disk_io / host_resources / swap / numa / vm_total .svg)",
+    )
+
+    # Skip the xlsx chart phase (chart builders + full openpyxl re-save). For
+    # huge runs the chart phase dominates export time; sheets are still written,
+    # just without charts. bench-core forwards this via monitor.skip_charts.
+    parser.add_argument(
+        "--no-charts",
+        action="store_true",
+        help="Skip the xlsx chart phase (saves export time on huge runs; sheets are still written)",
+    )
+
+    # Log capture options
+    parser.add_argument(
+        "--enable-capture", action="store_true", help="Enable parallel log collection with devkit/ksys/ub_watch/smap_bw"
+    )
+    parser.add_argument(
+        "--auto-skip", action="store_true", help="Auto-skip missing log capture tools (for automated testing)"
+    )
+    parser.add_argument(
+        "--ksys-parse-timeout",
+        type=int,
+        default=600,
+        help="Timeout for ksys data parsing phase in seconds (default: 600s, increase for large VM counts)",
+    )
+
+    # Log-rotation capture (devkit -> ksys -> perf -> uprof, one slot at a time).
+    # bench-core forwards monitor.log_rotation as these flags.
+    parser.add_argument(
+        "--log-rotation",
+        action="store_true",
+        help="Log-rotation mode: devkit (top-down + memory in parallel) -> ksys -> perf stat -> uprof rotate "
+        "one slot per --rotation-interval for the whole stress window instead of running all capture "
+        "tools concurrently. Per-turn timestamped logs under --rotation-log-dir. Requires "
+        "--enable-capture; keys off the --stress-file lock lifecycle when given.",
+    )
+    parser.add_argument(
+        "--rotation-interval",
+        type=int,
+        default=15,
+        help="Per-slot collection duration in seconds for --log-rotation (default: 15). "
+        "Fallback for any tool not overridden by --rotation-intervals.",
+    )
+    parser.add_argument(
+        "--rotation-intervals",
+        type=str,
+        default=None,
+        help="Per-tool rotation intervals as 'devkit=20,ksys=30,perf=15,uprof=15' (seconds). "
+        "Tools omitted fall back to --rotation-interval. Overrides --rotation-interval "
+        "for the tools it lists.",
+    )
+    parser.add_argument(
+        "--rotation-tools",
+        type=str,
+        default=None,
+        help="Comma-separated tools to rotate in --log-rotation, e.g. 'devkit,perf' "
+        "(default: all of devkit,ksys,perf,uprof; canonical slot order is kept). "
+        "Unknown names are warned + dropped; an empty result rotates every tool.",
+    )
+    parser.add_argument(
+        "--rotation-perf-events",
+        type=str,
+        default=DEFAULT_ROTATION_PERF_EVENTS,
+        help="Comma-separated perf stat events for --log-rotation (default: built-in set)",
+    )
+    parser.add_argument(
+        "--rotation-log-dir",
+        type=str,
+        default=None,
+        help="Output dir for rotation logs (default: <log-dir>/log_capture)",
+    )
+
+    # Selective /proc collectors + devkit split (default all ON). The dest is
+    # derived from the hyphenated STEM so --no-host-mem-detail lands on
+    # args.no_host_mem_detail (NOT a broken internal-name-derived dest).
+    for stem, _internal, _target in COLLECTOR_FLAGS:
+        parser.add_argument(
+            f"--no-{stem}",
+            action="store_true",
+            dest=f"no_{stem.replace('-', '_')}",
+            default=False,
+            help=f"Skip the {stem} collector (default: enabled)",
+        )
+
+    # User-specified host processes to monitor by name (agentENV "server", etc).
+    # Repeatable; each SPEC is ``comm`` or ``comm:cmdline_substr``. The cmdline
+    # filter is needed for generic comms (``server`` alone is too loose). Each
+    # spec tracks one pid; raw utime+stime+pss land in hostproc_cpu_raw.csv.
+    parser.add_argument(
+        "--host-proc",
+        action="append",
+        dest="host_procs",
+        default=[],
+        metavar="comm[:cmdline_substr]",
+        help="Monitor a host process by comm (+ optional cmdline substring). "
+        "Repeatable. e.g. --host-proc server:release/server. "
+        "Use --no-hostproc to disable the whole collector.",
+    )
+
+    return parser
+
+
+def collect_disabled(args) -> tuple[set[str], set[str]]:
+    """Translate parsed --no-X args into (disabled base collectors, disabled devkit).
+
+    Routes each set flag to its internal name + target via COLLECTOR_FLAGS.
+    """
+    disabled_collectors: set[str] = set()
+    disabled_devkit: set[str] = set()
+    for stem, internal, target in COLLECTOR_FLAGS:
+        if getattr(args, f"no_{stem.replace('-', '_')}", False):
+            if target == "base":
+                disabled_collectors.add(internal)
+            else:
+                disabled_devkit.add(internal)
+    return disabled_collectors, disabled_devkit
+
+
+# Try to import pandas for Excel availability check
+try:
+    import pandas as pd
+
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+
+def resolve_numa_nodes(numa_arg: str, available_nodes: list[int]) -> list[int]:
+    """Resolve a --numa argument to a concrete list of NUMA node IDs.
+
+    "all" -> every node the host exposes (``available_nodes``); falls back to
+    [0] when the host is non-NUMA (no /sys/devices/system/node nodeN dirs) so a
+    default "all" never yields an empty focus set. A comma-separated int list
+    ("0,1") is parsed verbatim; an unparseable value falls back to [0].
+    """
+    if numa_arg.strip().lower() == "all":
+        return list(available_nodes) if available_nodes else [0]
+    try:
+        return list(map(int, numa_arg.split(",")))
+    except ValueError:
+        return [0]
+
+
+def _dir_has_raw_csvs(path: str) -> bool:
+    """True if ``path`` holds any ``*_raw.csv`` file (the always-on dumper's output)."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(n.endswith("_raw.csv") for n in names)
+
+
+def _resolve_raw_dir(log_dir: str, raw_subdir: str) -> str:
+    """Find the directory holding the raw CSVs.
+
+    The user may pass EITHER the vm_monitor log_dir (CSVs live in
+    ``<log_dir>/<raw_subdir>/``) OR the raw_data dir itself. Pointing at the
+    raw_data dir used to double the subdir (``raw_data/raw_data/``) and find
+    nothing. Try the subdir first; if it has no CSVs, fall back to ``log_dir``
+    itself when it does. If neither has CSVs, return the subdir candidate so
+    the build emits its standard ``raw_dir=...`` missing-CSV message.
+    """
+    candidate = os.path.join(log_dir, raw_subdir)
+    if _dir_has_raw_csvs(candidate):
+        return candidate
+    if _dir_has_raw_csvs(log_dir):
+        return log_dir  # user pointed at the raw_data dir directly
+    return candidate
+
+
+def _run_raw_report(argv):
+    """`vm-monitor raw-report <log_dir> [--out PATH] [--raw-subdir raw_data]`.
+
+    Regenerate host_resources.xlsx from persisted raw_data CSVs (post-hoc, no
+    monitor needed). Accepts either the vm_monitor log_dir (CSVs in
+    ``<log_dir>/raw_data/``) or the raw_data dir itself. Degrade to
+    [ERROR] + rc=1, never an uncaught traceback."""
+    p = argparse.ArgumentParser(
+        prog="vm-monitor raw-report",
+        description="Regenerate host_resources.xlsx from persisted raw_data CSVs.",
+    )
+    p.add_argument("log_dir", help="vm_monitor log dir OR the raw_data dir itself")
+    p.add_argument("--out", help="Output xlsx (default: <log_dir>/host_resources.xlsx)")
+    p.add_argument(
+        "--raw-subdir",
+        default="raw_data",
+        help="raw CSV subdir (default raw_data; ignored when log_dir IS the raw_data dir)",
+    )
+    a = p.parse_args(argv)
+    log_dir = os.path.abspath(a.log_dir)
+    raw_dir = _resolve_raw_dir(log_dir, a.raw_subdir)
+    out = os.path.abspath(a.out) if a.out else os.path.join(log_dir, "host_resources.xlsx")
+    try:
+        build_host_resources_xlsx(raw_dir, out)
+        print(f"[OK] host_resources.xlsx -> {out}")
+        return 0
+    except (OSError, ValueError, KeyError) as e:
+        print(f"[ERROR] raw-report failed for raw_dir={raw_dir}: {e}")
+        return 1
+
+
+def main(argv=None):
+    """Main entry point for VM monitoring tool.
+
+    Subcommand ``raw-report <log_dir>`` regenerates host_resources.xlsx from
+    persisted raw_data CSVs (post-hoc, no monitor needed). All other argv
+    shapes take the existing flat flag parser.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["raw-report"]:
+        return _run_raw_report(argv[1:])
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # Check root permission
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("[WARN] Recommended to run as root, otherwise some processes cannot be read")
+        time.sleep(1)
+
+    # Setup log directory
+    log_dir = args.log_dir or f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"[OK] Log directory: {log_dir}")
+
+    # Load .env config if capture enabled
+    capture = None
+    config = None
+    if args.enable_capture:
+        print("\nLoading log collection configuration...")
+        config = load_env_config()
+        config = validate_and_prompt_missing(config, non_interactive=args.auto_skip)
+
+    # Create appropriate Monitor instance based on --vmm argument
+    if args.vmm == "qemu":
+        m = QEMUMonitor()
+        csv_prefix = "qemu_monitor"
+    elif args.vmm == "firecracker":
+        m = FirecrackerMonitor()
+        csv_prefix = "firecracker_monitor"
+    elif args.vmm == "cubesandbox":
+        m = CubeSandboxMonitor()
+        csv_prefix = "cubesandbox_monitor"
+    else:
+        print(f"[ERROR] Unknown VMM type: {args.vmm}")
+        sys.exit(1)
+
+    m.target_numa_nodes = resolve_numa_nodes(args.numa, m.available_numa_nodes)
+
+    # Override the platform-default remote borrowing node; a negative value
+    # disables injecting any remote node.
+    m.remote_numa_id = args.remote_numa if args.remote_numa >= 0 else None
+
+    if args.disks.strip().lower() == "all":
+        m.target_disks = _discover_block_devices()
+    else:
+        m.target_disks = [d.strip() for d in args.disks.split(",") if d.strip()]
+
+    # Log dir drives the always-on raw dumper (host_*_raw.csv / vm_cpu_raw.csv /
+    # disk_io_raw.csv / numa_cpu_map.csv) inside base.collect_sample; set before
+    # monitoring starts so the lazy-start on the first sample finds it.
+    m.log_dir = log_dir
+
+    # Selective /proc collectors + devkit split (--no-X flags; default all ON).
+    disabled_collectors, disabled_devkit = collect_disabled(args)
+    if disabled_collectors:
+        m.disable_collectors(disabled_collectors)
+        logger.debug("enabled_collectors after --no-X: %s", m.enabled_collectors)
+        print(f"[INFO] Disabled collectors: {', '.join(sorted(disabled_collectors))}")
+    if disabled_devkit:
+        print(f"[INFO] Disabled devkit: {', '.join(sorted(disabled_devkit))}")
+
+    # User-specified host processes to monitor by name (agentENV server, etc).
+    # Parsed into (label, comm, cmdline_substr) specs by the monitor. --no-hostproc
+    # (in disabled_collectors) globally skips collection regardless of specs.
+    if args.host_procs:
+        m.set_host_proc_specs(args.host_procs)
+
+    # Start log capture (parallel with monitor)
+    if args.enable_capture:
+        print("\nStarting log collection tools...")
+        # --rotation-intervals 'devkit=20,ksys=30,perf=15' -> per-tool dict;
+        # falls back to --rotation-interval for omitted tools / when unset.
+        rotation_interval = args.rotation_interval
+        if args.rotation_intervals:
+            rotation_interval = _parse_rotation_intervals(args.rotation_intervals, args.rotation_interval)
+        # --rotation-tools 'devkit,perf' -> rotate only the named tools;
+        # unset / only-invalid names -> None (rotate every tool).
+        rotation_tools = _parse_rotation_tools(args.rotation_tools) if args.rotation_tools else None
+        capture = LogCapture(
+            config,
+            args.time,
+            log_dir,
+            m.target_numa_nodes,
+            ksys_parse_timeout=args.ksys_parse_timeout,
+            disabled_devkit=disabled_devkit,
+            log_rotation=args.log_rotation,
+            rotation_interval=rotation_interval,
+            rotation_perf_events=args.rotation_perf_events,
+            rotation_log_dir=args.rotation_log_dir,
+            stress_file=args.stress_file,
+            rotation_tools=rotation_tools,
+        )
+        capture.start()
+        print(f"[OK] Log collection tools started in background (duration={args.time}s)")
+        print(f"  ksys parse timeout: {args.ksys_parse_timeout}s")
+        sys.stdout.flush()
+
+    # Start VM monitoring
+    if args.stress_process:
+        m.wait_for_stress_and_monitor("process", args.stress_process, args.interval, args.time)
+    elif args.stress_file:
+        m.wait_for_stress_and_monitor("file", args.stress_file, args.interval, args.time)
+    else:
+        m.start_monitoring(args.time, args.interval)
+
+    # Wait for capture to finish
+    if capture:
+        print("\nWaiting for log collection tools to finish...")
+        capture.wait()
+        print("[OK] Log collection complete")
+
+    # Export results to log_dir
+    raw = os.path.join(log_dir, f"{args.output}.csv" if args.output else f"{csv_prefix}.csv")
+    sumf = os.path.join(log_dir, f"summary_{args.output}.csv" if args.output else "summary.csv")
+    m.analyze_and_export(raw, sumf)
+
+    # Print capture summary
+    capture_results = None
+    if capture:
+        capture_results = capture.get_results()
+        print_capture_summary(capture_results, log_dir, m.target_numa_nodes)
+
+    # host_resources.xlsx from raw CSVs -- built FIRST in the export phase so
+    # it lands on disk before the slow SVG/xlsx steps. It reads only the
+    # line-flushed raw_data CSVs (independent of the in-memory chart stack;
+    # runs even with --no-charts), so it's the one artifact worth guaranteeing
+    # on a mid-export Ctrl+C / hard kill. Separate filename so
+    # resource_report.xlsx remains bench-core's reap signal. Degrade to
+    # WARNING, never block the main xlsx.
+    raw_dir = os.path.join(log_dir, "raw_data")
+    try:
+        build_host_resources_xlsx(raw_dir, os.path.join(log_dir, "host_resources.xlsx"))
+    except (OSError, ValueError, KeyError) as e:
+        logger.warning("host_resources raw-report failed for raw_dir=%s: %s", raw_dir, e)
+
+    # Export dark-themed SVG time-curve reports. The xlsx report must be the
+    # LAST artifact written: orchestrators (bench-core MonitorController) poll
+    # for resource_report.xlsx as the "all artifacts written" signal and reap
+    # the subprocess the moment it appears. If SVG ran after xlsx, that reap
+    # would drop every SVG file.
+    if not args.no_svg:
+        # SVGs land in a dedicated svg/ subdir of the log dir instead of being
+        # scattered alongside the CSVs/xlsx, so the results tree stays clean.
+        svg_files = export_svg_reports(m, os.path.join(log_dir, "svg"))
+        if svg_files:
+            print(f"[OK] SVG time-curve reports (svg/): {', '.join(os.path.basename(p) for p in svg_files)}")
+
+    # Export to Excel (if pandas available) -- LAST so its appearance signals
+    # that CSV + SVG + xlsx are all written and the subprocess is essentially
+    # done (safe to reap).
+    if PANDAS_AVAILABLE:
+        excel_file = os.path.join(log_dir, "resource_report.xlsx")
+        export_to_excel(m, log_dir, m.target_numa_nodes, excel_file, capture_results, skip_charts=args.no_charts)
+
+    print(f"\nComplete! All outputs saved to: {log_dir}/")
