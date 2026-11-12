@@ -915,3 +915,394 @@ class LogCapture:
 
         return {"success": success, "failed": failed}
 
+    def stop(self):
+        """Stop all running processes and threads"""
+        # Rotation mode: signal the loop first so it stops between slots (an
+        # in-flight tool finishes its own bounded -d interval slot), then reap
+        # any ksys parse still running in the background (emergency path: a
+        # kill here loses that turn's parse output, same as the parallel mode).
+        self.rotation_stop_flag.set()
+        if self.rotation_thread is not None and self.rotation_thread.is_alive():
+            self.rotation_thread.join(timeout=self.rotation_interval + 90)
+        for proc in self._rotation_devkit_procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        for proc in self._rotation_perf_procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        for proc in self._rotation_uprof_procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        for proc, log_path in self._rotation_ksys_procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            # Rename ksys-generated *_report.json to match the .log
+            # filename (same timestamp, .json extension) so all files in
+            # the ksys/ dir share one naming scheme.
+            ksys_dir = os.path.dirname(log_path)
+            base = os.path.basename(log_path).removesuffix(".log")
+            try:
+                for f in os.listdir(ksys_dir):
+                    if f.endswith("_report.json"):
+                        src = os.path.join(ksys_dir, f)
+                        dst = os.path.join(ksys_dir, base + "_report.json")
+                        if src != dst:
+                            os.rename(src, dst)
+            except OSError:
+                pass
+
+        # Stop getfre threads first
+        for numa_id, stop_flag in self.getfre_stop_flags.items():
+            stop_flag.set()  # Signal threads to stop
+
+        # Wait for getfre threads to finish
+        for numa_id, thread in self.getfre_threads.items():
+            thread.join(timeout=5)
+
+        # Close getfre log files
+        for numa_id, f in self.getfre_log_files.items():
+            try:
+                f.close()
+            except Exception:
+                pass
+
+        # Stop other processes
+        for tool_name, proc in self.processes.items():
+            if proc.poll() is None:  # Still running
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        # Close log file handles
+        for tool_name, f in self.log_files.items():
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def _check_ksys_parse_progress(self) -> str:
+        """Check ksys.log for parse progress
+
+        Returns:
+            'completed' - parse finished, data output started
+            'parsing' - currently parsing data
+            'collecting' - still collecting data
+            'unknown' - cannot determine status
+        """
+        ksys_log_path = os.path.join(self.log_dir, "ksys.log")
+        if not os.path.exists(ksys_log_path):
+            return "unknown"
+
+        try:
+            with open(ksys_log_path, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            # Check parse completion markers
+            if "Starting to process and print data" in content:
+                return "completed"
+            if "CPU Metrics" in content or "Common Microarchitecture Metrics" in content:
+                return "completed"
+            if "Data saved successfully" in content:
+                return "completed"
+
+            # Check if parsing started
+            if "Starting to parse data" in content:
+                return "parsing"
+
+            # Still in collection phase
+            if "Starting to collect data" in content:
+                return "collecting"
+
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def _wait_for_ksys(self, proc) -> dict:
+        """Wait for ksys with extended timeout for parse phase
+
+        ksys has two phases:
+        1. Collect phase: duration seconds (data collection)
+        2. Parse phase: can take minutes for large data
+
+        Returns:
+            {'status': 'completed'|'timeout', 'returncode': int, 'elapsed': int}
+        """
+        tool_name = "ksys"
+        start_time = time.time()
+
+        # Phase 1: Wait for collection to complete (duration + buffer)
+        collect_timeout = self.duration + 30
+        print(f"  [{tool_name}] Waiting for collection phase ({self.duration}s)...")
+
+        try:
+            proc.wait(timeout=collect_timeout)
+            elapsed = int(time.time() - start_time)
+            if proc.returncode == 0:
+                print(f"  [OK] {tool_name} completed in {elapsed}s")
+                return {"status": "completed", "returncode": 0, "elapsed": elapsed}
+            else:
+                print(f"  [WARN] {tool_name} exited with code {proc.returncode} after {elapsed}s")
+                return {"status": "completed", "returncode": proc.returncode, "elapsed": elapsed}
+        except subprocess.TimeoutExpired:
+            pass  # Continue to parse phase wait
+
+        # Phase 2: Wait for parse phase with extended timeout
+        parse_timeout = self.ksys_parse_timeout
+        total_timeout = collect_timeout + parse_timeout
+        print(f"  [{tool_name}] Collection done, waiting for parse phase (timeout={parse_timeout}s)...")
+
+        last_status = "collecting"
+        warning_thresholds = [0.5, 0.75, 0.9]
+        warnings_given = [False, False, False]
+
+        while time.time() - start_time < total_timeout:
+            # Check if process completed
+            try:
+                proc.wait(timeout=5)
+                elapsed = int(time.time() - start_time)
+                if proc.returncode == 0:
+                    print(f"  [OK] {tool_name} parse completed, total {elapsed}s")
+                    return {"status": "completed", "returncode": 0, "elapsed": elapsed}
+                else:
+                    print(f"  [WARN] {tool_name} exited with code {proc.returncode} after {elapsed}s")
+                    return {"status": "completed", "returncode": proc.returncode, "elapsed": elapsed}
+            except subprocess.TimeoutExpired:
+                pass
+
+            # Check parse progress
+            current_status = self._check_ksys_parse_progress()
+            elapsed = int(time.time() - start_time)
+            elapsed_parse = elapsed - collect_timeout
+
+            if current_status != last_status:
+                last_status = current_status
+                if current_status == "parsing":
+                    print(f"  [{tool_name}] Parse phase started ({elapsed}s total)")
+                elif current_status == "completed":
+                    print(f"  [{tool_name}] Parse completed ({elapsed}s total)")
+
+            # Progress logging every 30s
+            if elapsed_parse > 0 and elapsed_parse % 30 == 0:
+                progress_ratio = elapsed_parse / parse_timeout
+                print(
+                    f"  [{tool_name}] Parse in progress... {elapsed_parse}s/{parse_timeout}s ({progress_ratio * 100:.0f}%)"
+                )
+
+            # Warnings at thresholds
+            elapsed_ratio = elapsed_parse / parse_timeout
+            for i, threshold in enumerate(warning_thresholds):
+                if elapsed_ratio >= threshold and not warnings_given[i]:
+                    warnings_given[i] = True
+                    remaining = int(parse_timeout - elapsed_parse)
+                    print(
+                        f"  [WARN] [{tool_name}] Approaching parse timeout ({threshold * 100:.0f}% used), {remaining}s remaining"
+                    )
+
+            time.sleep(5)
+
+        # Timeout - force terminate
+        elapsed = int(time.time() - start_time)
+        print(f"  [WARN] [{tool_name}] Parse timeout after {elapsed}s total, terminating...")
+        proc.terminate()
+        time.sleep(3)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+        print(f"  [WARN] {tool_name} timeout suggestions:")
+        print(f"      - Increase ksys_parse_timeout (current: {parse_timeout}s)")
+        print("      - Check ksys.log size and parse progress")
+        print("      - Reduce monitor sampling interval for less data")
+
+        return {"status": "timeout", "returncode": None, "elapsed": elapsed}
+
+    def wait(self):
+        """Wait for all processes to complete, track failures
+
+        Uses different timeouts for different tools:
+        - devkit/ub_watch: duration + 60s (quick completion expected)
+        - ksys: duration + ksys_parse_timeout (parse can take minutes)
+        """
+        # Rotation mode: the thread exits on stop flag / stress end once its
+        # in-flight slot finishes; give it that slot's budget before moving on.
+        if self.log_rotation and self.rotation_thread is not None:
+            self.rotation_thread.join(timeout=self.rotation_interval + 120)
+        for tool_name, proc in self.processes.items():
+            try:
+                # Get appropriate timeout for this tool
+                if tool_name == "ksys":
+                    # ksys has special handling with parse phase monitoring
+                    result = self._wait_for_ksys(proc)
+                    if result["status"] == "timeout":
+                        self.failed_runtime.append(
+                            {
+                                "tool": tool_name,
+                                "error": "parse_timeout",
+                                "elapsed": result["elapsed"],
+                            }
+                        )
+                    elif result["returncode"] != 0:
+                        self.failed_runtime.append(
+                            {
+                                "tool": tool_name,
+                                "returncode": result["returncode"],
+                            }
+                        )
+                else:
+                    # Other tools: simple timeout
+                    timeout = self.duration + self.DEFAULT_TOOL_TIMEOUTS.get(tool_name, 60)
+                    proc.wait(timeout=timeout)
+                    if proc.returncode != 0:
+                        self.failed_runtime.append(
+                            {
+                                "tool": tool_name,
+                                "returncode": proc.returncode,
+                            }
+                        )
+            except subprocess.TimeoutExpired:
+                # Process didn't finish within timeout, force terminate
+                timeout_used = self.duration + self.DEFAULT_TOOL_TIMEOUTS.get(tool_name, 60)
+                print(f"[WARN] {tool_name} timed out after {timeout_used}s, terminating...")
+                proc.terminate()
+                time.sleep(3)
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                self.failed_runtime.append(
+                    {
+                        "tool": tool_name,
+                        "error": "timeout",
+                    }
+                )
+            except Exception as e:
+                self.failed_runtime.append(
+                    {
+                        "tool": tool_name,
+                        "error": str(e),
+                    }
+                )
+
+        # Rotation-mode ksys processes: collect already finished, only the
+        # parse phase may still be running. Bounded by ksys_parse_timeout,
+        # then terminated (a straggler's parse output is lost past that).
+        for proc, _log_path in self._rotation_ksys_procs:
+            if proc.poll() is not None:
+                continue
+            deadline = time.time() + self.ksys_parse_timeout
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(5)
+            if proc.poll() is None:
+                print(f"  [WARN] rotation ksys parse exceeded {self.ksys_parse_timeout}s, terminating...")
+                proc.terminate()
+                time.sleep(3)
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                self.failed_runtime.append({"tool": "ksys", "error": "parse_timeout"})
+            elif proc.returncode != 0:
+                self.failed_runtime.append({"tool": "ksys", "returncode": proc.returncode})
+
+        # Close log file handles
+        for tool_name, f in self.log_files.items():
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def get_results(self) -> dict:
+        """Return collection results and status
+
+        Returns:
+            {
+                'success': [tool_names],
+                'failed_startup': [tool_names],
+                'failed_runtime': [{tool, returncode/error}],
+                'log_files': {tool_name: file_path},
+                'duration': actual_duration_seconds
+            }
+        """
+        # Calculate actual duration
+        actual_duration = 0
+        if self.start_time:
+            actual_duration = int((datetime.now() - self.start_time).total_seconds())
+
+        # Determine successful tools
+        all_tools = list(self.processes.keys())
+        success = [
+            t for t in all_tools if t not in self.failed_startup and t not in [f["tool"] for f in self.failed_runtime]
+        ]
+
+        # Add getfre if threads started successfully
+        if self.getfre_threads and "getfre" not in self.failed_startup:
+            success.append("getfre")
+
+        # Rotation mode: the rotated tools never enter self.processes; report
+        # the thread as the carrier of devkit/ksys/perf/uprof instead.
+        if self.log_rotation and self.rotation_thread is not None:
+            success.append("log_rotation")
+
+        # Build getfre log files dict
+        getfre_logs = {}
+        for numa_id in self.getfre_log_files.keys():
+            getfre_logs[f"getfre_NUMA{numa_id}"] = os.path.join(self.log_dir, f"getfre_NUMA{numa_id}.log")
+
+        log_files = {
+            "devkit_mem": os.path.join(self.log_dir, "devkit_mem.log"),
+            "devkit_top_down": os.path.join(self.log_dir, "devkit_top_down.log"),
+            "ksys": os.path.join(self.log_dir, "ksys.log"),
+            "ub_watch": os.path.join(self.log_dir, "ub_watch.log"),
+            "smap_bw": os.path.join(self.log_dir, "smap_bw.log"),
+            **getfre_logs,  # Add getfre log files
+        }
+        if self.log_rotation:
+            # devkit/ksys write per-turn timestamped logs instead of the single
+            # files the exporters look for; expose them as rotation_files and
+            # drop the nonexistent single-file keys.
+            for tool in ("devkit_mem", "devkit_top_down", "ksys"):
+                log_files.pop(tool, None)
+
+        results = {
+            "success": success,
+            "failed_startup": self.failed_startup,
+            "failed_runtime": self.failed_runtime,
+            "log_files": log_files,
+            "duration": actual_duration,
+        }
+        if self.log_rotation:
+            results["rotation_files"] = {tool: list(paths) for tool, paths in self.rotation_turns.items()}
+        return results
