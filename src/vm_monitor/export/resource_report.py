@@ -760,3 +760,312 @@ def _add_vm_stats_bar(wb):
     ws.add_chart(bar, f"{get_column_letter(anchor_col)}2")
 
 
+def export_to_excel(
+    monitor: "VMMonitorBase",
+    log_dir: str,
+    numa_nodes: list = None,
+    output_file: str = None,
+    capture_results: dict = None,
+    skip_charts: bool = False,
+) -> str:
+    """Export all monitoring and parsed log data to Excel.
+
+    Orchestrates one _build_* helper per logical sheet, then adds charts.
+    Each helper owns its sheet(s) and writes to the shared writer.
+
+    Args:
+        monitor: QEMUMonitor instance with collected data
+        log_dir: directory containing log files
+        numa_nodes: list of NUMA nodes monitored
+        output_file: Excel output filename (default: resource_report.xlsx in log_dir)
+        capture_results: LogCapture results (optional)
+        skip_charts: skip the xlsx chart phase (load_workbook + ~14 chart
+            builders + full re-save) -- for huge runs it dominates export time;
+            sheets are still written, just without charts. (Forwards --no-charts
+            from the CLI.)
+
+    Returns:
+        Path to generated Excel file
+    """
+    if not PANDAS_AVAILABLE:
+        print("[WARN] pandas not available, skipping Excel export")
+        print("  Install with: pip install pandas openpyxl")
+        return None
+
+    if output_file is None:
+        output_file = os.path.join(log_dir, "resource_report.xlsx")
+
+    # Parse log files
+    parsed_logs = parse_all_logs(log_dir, numa_nodes)
+
+    # Write to a build path first, then atomically promote it onto output_file.
+    # bench-core's MonitorController.stop() waits for THIS PROCESS TO EXIT (the
+    # true completion signal: it polls process exit, not the xlsx path), so the
+    # final path is never observed mid-write. The build path + atomic os.replace
+    # is the second line of defense: even a SIGKILL/OOM mid-build (a genuine hang
+    # past the reaper's grace) cannot leave a corrupt partial at the final path,
+    # because os.replace makes the final path appear exactly once, complete.
+    # Clean up a stale build from a prior crashed run first -- otherwise a
+    # leftover .build.xlsx from a SIGKILL'd export would shadow the fresh build.
+    build_file = output_file + ".build.xlsx"
+    if os.path.exists(build_file):
+        try:
+            os.unlink(build_file)
+        except OSError:
+            pass
+
+    # Create writer for multi-sheet Excel (openpyxl required)
+    try:
+        with pd.ExcelWriter(build_file, engine="openpyxl") as writer:
+            vm_stats = monitor.calculate_vm_stats()
+            overall_stats = monitor.calculate_overall_stats(vm_stats)
+
+            # Unify the CPU-bearing sheets onto the raw /proc delta source that
+            # host_resources.xlsx uses, so resource_report's VM_Stats / Summary
+            # never disagree with it or spotbox_monitor on host or per-VM CPU.
+            # Missing CSVs -> empty df -> each builder falls back to its psutil
+            # history (synthetic fixtures / raw capture off).
+            raw_dir = Path(log_dir) / "raw_data"
+            raw_host_df = pd.DataFrame()
+            vm_cores_df = pd.DataFrame()
+            try:
+                from vm_monitor.export.raw.frames import _load_frames
+                from vm_monitor.export.raw.report import _derive_host, _derive_per_vm
+
+                # One read of raw_data for both summary derivations: reading it
+                # per helper doubles the parse (8.4 s each at a 2 h capture).
+                frames = _load_frames(raw_dir)
+                raw_host_df = _derive_host(frames=frames)
+                # max_series effectively uncapped: VM_Stats lists every VM, not
+                # the top-K the Per-VM chart sheet caps at.
+                vm_cores_df, _, _ = _derive_per_vm(frames=frames, max_series=10**6)
+            except (OSError, ValueError, KeyError, pd.errors.ParserError) as e:
+                print(f"[WARN] raw CPU derivation skipped (falling back to psutil): {e}")
+
+            # Summary sheets only: every per-sample timeline lives in
+            # host_resources.xlsx (built from raw_data/*.csv, post-hoc rerunnable).
+            _build_summary_sheet(writer, monitor, numa_nodes, overall_stats, raw_host_df=raw_host_df)
+            _build_numa_overview_sheet(writer, monitor)
+            _build_vm_stats_sheet(writer, vm_stats, vm_cores_df=vm_cores_df)
+            _build_devkit_topdown_sheets(writer, parsed_logs)
+            _build_devkit_memory_sheets(writer, parsed_logs)
+            _build_ksys_sheet(writer, parsed_logs)
+            _build_ubwatch_sheets(writer, parsed_logs)
+            _build_smapbw_sheets(writer, parsed_logs)
+            _build_getfre_sheets(writer, parsed_logs)
+    except ImportError:
+        print("[WARN] openpyxl not available, skipping Excel export")
+        print("  Install with: pip install openpyxl")
+        if os.path.exists(build_file):
+            try:
+                os.unlink(build_file)
+            except OSError:
+                pass
+        return None
+    except Exception as e:
+        print(f"[WARN] Excel export failed: {e}")
+        if os.path.exists(build_file):
+            try:
+                os.unlink(build_file)
+            except OSError:
+                pass
+        return None
+
+    # Add charts to the build copy. Non-critical: _add_charts warns on its own
+    # failures, and we guard again here so a chart-phase crash still promotes
+    # the valid (chart-less) pandas workbook rather than propagating.
+    # skip_charts (--no-charts): for huge runs the chart phase (load_workbook +
+    # ~14 chart builders + full re-save) dominates export time; skipping still
+    # promotes a complete (chart-less) workbook fast. Charts are a rendering
+    # convenience -- every underlying sheet is already written above.
+    if skip_charts:
+        print("[INFO] Charts skipped (--no-charts); resource_report.xlsx written without charts")
+    else:
+        try:
+            _add_charts(build_file)
+        except Exception as e:
+            print(f"[WARN] Chart generation failed (non-critical): {e}")
+
+    # Atomic promotion: final path appears once, complete (with charts unless skipped).
+    os.replace(build_file, output_file)
+    print(f"[OK] Excel report exported: {output_file}")
+    return output_file
+
+
+def print_capture_summary(results: dict, log_dir: str, numa_nodes: list = None):
+    """Print log collection summary at the end of monitoring
+
+    Args:
+        results: capture results from LogCapture.get_results()
+        log_dir: log directory path
+        numa_nodes: list of NUMA nodes for filtering devkit_mem bandwidth
+    """
+    print("\n" + "=" * 70)
+    print("Log Collection Summary")
+    print("=" * 70)
+
+    print(f"Duration: {results['duration']}s")
+    print(f"Output directory: {log_dir}/")
+
+    # Success tools
+    if results["success"]:
+        print(f"\n[OK] Success ({len(results['success'])} tools):")
+        for tool in results["success"]:
+            if tool == "log_rotation":
+                continue  # the rotation carrier has no single log file; printed below
+            log_file = results["log_files"].get(tool, "")
+            size = 0
+            if os.path.exists(log_file):
+                size = os.path.getsize(log_file)
+            print(f"   {tool}: {log_file} ({size} bytes)")
+
+    # Rotation mode: per-turn timestamped logs (one per slot), not single files.
+    rotation = results.get("rotation_files")
+    if rotation:
+        print("\n[OK] Log rotation turns:")
+        for tool, paths in rotation.items():
+            if paths:
+                print(f"   {tool}: {len(paths)} logs under {os.path.dirname(paths[0])}/")
+
+    # Startup failures
+    if results["failed_startup"]:
+        print(f"\n[ERROR] Failed to start ({len(results['failed_startup'])} tools):")
+        for tool in results["failed_startup"]:
+            print(f"   {tool}: path not configured or invalid")
+
+    # Runtime failures
+    if results["failed_runtime"]:
+        print(f"\n[ERROR] Failed during runtime ({len(results['failed_runtime'])} tools):")
+        for fail in results["failed_runtime"]:
+            tool = fail["tool"]
+            returncode = fail.get("returncode", "unknown")
+            print(f"   {tool}: returncode={returncode}")
+
+    # List all log files
+    print(f"\nLog files in {log_dir}:")
+    for tool, path in results["log_files"].items():
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            print(f"   {os.path.basename(path)} ({size} bytes)")
+        else:
+            print(f"   {os.path.basename(path)} (not created)")
+
+    # Parse and display log contents
+    print("\n" + "=" * 70)
+    print("Parsed Metrics Summary")
+    print("=" * 70)
+
+    parsed = parse_all_logs(log_dir, numa_nodes)
+
+    # devkit_top_down results
+    if "devkit_top_down" in parsed and "error" not in parsed["devkit_top_down"]:
+        td = parsed["devkit_top_down"]
+        print(f"\n[DevKit Top-Down] ({td.get('report_count', 0)} reports)")
+        print(f"  Cycles Avg:       {td.get('cycles_avg', 0):,.0f}")
+        print(f"  Instructions Avg: {td.get('instructions_avg', 0):,.0f}")
+        print(f"  IPC Avg:          {td.get('ipc_avg', 0):.2f}")
+        print("  Top-down Metrics:")
+        print(f"    Bad Speculation:  {td.get('bad_speculation_avg', 0):.2f}%")
+        print(f"    Frontend Bound:   {td.get('frontend_bound_avg', 0):.2f}%")
+        print(f"    Retiring:         {td.get('retiring_avg', 0):.2f}%")
+        print(f"    Backend Bound:    {td.get('backend_bound_avg', 0):.2f}%")
+        print("  Memory Bound Details:")
+        print(f"    L3 Bound:         {td.get('l3_bound_avg', 0):.2f}%")
+        print(f"    Mem Bound:        {td.get('mem_bound_avg', 0):.2f}%")
+        print(f"      Latency bound:    {td.get('mem_latency_bound_avg', 0):.2f}%")
+        print(f"      Bandwidth bound:  {td.get('mem_bandwidth_bound_avg', 0):.2f}%")
+
+    # devkit_mem results
+    if "devkit_mem" in parsed and "error" not in parsed["devkit_mem"]:
+        mem = parsed["devkit_mem"]
+        print(f"\n[DevKit Memory] ({mem.get('report_count', 0)} reports)")
+        cm = mem.get("cache_miss", {})
+        print("  Cache Miss %:")
+        print(f"    L1D: {cm.get('L1D', 0):.2f}%")
+        print(f"    L1I: {cm.get('L1I', 0):.2f}%")
+        print(f"    L2D: {cm.get('L2D', 0):.2f}%")
+        print(f"    L2I: {cm.get('L2I', 0):.2f}%")
+        ddr = mem.get("ddr_bandwidth_system", {})
+        print("  DDR Bandwidth (system):")
+        print(f"    Write: {ddr.get('write', 0):.2f} MB/s")
+        print(f"    Read:  {ddr.get('read', 0):.2f} MB/s")
+        numa_bw = mem.get("numa_bandwidth", {})
+        if numa_bw:
+            print("  NUMA Bandwidth (filtered):")
+            for node_id in sorted(numa_bw.keys()):
+                bw = numa_bw[node_id]
+                print(f"    NUMA {node_id}: Read {bw.get('read', 0):.2f} MB/s | Write {bw.get('write', 0):.2f} MB/s")
+
+    # ksys results
+    if "ksys" in parsed and "error" not in parsed["ksys"]:
+        ksys = parsed["ksys"]
+        print("\n[KSys]")
+        l2 = ksys.get("l2_miss_latency", {})
+        l3 = ksys.get("l3_miss_latency", {})
+        if l2:
+            print(
+                f"  L2 Miss Latency: max={l2.get('cycles_max', 0)} min={l2.get('cycles_min', 0)} avg={l2.get('cycles_avg', 0)} cycles"
+            )
+        if l3:
+            print(
+                f"  L3 Miss Latency: max={l3.get('cycles_max', 0)} min={l3.get('cycles_min', 0)} avg={l3.get('cycles_avg', 0)} cycles"
+            )
+        if ksys.get("ipc"):
+            print(f"  IPC: {ksys.get('ipc', 0):.2f}")
+        td = ksys.get("topdown", {})
+        if td:
+            print("  Topdown:")
+            if td.get("retiring"):
+                print(f"    Retiring:        {td['retiring']:.2f}%")
+            if td.get("frontend_bound"):
+                print(f"    Frontend Bound:  {td['frontend_bound']:.2f}%")
+            if td.get("bad_speculation"):
+                print(f"    Bad Speculation: {td['bad_speculation']:.2f}%")
+            if td.get("backend_bound"):
+                print(f"    Backend Bound:   {td['backend_bound']:.2f}%")
+
+    # ub_watch results
+    if "ub_watch" in parsed and "error" not in parsed["ub_watch"]:
+        ub = parsed["ub_watch"]
+        print("\n[UB Watch]")
+        lat = ub.get("latency", {})
+        if lat:
+            print(f"  Latency ({lat.get('path', 'N/A')}):")
+            print(f"    Avg: R={lat.get('avg_r', 0)}ns W={lat.get('avg_w', 0)}ns")
+            print(f"    Min: R={lat.get('min_r', 0)}ns W={lat.get('min_w', 0)}ns")
+            print(f"    Max: R={lat.get('max_r', 0)}ns W={lat.get('max_w', 0)}ns")
+        bw_list = ub.get("bandwidth", [])
+        if bw_list:
+            print("  Bandwidth (non-zero only):")
+            for bw in bw_list:
+                if bw.get("avg_sum", 0) > 0:
+                    print(
+                        f"    Chip {bw.get('chip', 0)} Ports {bw.get('ports', 'N/A')}: "
+                        f"Wr={bw.get('avg_wr', 0):.2f} Rd={bw.get('avg_rd', 0):.2f} Sum={bw.get('avg_sum', 0):.2f} MB/s"
+                    )
+
+    # getfre results
+    if "getfre" in parsed:
+        getfre_data = parsed["getfre"]
+        print("\n[getfre Core Frequency]")
+        for numa_id in sorted(getfre_data.keys()):
+            gf = getfre_data[numa_id]
+            if "error" not in gf:
+                print(
+                    f"  NUMA {numa_id}: Avg={gf.get('numa_avg', 0):.0f} MHz "
+                    f"(Min={gf.get('numa_min', 0):.0f}, Max={gf.get('numa_max', 0):.0f}), "
+                    f"{gf.get('sample_count', 0)} samples"
+                )
+                # Show top 5 cores by frequency variance if available
+                core_stats = gf.get("core_stats", {})
+                if core_stats:
+                    sorted_cores = sorted(core_stats.items(), key=lambda x: x[1]["max"] - x[1]["min"], reverse=True)[:5]
+                    if sorted_cores:
+                        print("    Top 5 variable cores:")
+                        for core_id, stats in sorted_cores:
+                            print(
+                                f"      Core {core_id}: Avg={stats['avg']:.0f} "
+                                f"(Min={stats['min']:.0f}, Max={stats['max']:.0f}) MHz"
+                            )
+
+    print("=" * 70)
