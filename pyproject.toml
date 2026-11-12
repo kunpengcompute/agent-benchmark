@@ -39,10 +39,11 @@ cubesandbox = ["cubesandbox>=0.7.0"]
 bench-core = "bench_core.bench_cli:main"
 oversub-bench = "bench_core.oversub_run:main"
 oversub-compare = "bench_core.compare_sweeps:main"
+vm-monitor = "vm_monitor.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["bench_core*", "env_provider*"]
+include = ["bench_core*", "env_provider*", "vm_monitor*"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -120,7 +121,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["bench_core", "env_provider"]
+known-first-party = ["bench_core", "env_provider", "vm_monitor"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ARG", "S101"]
