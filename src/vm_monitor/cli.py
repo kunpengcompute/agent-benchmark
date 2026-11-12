@@ -500,6 +500,21 @@ def main(argv=None):
             stress_file=args.stress_file,
             rotation_tools=rotation_tools,
         )
+        # Stress-sync mode: defer the all-parallel tools until the stress
+        # marker appears so their -d windows cover the stress phase. Rotation
+        # mode gates internally (_wait_for_stress_lock); the parallel mode
+        # historically started at spawn, spending the tools' duration on
+        # sandbox create/warmup when setup ran long. wait_for_stress_and_monitor
+        # below polls the same marker, so capture start and sampling stay in
+        # lockstep.
+        if args.stress_file or args.stress_process:
+            print("Waiting for the stress marker before starting log collection tools...")
+            while not (
+                (args.stress_file and os.path.exists(args.stress_file))
+                or (args.stress_process and m.check_stress_process(args.stress_process))
+            ):
+                time.sleep(1)
+            print("[OK] Stress marker detected -- starting log collection tools")
         capture.start()
         print(f"[OK] Log collection tools started in background (duration={args.time}s)")
         print(f"  ksys parse timeout: {args.ksys_parse_timeout}s")
