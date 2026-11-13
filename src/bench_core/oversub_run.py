@@ -128,7 +128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--running-concurrency",
         type=int,
         default=None,
-        help="N running slots (default = base replay.running_concurrency)",
+        help="N (ratio basis); lifecycle scales running_concurrency to k*N per trial",
     )
     p.add_argument("--ratios", default=None, help="comma-separated k values (default 1,2,3)")
     p.add_argument("--modes", default=None, help="comma-separated replay modes (default exec_ephemeral,lifecycle)")
@@ -153,7 +153,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "'auto' = one shard per ratio (each ~N slots, its own GIL) or an explicit P >= 1 "
         "(P=1 = one shard, keeps the same shard-00/ + merged/ + driver-owned vm_monitor "
         "layout as any P, so ratio-1 trials share one structure with higher ratios). "
-        "lifecycle always runs single-process (global admission). Default auto.",
+        "lifecycle always runs single-process (full-scale, not sharded). Default auto.",
     )
     p.add_argument("--cooldown-sec", type=int, default=None, help="settle time between trials (default 30)")
     p.add_argument(
@@ -359,8 +359,9 @@ def _run_trial(
     m = (args.multiplier or None) if mode == "exec_ephemeral" else None
     # Shardable modes (exec_ephemeral/exec_only) get a plan at every P, including
     # P == 1, so a ratio-1 trial keeps the sharded layout (shard-00/ + merged/ +
-    # driver-owned vm_monitor) byte-identical to P >= 2 trials; lifecycle (global
-    # admission) alone stays None = legacy single-process path. See oversub_shards.
+    # driver-owned vm_monitor) byte-identical to P >= 2 trials; lifecycle (its
+    # full-scale pause/resume fleet is one shared window) stays None = single
+    # process. See oversub_shards.
     plan = plan_shards(trial_dir=trial_dir, mode=mode, ratio=ratio, n=n, setting=args.shards)
 
     summary_glob = f"{prefix}_*/{prefix}_run_summary.json"
@@ -780,7 +781,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(
         "shards=%s: admission-free modes (exec_ephemeral/exec_only) run one kernel "
         "process per shard ('auto' = P=ratio, ~N slots each); lifecycle "
-        "always single-process (global admission)",
+        "always single-process (full-scale, not sharded)",
         args.shards,
     )
     try:
