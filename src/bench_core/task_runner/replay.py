@@ -39,11 +39,13 @@ from .replay_types import (
     ACTION_SERIES_LIMIT,
     READY_PROBE_MAX_ATTEMPTS,
     READY_PROBE_TIMEOUT,
+    STEP_OUTPUT_LIMIT,
     TIMEOUT_EXIT_CODE,
     SandboxInfrastructureError,
     StepResult,
     _affinity_pool,
     _compact_action,
+    _compact_output,
 )
 
 logger = logging.getLogger(__name__)
@@ -298,6 +300,13 @@ class ReplayBaseRunner(TaskRunner):
                         "running_slot_held_sec": sr.running_slot_held_sec,
                         "interaction_total_sec": sr.interaction_total_sec,
                         "action": _compact_action(step.action),
+                        # The command's actual run result (truncated + slimmed
+                        # by _compact_output). Absent on the failure path (a
+                        # slice exception has no CommandResult -- see the
+                        # _failed_series_record where they are None). Old series
+                        # files predate this field and read as None downstream.
+                        "stdout": _compact_output(result.stdout),
+                        "stderr": _compact_output(result.stderr),
                         "retries_in_slice": retries_in_slice,
                     }
                 )
@@ -895,6 +904,9 @@ class ReplayBaseRunner(TaskRunner):
             "exit_code": 1,
             "timed_out": timed_out,
             "slice_failed": True,
+            # No CommandResult on the failure path: output honestly None.
+            "stdout": None,
+            "stderr": None,
             "slot_contention_wait_sec": 0.0,
             "resume_rate_pacing_wait_sec": 0.0,
             "resume_api_sec": 0.0,
