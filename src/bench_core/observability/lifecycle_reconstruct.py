@@ -336,6 +336,7 @@ def replay_states_from_events(events: Iterable[dict]) -> dict[int, BenchSandbox]
                 capacity_wait_sec=e.get("capacity_wait_sec") or 0.0,
                 resume_inflight_wait_sec=e.get("resume_inflight_wait_sec") or 0.0,
                 pause_inflight_wait_sec=e.get("pause_inflight_wait_sec") or 0.0,
+                command_rate_pacing_wait_sec=e.get("command_rate_pacing_wait_sec") or 0.0,
             )
             # Key presence, not truthiness: a zero retry count is a real
             # sample (it belongs in the p95 population) and only the

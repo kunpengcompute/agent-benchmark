@@ -41,10 +41,11 @@ from bench_core.utils import calc_percentiles
 
 # The per-step duration fields summed per run. slice_total_sec is the invariant
 # total (resume+exec+pause); interaction_total_sec adds delay + capacity_wait +
-# resume rate-pacing (>= slice, since resume rate-pacing is pre-lease and
-# excluded from slice_total). The wait sums isolate the four independent
-# non-productive components: slot_contention (the natural_delay + capacity_wait
-# composite, kept for parse-compat) plus its split (natural_delay /
+# resume rate-pacing + command rate-pacing (>= slice: both pacings are real wall
+# waits -- resume pacing is pre-lease, command pacing is in-slice but kept out
+# of the phase segments so each stays pure). The wait sums isolate the four
+# independent non-productive components: slot_contention (the natural_delay +
+# capacity_wait composite, kept for parse-compat) plus its split (natural_delay /
 # capacity_wait), rate_pacing (the 1/qps shaping, split across
 # resume_rate_pacing_wait + pause_rate_pacing_wait), and inflight (the fuse
 # block, across resume_inflight + pause_inflight). Exported so obs_xlsx imports
@@ -64,6 +65,7 @@ SEG_KEYS = (
     "pause_rate_pacing_wait_sec",
     "resume_inflight_wait_sec",
     "pause_inflight_wait_sec",
+    "command_rate_pacing_wait_sec",
     "running_slot_held_sec",
 )
 
@@ -80,6 +82,7 @@ _RUN_METRIC_FIELDS = (
     "n_steps",
     "n_failed",
     "n_timeout",
+    "resume_attempts",
 )
 
 
@@ -167,6 +170,11 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
                 "n_steps": 0,
                 "n_failed": 0,
                 "n_timeout": 0,
+                # Exact resume-call attempt total: n_steps first-try resumes +
+                # every transient re-attempt (each retry_queued(operation="resume")
+                # event is one extra resume call). A COUNT, so it lives beside
+                # n_failed/n_timeout -- never in the seconds-typed SEG_KEYS sums.
+                "resume_attempts": 0,
                 "sums": {k: 0.0 for k in SEG_KEYS},
                 "create_sec": 0.0,
                 "kill_sec": 0.0,
@@ -187,6 +195,9 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
             round_id = ev.get("round_id")
             acc = _slot(tid, sandbox, round_id)
             acc["n_steps"] += 1
+            # Every step performs exactly one first-try resume; transient
+            # re-attempts are added by the retry_queued branch below.
+            acc["resume_attempts"] += 1
             if ev.get("slice_failed"):
                 acc["n_failed"] += 1
             if ev.get("timed_out"):
@@ -249,6 +260,14 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
             v = ev.get("kill_sec")
             if v is not None:
                 acc["kill_sec"] += float(v)
+        elif evtype == "retry_queued" and ev.get("operation") == "resume":
+            # One transient resume re-attempt beyond the first try. The event
+            # carries the run identity (trajectory_id/round_id) from the
+            # emitting slice; older series files that predate those fields fall
+            # back to (tid "", sandbox, round_id) so the count is never lost,
+            # just attributed to the sandbox-level default run.
+            acc = _slot(ev.get("trajectory_id") or "", ev.get("sandbox_index"), ev.get("round_id"))
+            acc["resume_attempts"] += 1
 
     out = []
     for key in sorted(runs, key=lambda k: (str(k[0]), _sort_key(k[1]), _sort_key(k[2]))):
@@ -332,3 +351,4 @@ def aggregate_trajectories(per_run: list[dict]) -> list[dict]:
             }
         )
     return out
+

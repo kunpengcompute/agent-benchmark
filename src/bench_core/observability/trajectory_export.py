@@ -81,7 +81,24 @@ _BREAKDOWN_SHORT = {
     "pause_rate_pacing_wait_sec": "pause_rate_pacing_wait",
     "resume_inflight_wait_sec": "resume_inflight_wait",
     "pause_inflight_wait_sec": "pause_inflight_wait",
+    "command_rate_pacing_wait_sec": "command_rate_pacing_wait",
     "running_slot_held_sec": "running_slot_held",
+}
+
+# Legacy-compat aliases for the old agent-benchmark CSV parser. Each alias
+# resolves EXACTLY to a kernel-measured fact (never an improvised value under
+# a borrowed name): post_command_pause == pause_sec (the pause after each
+# command); command_wait == exec_sec (the pure command body wall, now that
+# the command-bucket QPS pacing is measured as its own segment);
+# command_start == command_rate_pacing_wait (the "command" QPS-bucket 1/qps
+# dispatch wait -- the quantity the old column name promises, 0 with the gate
+# off). resume_attempts is NOT an alias: it is an exact count computed in
+# trajectory_summaries (n_steps first tries + retry_queued(operation="resume")
+# re-attempts) and exported as a COUNT column, not a duration.
+_BREAKDOWN_ALIASES = {
+    "post_command_pause": "pause",  # the pause that follows each command
+    "command_wait": "exec",  # the pure command body wait == exec_sec
+    "command_start": "command_rate_pacing_wait",  # command QPS dispatch wait
 }
 
 
@@ -202,8 +219,17 @@ def _sanitize_tid(tid: str) -> str:
 
 
 def _flat_breakdown(sums: dict, requested_delay: float, create: float, kill: float, stress: float) -> dict:
-    """Flat short-key breakdown dict from a single run's sums (for index runs[])."""
+    """Flat short-key breakdown dict from a single run's sums (for index runs[]).
+
+    The legacy-compat duration aliases (``post_command_pause`` /
+    ``command_wait`` / ``command_start``) are appended AFTER the real segments
+    so the flat dict carries the old CSV's column shape without a second
+    measurement path. ``resume_attempts`` is a COUNT exported beside
+    ``n_steps`` (not a duration; see :func:`trajectory_summaries`).
+    """
     bd = {_short: round(float(sums[seg]), 6) for seg, _short in _BREAKDOWN_SHORT.items()}
+    for alias, src in _BREAKDOWN_ALIASES.items():
+        bd[alias] = bd[src]
     bd["requested_delay"] = round(float(requested_delay), 6)
     bd["create"] = round(float(create), 6)
     bd["kill"] = round(float(kill), 6)
@@ -218,6 +244,8 @@ def _flat_breakdown_p50(set_dict: dict) -> dict:
     """Flat short-key breakdown of p50 values from an aggregate set (for index top level)."""
     tbs = set_dict["time_breakdown_sec"]
     bd = {_short: tbs[seg]["p50"] for seg, _short in _BREAKDOWN_SHORT.items()}
+    for alias, src in _BREAKDOWN_ALIASES.items():
+        bd[alias] = bd[src]
     bd["requested_delay"] = set_dict["requested_delay_sec"]["p50"]
     bd["create"] = set_dict["create_sec"]["p50"]
     bd["kill"] = set_dict["kill_sec"]["p50"]
@@ -383,6 +411,7 @@ def _enrich_step(index: int, ev: dict, paused_sec: float) -> dict:
         "pause_rate_pacing_wait_sec": _f("pause_rate_pacing_wait_sec"),
         "pause_api_sec": _f("pause_api_sec"),
         "pause_inflight_wait_sec": _f("pause_inflight_wait_sec"),
+        "command_rate_pacing_wait_sec": _f("command_rate_pacing_wait_sec"),
         "running_slot_held_sec": _f("running_slot_held_sec"),
     }
 
@@ -408,6 +437,9 @@ def _index_row(agg: dict, run_summaries: list[dict], sanitized: str, action_seri
             "n_steps": r["n_steps"],
             "n_failed": r["n_failed"],
             "n_timeout": r["n_timeout"],
+            # Exact resume-call attempt count (n_steps + resume re-attempts);
+            # a COUNT beside the other counts, never in time_breakdown_sec.
+            "resume_attempts": r["resume_attempts"],
             "success_rate": r["success_rate"],
             "success": r["success_rate"] is not None and r["success_rate"] >= 1.0,
             "create_error_type": r["create_error_type"],
@@ -431,6 +463,9 @@ def _index_row(agg: dict, run_summaries: list[dict], sanitized: str, action_seri
         "elapsed_sec": agg["elapsed_sec"],
         "all_failed": agg["all_failed"],
         "n_steps_max": agg["n_steps_max"],
+        # Per-run resume attempt count p50 (browsability; the exact per-run
+        # counts live in runs[].resume_attempts).
+        "resume_attempts": use_set["resume_attempts"]["p50"],
         "time_breakdown_sec": _flat_breakdown_p50(use_set),
         "runs": runs_slim,
         "create_error_type": create_err_type,
@@ -438,3 +473,4 @@ def _index_row(agg: dict, run_summaries: list[dict], sanitized: str, action_seri
         "action_series": action_series,
         "file": f"{sanitized}/replay_result.json",
     }
+

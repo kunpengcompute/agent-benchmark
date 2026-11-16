@@ -224,7 +224,7 @@ class TestRunSliceSeriesRecord:
         provider = FakeLifecycleProvider(count=1)
 
         class _BoomRunner(ReplayBaseRunner):
-            def _resume(self):
+            def _resume(self, *, trajectory_id: str = ""):
                 raise RuntimeError("resume blew up")
 
         stop = threading.Event()
@@ -245,7 +245,7 @@ class TestRunSliceSeriesRecord:
         provider = FakeLifecycleProvider(count=1)
 
         class _BoomRunner(ReplayRoundRunner):
-            def _resume(self):
+            def _resume(self, *, trajectory_id: str = ""):
                 raise RuntimeError("resume blew up")
 
         stop = threading.Event()
@@ -745,8 +745,17 @@ class TestRunSliceP26Decomposition:
         # EXCLUSION: running_slot_held spans [acquire, release]; acquire runs
         # AFTER the pre-lease resume time_wait, so resume rate-pacing sits OUTSIDE
         # the lease bracket. The gap between (resume_pacing + resume_sec + exec +
-        # pause_sec) and running_slot_held IS the excluded pre-lease wait.
-        bracket = sr.resume_rate_pacing_wait_sec + sr.resume_sec + sr.exec_elapsed_sec + sr.pause_sec
+        # command_pacing + pause_sec) and running_slot_held IS the excluded
+        # pre-lease wait. (exec excludes the in-slice command QPS pacing -- kept
+        # pure, comparable across qps on/off -- so the bracket re-adds it: it is
+        # real lease wall the slot was held through.)
+        bracket = (
+            sr.resume_rate_pacing_wait_sec
+            + sr.resume_sec
+            + sr.exec_elapsed_sec
+            + sr.command_rate_pacing_wait_sec
+            + sr.pause_sec
+        )
         excluded = bracket - sr.running_slot_held_sec
         assert excluded > 0.001, (
             f"resume rate-pacing must be EXCLUDED from running_slot_held; "
@@ -760,9 +769,13 @@ class TestRunSliceP26Decomposition:
 
         # INCLUSION: pause rate-pacing is in pause_sec (in-lease) -> in slot_held.
         assert sr.pause_sec >= sr.pause_rate_pacing_wait_sec
-        # running_slot_held == resume_sec + exec + pause_sec exactly (resume_sec
-        # excludes resume rate-pacing; pause_sec includes pause rate-pacing).
-        assert abs(sr.running_slot_held_sec - (sr.resume_sec + sr.exec_elapsed_sec + sr.pause_sec)) < 0.02
+        # running_slot_held == resume_sec + exec + command_pacing + pause_sec
+        # exactly (resume_sec excludes resume rate-pacing; pause_sec includes
+        # pause rate-pacing; command pacing is in-lease wall outside exec).
+        assert (
+            abs(sr.running_slot_held_sec - (sr.resume_sec + sr.exec_elapsed_sec + sr.command_rate_pacing_wait_sec + sr.pause_sec))
+            < 0.02
+        )
 
     def test_ready_probe_runs_in_lifecycle(self, tmp_path):
         """In lifecycle mode, ``true`` is exec'd as a ready probe after resume."""
@@ -918,7 +931,7 @@ class TestRunSliceP26Decomposition:
         admission = Admission(slots=slots, qps=None)
 
         class _BoomRunner(ReplayBaseRunner):
-            def _resume(self):
+            def _resume(self, *, trajectory_id: str = ""):
                 raise RuntimeError("resume blew up")
 
         stop = threading.Event()

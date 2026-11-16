@@ -440,6 +440,64 @@ def test_lifecycle_call_splits_queue_wait_from_api_sec():
     assert a2 >= 0.01
 
 
+def test_execute_measures_command_rate_pacing_wait_explicitly():
+    """_execute returns (result, command_rate_pacing_wait_sec, body_elapsed_sec):
+    the "command" QPS-bucket 1/qps dispatch wait is measured as its OWN quantity
+    (forced future deadline -> deterministic ~0.05s) and the timer wraps ONLY
+    the provider.exec body, so body_elapsed (exec_sec) EXCLUDES the pacing --
+    comparable across qps on/off -- and the legacy command_start alias resolves
+    to the quantity its name promises. Without an admission controller the wait
+    is exactly 0.0 and body == the full call wall."""
+    from bench_core.admission import QpsRateLimiter
+    from bench_core.config import KernelConfig
+
+    cfg = KernelConfig(
+        workflow_type="replay",
+        workflow_config=ReplayConfig(replay_mode="lifecycle", replay_ready_probe=False),
+    )
+    provider = FakeLifecycleProvider(count=1)
+    provider.create_all()
+    state = BenchSandbox.from_instance(provider._instances[0], "replay")
+    stop = threading.Event()
+    qps = QpsRateLimiter(qps=100.0, inflight_cap=4)
+    adm = Admission(slots=RunningSlotScheduler(maximum=1), qps=qps)
+    runner = ReplayBaseRunner(RunContext(state=state, config=cfg, stop_event=stop, provider=provider, admission=adm))
+
+    # Ungated: the wait is exactly 0 and the body is the full call wall.
+    step = ReplayStep(index=0, action_type="shell", action="true", delay_time_sec=0.0)
+    t0 = time.perf_counter()
+    result, wait, body = runner._execute(step)
+    wall = time.perf_counter() - t0
+    assert result.exit_code == 0
+    assert wait == 0.0  # no future deadline pending at qps=100 on a quiet limiter
+    assert body <= wall + 0.05  # no pacing: body ~= full wall
+
+    # Gated with a forced future deadline ~0.05s out: the wait is observable
+    # and deterministic, the command bucket dispatched, and the pacing is
+    # EXCLUDED from the body (body ~= wall - pacing; the old wrap-around
+    # timing would have reported body ~= wall, pacing included).
+    qps._next_dispatch_at = time.monotonic() + 0.05
+    t0 = time.perf_counter()
+    result, wait, body = runner._execute(step)
+    wall = time.perf_counter() - t0
+    assert result.exit_code == 0
+    assert wait >= 0.04
+    assert qps.snapshot()["dispatched_by_operation"].get("command", 0) >= 1
+    # exec_sec is the PURE body: body + wait covers the whole wall, and body
+    # itself is NOT inflated by the pacing (wall - wait is all body + slack).
+    assert body + wait >= wall - 0.02
+    assert body <= wall - wait + 0.02
+
+    # No admission controller: wait always exactly 0.0.
+    runner_noqps = ReplayBaseRunner(
+        RunContext(state=state, config=cfg, stop_event=stop, provider=provider, admission=None)
+    )
+    result, wait, body = runner_noqps._execute(step)
+    assert result.exit_code == 0
+    assert wait == 0.0
+    assert body >= 0.0
+
+
 def test_lifecycle_call_shutdown_during_retry_bypasses_except():
     """ShutdownInterrupted (BaseException) raised mid-retry must bypass the
     ``except Exception`` retry handler and propagate to the caller. This is the

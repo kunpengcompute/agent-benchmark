@@ -142,3 +142,9 @@ class StepResult:
     capacity_wait_sec: float = 0.0
     resume_inflight_wait_sec: float = 0.0
     pause_inflight_wait_sec: float = 0.0
+    # Command-bucket QPS rate-pacing (the 1/qps time-wait paid before the
+    # exec body; 0 when no QPS gate). Previously rode inside exec_sec;
+    # measured separately so exec_sec is a pure quantity and
+    # command_rate_pacing_wait + exec == the old exec_sec wall.
+    command_rate_pacing_wait_sec: float = 0.0
+

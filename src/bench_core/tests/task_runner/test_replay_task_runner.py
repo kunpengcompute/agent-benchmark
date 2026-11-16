@@ -222,12 +222,12 @@ def test_run_slice_p2_override_flows_timing_through_hooks():
         RESUME_DUR = 0.02
         PAUSE_DUR = 0.02
 
-        def _resume(self) -> tuple[float, float, float]:
+        def _resume(self, *, trajectory_id: str = "") -> tuple[float, float, float]:
             t = time.perf_counter()
             time.sleep(self.RESUME_DUR)
             return 0.0, 0.0, time.perf_counter() - t
 
-        def _pause(self) -> tuple[float, float, float]:
+        def _pause(self, *, trajectory_id: str = "") -> tuple[float, float, float]:
             t = time.perf_counter()
             time.sleep(self.PAUSE_DUR)
             return 0.0, 0.0, time.perf_counter() - t
