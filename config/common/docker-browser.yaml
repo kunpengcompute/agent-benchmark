@@ -1,4 +1,4 @@
-# config/common/docker.yaml
+# config/common/docker-browser.yaml
 # Docker-only browser benchmark config — a smaller stress profile (10 containers,
 # single Weibo url, no warmup/round-robin) for quick docker-only runs.
 #
@@ -15,9 +15,9 @@
 # via KernelConfig.from_raw; the docker block loads into env_provider.docker.Config.
 #
 # Validate without Docker:
-#   bench-core --provider fake --config config/common/docker.yaml --create-only -n 1
+#   bench-core --provider fake --config config/common/docker-browser.yaml --create-only -n 1
 # Create-only dry run (needs Docker daemon):
-#   bench-core --provider docker --config config/common/docker.yaml --create-only
+#   bench-core --provider docker --config config/common/docker-browser.yaml --create-only
 
 workflow_type: browser
 
