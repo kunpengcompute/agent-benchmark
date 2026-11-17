@@ -403,7 +403,7 @@ func (w *worker) start(ctx context.Context, p object) (any, error) {
 						}
 						ev["exitCode"] = alias
 					}
-					code, err := protoInt(ev, "exitCode", false, math.MinInt32, math.MaxInt32)
+					code, err := protoInt(ev, "exitCode", true, math.MinInt32, math.MaxInt32)
 					if err != nil {
 						return err
 					}
@@ -464,6 +464,14 @@ func (w *worker) handle(ctx context.Context, method string, p object) (any, erro
 	}
 	resp, e := w.rpcRequest(ctx, c.sandbox, "SendSignal", object{"process": object{"pid": c.pid}, "signal": 9}, false)
 	if e != nil {
+		// SendSignal failed (e.g. 404: the process already exited). The
+		// stream may have ended on its own; regardless, the handle must not
+		// leak -- cancel the stream and drop the entry so a later wait/kill
+		// cannot wedge on the stale goroutine.
+		c.cancel()
+		w.mu.Lock()
+		delete(w.commands, id)
+		w.mu.Unlock()
 		return nil, e
 	}
 	_, e = io.Copy(io.Discard, resp.Body)

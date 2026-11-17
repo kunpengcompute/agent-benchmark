@@ -24,6 +24,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -316,12 +317,12 @@ class GoCommands:
         if user != "root":
             raise ValueError("Go client commands require user=root")
         # cwd: the worker's bash -l -c has no first-class cwd param; emulate
-        # with a cd prefix (the replay config's default workdir is "/").
-        command = f"cd {cwd} && {cmd}" if cwd and cwd != "/" else cmd
+        # with a quoted cd prefix (the replay config's default workdir is "/").
+        command = f"cd {shlex.quote(cwd)} && {cmd}" if cwd and cwd != "/" else cmd
         # env: replay config defaults to {}; bash -l already inherits the
-        # sandbox env, so explicit vars are injected via export prefix.
+        # sandbox env, so explicit vars are injected via an export prefix.
         if env:
-            exports = " ".join(f"{k}='{v}'" for k, v in env.items())
+            exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
             command = f"export {exports} && {command}"
         data = self.sandbox.api.invoke(
             "command_start",
