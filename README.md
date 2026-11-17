@@ -1,12 +1,10 @@
 # agent-benchmark
 
-Agent 负载压测套件：同一份压力配置通过 `--provider` 在 AENV / E2B / Docker / 本地 `fake`
-后端之间切换，采集创建与执行耗时、主机资源指标；超分扫描驱动按不同超分比自动跑一组 trial
-并输出退化曲线。以下命令均在仓库根目录执行。
+Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / AgentENV / CubeSandbox 三个受支持后端之间切换，采集沙箱的创建与执行耗时、主机资源指标；超分（overcommit）扫描驱动按不同超分比自动跑一组 trial 并输出退化曲线。以下命令均在仓库根目录执行。
 
 | 目录 | 内容 | 从哪看 |
 | --- | --- | --- |
-| `src/` | `bench-core` 内核（5 个后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
+| `src/` | `bench-core` 内核（3 个受支持后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
 | `artifacts/` | 55 条轨迹、镜像清单、轨迹 → 模板映射 | [数据集与模板](#数据集与模板) |
 | `agent_replay/` | 早期回放实现，保留仅供参考，后续会 deprecate | — |
 | `docs/guide/` | 中英文使用指南 | [文档](#文档) |
