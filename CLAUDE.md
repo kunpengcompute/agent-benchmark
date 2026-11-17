@@ -17,6 +17,7 @@ Scenarios / providers (all behind the SDK-free `env_provider` contract):
 - **E2B Sandbox** — Firecracker microVMs via the E2B API (`--provider e2b`)
 - **Docker Containers** — browser automation in containers (`--provider docker`)
 - **AgentENV** — e2b SDK pointed at an AgentENV server; adds pause/resume + snapshots (`--provider aenv`)
+- **AgentENV Go** — same AgentENV server via a resident Go worker client (`--provider aenv-go`; see `go-client/` for the worker, `aenv_go:` config block falls back to `aenv:` keys)
 - **CubeSandbox** — Cloud Hypervisor microVMs, full lifecycle (`--provider cubesandbox`)
 
 The replay workflow (`exec_only` / `lifecycle` / `exec_ephemeral`) replays recorded
@@ -113,7 +114,7 @@ entries are `bench-core = "bench_core.bench_cli:main"`,
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  CLI / entry                                                 │
-│  bench-core (bench_core.bench_cli.main) --provider {fake,e2b,docker,aenv,cubesandbox} │
+│  bench-core (bench_core.bench_cli.main) --provider {fake,e2b,docker,aenv,aenv-go,cubesandbox} │
 │  oversub-bench (bench_core.oversub_run.main)                │
 │  oversub-compare (bench_core.compare_sweeps.main)           │
 └─────────────────────────────────────────────────────────────┘
@@ -132,7 +133,7 @@ entries are `bench-core = "bench_core.bench_cli:main"`,
                 ▼               ▼                   ▼            ▼
          env_provider.e2b  env_provider.docker  env_provider.aenv  env_provider.cubesandbox
          (opt-in, pulls e2b SDK)  (pulls docker SDK)  (reuses e2b SDK)  (pulls cube SDK)
-                                                          env_provider.fake (no SDK)
+         env_provider.aenv_go (resident Go worker, no e2b SDK)   env_provider.fake (no SDK)
 ```
 
 The kernel (`bench_core`) and every provider impl depend on the contract
@@ -160,7 +161,7 @@ contract + kernel untouched.
 - `_ready.py` — `ReadyChecker`: workflow-driven poll-until-ready; backend supplies `_exec_probe`. browser=port scan, coding=`uname -a`, document=`document-bench-validate`. Constants `READY_MAX_WAIT=300`, `READY_INTERVAL=5`.
 - `_base.py` — `BackendSandboxStatus` / `BackendCreationMetrics` + `BaseSandboxManager(ABC)` lifecycle template. Subclass supplies SDK seams (`_create_single`, `_list_existing`, `_external_id`, `_attach`, `_kill_one`, `_exec_probe`) + class attrs. `_ready_config` is a concrete base method returning shared constants — readiness is a workflow concern, so there are no per-backend readiness knobs and no `port_check` block in any YAML.
 
-**Provider impls**: `env_provider/e2b/` (`config.py` `setup_e2b_env` + placeholder-credential fallback to `~/.e2b/config.json`, `manager.py`, `schemas.py`), `env_provider/docker/`, `env_provider/aenv/` (`AenvProvider` subclasses `E2BProvider` and reuses the E2B `SandboxManager` handle table + SDK — AENV has no separate SDK, it is the E2B SDK pointed at an AENV server via `E2B_API_URL`; adds `pause`/`resume`, `snapshot_sizes`, `create_one`/`kill_one`), `env_provider/cubesandbox/`, `env_provider/fake.py`.
+**Provider impls**: `env_provider/e2b/` (`config.py` `setup_e2b_env` + placeholder-credential fallback to `~/.e2b/config.json`, `manager.py`, `schemas.py`), `env_provider/docker/`, `env_provider/aenv/` (`AenvProvider` subclasses `E2BProvider` and reuses the E2B `SandboxManager` handle table + SDK — AENV has no separate SDK, it is the E2B SDK pointed at an AENV server via `E2B_API_URL`; adds `pause`/`resume`, `snapshot_sizes`, `create_one`/`kill_one`), `env_provider/aenv_go/` (`AenvGoProvider` over a resident Go worker subprocess, `go-client/main.go`; a sync `GoBridge` multiplexes the worker's line protocol, no e2b SDK), `env_provider/cubesandbox/`, `env_provider/fake.py`.
 
 **Config layering**: one `config/common/*.yaml` per workflow carries the per-backend blocks it drives; `--provider` selects which block `Config.from_raw` reads. Browser/coding/document configs carry **both** `e2b:` and `docker:` blocks; replay configs carry `e2b:` / `docker:` / `aenv:` / `cubesandbox:` blocks. The kernel reads only the shared sections. Credential placeholders (`your_e2b_access_token_here` / `your_e2b_api_key_here`) are treated as unset → fall back to `~/.e2b/config.json`.
 
