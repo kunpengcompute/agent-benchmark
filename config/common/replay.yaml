@@ -82,15 +82,6 @@ aenv:
     E2B_API_URL: "http://127.0.0.1:8000"      # AENV control plane (POST /sandboxes)
     E2B_SANDBOX_URL: "http://127.0.0.1:8000"  # AENV data plane (envd proxy; overrides subdomain build, forces http)
 
-# Go-client variant of aenv (--provider aenv-go): same target server, but all
-# HTTP requests are executed by the resident Go worker (go-client/) instead of
-# the e2b SDK. Unset keys FALL BACK to the aenv: block above (template, env,
-# create_timeout, sandbox_ids_file), so only the go-specific overrides live here.
-# Build the worker first: `bash go-client/build.sh`. No e2b fallback: a missing
-# or stale Go binary is a hard error (see go-client/README.md).
-aenv_go: {}  # inherit everything from the aenv: block; see comments above for
-              # the go_client_bin override (or env AGENT_BENCHMARK_GO_BIN)
-
 cubesandbox:
   template: "openclaw-coding-python-v1"  # CubeSandbox image with /testbed (cube template ID)
   timeout: 86400            # idle TTL seconds (NOT create-wait; create is a synchronous

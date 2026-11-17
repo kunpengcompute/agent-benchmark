@@ -106,17 +106,9 @@ class SandboxManager(BaseSandboxManager):
     # Keep the original creation status for stats; don't overwrite with KILLED.
     _set_killed_on_cleanup = False
 
-    def __init__(self, kernel_config, e2b_config: Config, stop_event: Event,
-                 *, sandbox_cls: type | None = None) -> None:
+    def __init__(self, kernel_config, e2b_config: Config, stop_event: Event) -> None:
         super().__init__(kernel_config, stop_event)
         self.config = e2b_config
-        # Client-swap seam (instance-scoped, NOT a module global): the class
-        # backing create/list/connect. None -> the module-level e2b ``Sandbox``
-        # (identical behavior for e2b/aenv providers). A provider with its
-        # own client (aenv-go's Go worker shim) passes its class here so two
-        # provider instances in one process cannot cross-route through
-        # whichever shim bound last, and teardown needs no restore.
-        self.sandbox_cls = sandbox_cls
         # Serializes create+pin when pin_cpus is set so pgrep -fn reliably returns
         # THIS sandbox's just-spawned FC (see _pin_and_verify_fc). Inert otherwise.
         self._pin_lock = Lock()
@@ -164,7 +156,7 @@ class SandboxManager(BaseSandboxManager):
                 if numa_node is not None:
                     envs["FC_BIND"] = str(numa_node)
 
-                sbx = (self.sandbox_cls or Sandbox).create(
+                sbx = Sandbox.create(
                     resolved,
                     timeout=self.config.create_timeout,
                     envs=envs if envs else None,
@@ -303,7 +295,7 @@ class SandboxManager(BaseSandboxManager):
 
     def _list_existing(self) -> list:
         """List running sandboxes (flatten the E2B paginator)."""
-        paginator = (self.sandbox_cls or Sandbox).list()
+        paginator = Sandbox.list()
         listed: list = []
         while paginator.has_next:
             listed.extend(paginator.next_items())
@@ -313,7 +305,7 @@ class SandboxManager(BaseSandboxManager):
         return listed.sandbox_id if hasattr(listed, "sandbox_id") else str(listed)
 
     def _attach(self, listed: Any) -> Any:
-        return (self.sandbox_cls or Sandbox).connect(self._external_id(listed))
+        return Sandbox.connect(self._external_id(listed))
 
     def _kill_one(self, state: SandboxState) -> None:
         state.sandbox_obj.kill()

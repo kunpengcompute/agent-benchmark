@@ -92,9 +92,7 @@ oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.
 ## bench-core 套件
 
 - **后端**：`fake`（内存，无 SDK）、`docker`、`e2b`、`aenv`（e2b SDK 打 AENV 服务端，带
-  pause/resume）、`aenv-go`（同 AENV 服务端，改走常驻 Go worker 客户端，见
-  [go-client/README.md](go-client/README.md)；配置在 `aenv_go:` 块逐键回退 `aenv:` 块）、
-  `cubesandbox`。切后端只换 `--provider`，配置文件的共享段不变。
+  pause/resume）、`cubesandbox`。切后端只换 `--provider`，配置文件的共享段不变。
 - **工作流**：browser、coding、document，以及轨迹回放 `replay`
   （`exec_only` / `lifecycle` / `exec_ephemeral`）。
 - **阶段阶梯**：`--create-only` / `--detect` 都会留下运行中的沙箱，收尾用 `--cleanup`。从

@@ -121,8 +121,6 @@ def _build_provider(name: str, config: KernelConfig, raw_config: dict[str, Any])
         from env_provider.docker import build_provider
     elif name == "aenv":
         from env_provider.aenv import build_provider
-    elif name == "aenv-go":
-        from env_provider.aenv_go import build_provider
     elif name == "cubesandbox":
         from env_provider.cubesandbox import build_provider
     else:
