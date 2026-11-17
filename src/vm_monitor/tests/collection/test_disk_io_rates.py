@@ -82,12 +82,24 @@ class TestComputeDiskIoRates(unittest.TestCase):
         self.assertAlmostEqual(r["sdb"]["r_mb_s"], 0.5)  # 1024*512/2**20 = 0.5 MiB
         self.assertEqual(r["sdb"]["w_mb_s"], 0.0)
 
-    def test_negative_delta_clamped_by_raw_sectors(self):
-        # counters should never go backwards, but verify the math follows the raw delta
+    def test_negative_delta_clamped_to_zero(self):
+        # counters never go backwards; a backwards delta is treated as 0 to
+        # avoid polluting peak_*_mb_s with a fake transfer.
         cur = {"sda": self._snap(10, 10, 5, 1)}
-        prev = {"sda": self._snap(100, 100, 0, 0)}
+        prev = {"sda": self._snap(100, 100, 50, 0)}
         r = _compute_disk_io_rates(cur, prev, 1.0)["sda"]
-        self.assertEqual(r["r_mb_s"], round((10 - 100) * 512 / 2**20, 2))
+        self.assertEqual(r["r_mb_s"], 0.0)
+        self.assertEqual(r["w_mb_s"], 0.0)
+        self.assertEqual(r["util_pct"], 0.0)
+
+    def test_new_device_has_no_spike(self):
+        # device present in cur but absent in prev: no baseline, zero rates
+        cur = {"sda": self._snap(5000, 5000, 100, 2)}
+        prev = {"sdb": self._snap(0, 0, 0, 0)}
+        r = _compute_disk_io_rates(cur, prev, 1.0)["sda"]
+        self.assertEqual(r["r_mb_s"], 0.0)
+        self.assertEqual(r["w_mb_s"], 0.0)
+        self.assertEqual(r["inflight"], 2)  # current-state preserved
 
     def _full_snap(self, reads, writes, read_ms, write_ms, weighted_ms, ms_io, inflight):
         return {

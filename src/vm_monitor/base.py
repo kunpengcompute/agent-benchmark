@@ -146,7 +146,11 @@ def _compute_disk_io_rates(cur: dict, prev: dict, interval: float) -> dict:
     per second (delta reads/writes / interval). avg_rq_sz is the iostat-style
     average request size in 512-byte sectors = total sectors / total I/Os over
     the interval. A zero/None interval or missing previous snapshot yields
-    zero rates (first sample has no baseline). Snapshot fields are read via
+    zero rates (first sample has no baseline); a device absent from the
+    previous snapshot also yields zero rates (new device, no baseline, no
+    cumulative-to-increment spike). Deltas are clamped at 0 -- /sys block
+    counters are boot-constant, so a backwards delta only ever signals a
+    re-enumerated device or sampling hiccup. Snapshot fields are read via
     .get so partial snapshots (older callers) do not raise.
     """
     rates = {}
@@ -168,18 +172,41 @@ def _compute_disk_io_rates(cur: dict, prev: dict, interval: float) -> dict:
             }
         return rates
     for dev, c in cur.items():
-        p = prev.get(dev, {})
-        d_read = c.get("sectors_read", 0) - p.get("sectors_read", 0)
-        d_write = c.get("sectors_written", 0) - p.get("sectors_written", 0)
-        d_ms = c.get("ms_io", 0) - p.get("ms_io", 0)
+        p = prev.get(dev)
+        if p is None:
+            # First sample for a newly observed device: no baseline, so no
+            # delta. Zero rates (with current inflight) instead of treating
+            # the cumulative counters as a one-off spike.
+            rates[dev] = {
+                "r_mb_s": 0.0,
+                "w_mb_s": 0.0,
+                "util_pct": 0.0,
+                "inflight": c.get("inflight", 0),
+                "r_mb": 0.0,
+                "w_mb": 0.0,
+                "avg_queue_depth": 0.0,
+                "read_await_ms": 0.0,
+                "write_await_ms": 0.0,
+                "r_iops": 0.0,
+                "w_iops": 0.0,
+                "avg_rq_sz": 0.0,
+            }
+            continue
+        # Deltas are clamped at 0: /sys block counters never reset (read-only
+        # since boot), so a backwards delta means a device re-enumerated or a
+        # sampling hiccup -- reporting a negative transfer as a rate would
+        # pollute peak_*_mb_s. `d_ms` feeds util_pct which clamps separately.
+        d_read = max(0, c.get("sectors_read", 0) - p.get("sectors_read", 0))
+        d_write = max(0, c.get("sectors_written", 0) - p.get("sectors_written", 0))
+        d_ms = max(0, c.get("ms_io", 0) - p.get("ms_io", 0))
         r_mb = d_read * _SECTOR_SIZE_BYTES / _BYTES_PER_MIB
         w_mb = d_write * _SECTOR_SIZE_BYTES / _BYTES_PER_MIB
         util = max(0.0, min(100.0, d_ms / 1000.0 / interval * 100))
-        d_reads = c.get("reads_completed", 0) - p.get("reads_completed", 0)
-        d_writes = c.get("writes_completed", 0) - p.get("writes_completed", 0)
-        d_read_ms = c.get("read_ms", 0) - p.get("read_ms", 0)
-        d_write_ms = c.get("write_ms", 0) - p.get("write_ms", 0)
-        d_weighted_ms = c.get("weighted_ms", 0) - p.get("weighted_ms", 0)
+        d_reads = max(0, c.get("reads_completed", 0) - p.get("reads_completed", 0))
+        d_writes = max(0, c.get("writes_completed", 0) - p.get("writes_completed", 0))
+        d_read_ms = max(0, c.get("read_ms", 0) - p.get("read_ms", 0))
+        d_write_ms = max(0, c.get("write_ms", 0) - p.get("write_ms", 0))
+        d_weighted_ms = max(0, c.get("weighted_ms", 0) - p.get("weighted_ms", 0))
         rates[dev] = {
             "r_mb_s": round(r_mb / interval, 2),
             "w_mb_s": round(w_mb / interval, 2),
