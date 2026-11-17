@@ -75,8 +75,8 @@ bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --t
 换成自己的数据时改这两个键；`template_manifest` 不设则所有轨迹退回 `aenv.template`。
 
 手边没有 AgentENV 时，可以先用本地 docker 做同样的连通性验证：`pip install docker`，
-把 `config/common/docker.yaml` 的 `docker.image` 换成本地已有镜像，再跑
-`bench-core --provider docker --config config/common/docker.yaml --create-only -n 2`。
+把 `config/common/docker-browser.yaml` 的 `docker.image` 换成本地已有镜像，再跑
+`bench-core --provider docker --config config/common/docker-browser.yaml --create-only -n 2`。
 
 ### 3. 超分扫描：按超分比出一组曲线
 

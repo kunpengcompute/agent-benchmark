@@ -65,7 +65,7 @@ EXPECTED = {
             warmup_delay=5,
         ),
     ),
-    "docker.yaml": dict(
+    "docker-browser.yaml": dict(
         shared=dict(
             workflow_type="browser",
             total_count=10,

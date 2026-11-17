@@ -31,7 +31,7 @@ bench-core --provider fake --config config/common/browser.yaml --create-only -n 
 
 # 2)真实后端:第一次跑把集群压小(主路径是 AgentENV)
 bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --test-duration 600
-bench-core --provider docker --config config/common/docker.yaml --create-only -n 2   # 或:本地 docker
+bench-core --provider docker --config config/common/docker-browser.yaml --create-only -n 2   # 或:本地 docker
 ```
 
 第一次只求连通性时,把 `replay.delay_scale` 临时改成 `0.02`(思考时间压缩 50 倍,几十秒
@@ -133,7 +133,7 @@ report:       { output_dir: "results/browser", filename_prefix: "browser_bench" 
 | `coding-ts.yaml` | coding | TypeScript(vuejs/core),`npx tsx` verify,verify_repeat=3 |
 | `coding-go.yaml` | coding | Go(gohugoio/hugo),`go run` 冷编译 verify |
 | `coding-python.yaml` | coding | Python(django/django),`python3` import 峰值 verify |
-| `docker.yaml` | browser | docker 专用的小压力档(10 容器,单 Weibo url) |
+| `docker-browser.yaml` | browser | docker 专用的小压力档(10 容器,单 Weibo url) |
 | `pdf_bench.yaml` | document | PDF 场景回放(镜像内 seed) |
 | `xlsx_bench.yaml` | document | XLSX 场景回放(镜像内 seed) |
 | `replay.yaml` | replay | aenv lifecycle 1:1 基线(见 §8) |

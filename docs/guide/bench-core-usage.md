@@ -40,7 +40,7 @@ bench-core --provider fake --config config/common/browser.yaml --create-only -n 
 
 # 2) a real backend: keep the fleet tiny for a first run (AgentENV is the main path)
 bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --test-duration 600
-bench-core --provider docker --config config/common/docker.yaml --create-only -n 2   # or: local daemon
+bench-core --provider docker --config config/common/docker-browser.yaml --create-only -n 2   # or: local daemon
 ```
 
 For a first connectivity-only check, temporarily set `replay.delay_scale` to `0.02` (think time
@@ -150,7 +150,7 @@ any backend**.
 | `coding-ts.yaml` | coding | TypeScript (vuejs/core), `npx tsx` verify, `verify_repeat: 3` |
 | `coding-go.yaml` | coding | Go (gohugoio/hugo), `go run` verify, `verify_repeat: 1` |
 | `coding-python.yaml` | coding | Python (django/django), `python3` verify, `verify_repeat: 1` |
-| `docker.yaml` | browser | docker-only small profile (10 containers, single URL) |
+| `docker-browser.yaml` | browser | docker-only small profile (10 containers, single URL) |
 | `pdf_bench.yaml` | document | PDF scene replay against an in-image seed |
 | `xlsx_bench.yaml` | document | XLSX scene replay against an in-image seed |
 | `replay.yaml` | replay | aenv lifecycle 1:1 baseline (see §8) |
