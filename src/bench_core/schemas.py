@@ -327,6 +327,7 @@ class ReplayMetrics(TaskMetricsBase):
         self._capacity_wait_secs: list[float] = []  # running-slot FIFO token contention
         self._resume_inflight_wait_secs: list[float] = []  # resume inflight-fuse block
         self._pause_inflight_wait_secs: list[float] = []  # pause inflight-fuse block
+        self._command_rate_pacing_wait_secs: list[float] = []  # "command" QPS-bucket 1/qps time-wait
 
         # Phase 2/3: retry-event accumulators. ``record_retry_event`` is called
         # by the runner each time it emits a retry_* event to the series, so the
@@ -371,6 +372,7 @@ class ReplayMetrics(TaskMetricsBase):
         capacity_wait_sec: float = 0.0,
         resume_inflight_wait_sec: float = 0.0,
         pause_inflight_wait_sec: float = 0.0,
+        command_rate_pacing_wait_sec: float = 0.0,
     ) -> None:
         """Add a replay step result (thread-safe).
 
@@ -433,6 +435,7 @@ class ReplayMetrics(TaskMetricsBase):
                 self._capacity_wait_secs.append(capacity_wait_sec)
                 self._resume_inflight_wait_secs.append(resume_inflight_wait_sec)
                 self._pause_inflight_wait_secs.append(pause_inflight_wait_sec)
+                self._command_rate_pacing_wait_secs.append(command_rate_pacing_wait_sec)
 
     def record_retry_event(self, event_type: str, *, operation: str, time_lost_sec: float = 0.0) -> None:
         """Record a retry_* event for the report's retry-impact block.
@@ -605,6 +608,19 @@ class ReplayMetrics(TaskMetricsBase):
             return [r + p for r, p in zip(self._resume_rate_pacing_wait_secs, self._pause_rate_pacing_wait_secs)]
 
     @property
+    def command_rate_pacing_wait_secs(self) -> list[float]:
+        """Per-step "command" QPS-bucket rate-pacing wait, copy under lock.
+
+        Same RATE-control family as the resume/pause pacing, measured on the
+        exec dispatch (previously it rode invisibly inside exec_sec). NOT part
+        of the derived ``rate_pacing_wait_secs`` total (that stays resume+pause
+        so the per-phase invariants stay authoritative); exec-side pacing is
+        its own segment because it sits inside the slice wall.
+        """
+        with self._lock:
+            return list(self._command_rate_pacing_wait_secs)
+
+    @property
     def inflight_wait_secs(self) -> list[float]:
         """Per-step total inflight-fuse block wait (resume + pause), copy under lock.
 
@@ -766,3 +782,4 @@ class Snapshot:
     # Round comparison fields
     round_total: int = 0
     round_success: int = 0
+

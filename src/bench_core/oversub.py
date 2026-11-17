@@ -450,7 +450,16 @@ _TRAJECTORY_BREAKDOWN_COLUMNS = [
     "pause_rate_pacing_wait_sec",
     "resume_inflight_wait_sec",
     "pause_inflight_wait_sec",
+    "command_rate_pacing_wait_sec",
     "running_slot_held_sec",
+    # Legacy-compat aliases for the old agent-benchmark CSV parser. Each maps
+    # EXACTLY onto a kernel-measured segment (see
+    # trajectory_export._BREAKDOWN_ALIASES): command_wait == exec_sec (the
+    # pure command body), post_command_pause == pause_sec, command_start ==
+    # command_rate_pacing_wait (the "command" QPS dispatch wait).
+    "command_start_sec",
+    "command_wait_sec",
+    "post_command_pause_sec",
 ]
 _BREAKDOWN_KEY_TO_COL = {
     "slice_total": "slice_total_sec",
@@ -471,7 +480,11 @@ _BREAKDOWN_KEY_TO_COL = {
     "pause_rate_pacing_wait": "pause_rate_pacing_wait_sec",
     "resume_inflight_wait": "resume_inflight_wait_sec",
     "pause_inflight_wait": "pause_inflight_wait_sec",
+    "command_rate_pacing_wait": "command_rate_pacing_wait_sec",
     "running_slot_held": "running_slot_held_sec",
+    "command_start": "command_start_sec",
+    "command_wait": "command_wait_sec",
+    "post_command_pause": "post_command_pause_sec",
 }
 
 TRAJECTORY_COLUMNS = [
@@ -484,6 +497,9 @@ TRAJECTORY_COLUMNS = [
     "n_steps",
     "n_failed",
     "n_timeout",
+    # Legacy-compat count column (not a duration; lives beside the counts so
+    # it never lands in the seconds-typed breakdown percentiles).
+    "resume_attempts",
     "success_rate",
     "elapsed_sec",
     *_TRAJECTORY_BREAKDOWN_COLUMNS,
@@ -743,6 +759,11 @@ def _trajectory_rows(trials: list[dict]) -> list[dict]:
                     "n_steps": src.get("n_steps"),
                     "n_failed": src.get("n_failed"),
                     "n_timeout": src.get("n_timeout"),
+                    # Exact resume-call attempt count (n_steps first tries +
+                    # transient re-attempts), computed by trajectory_summaries
+                    # from the step + retry_queued(operation="resume") events.
+                    # Blank for an older index.json without it (backward compat).
+                    "resume_attempts": src.get("resume_attempts"),
                     "success_rate": src.get("success_rate"),
                     "elapsed_sec": src.get("elapsed_sec"),
                     "create_error_type": src.get("create_error_type"),
@@ -781,3 +802,4 @@ def __getattr__(name: str):
 
         return getattr(oversub_run, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

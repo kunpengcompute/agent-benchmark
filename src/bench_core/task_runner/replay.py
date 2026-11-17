@@ -188,7 +188,7 @@ class ReplayBaseRunner(TaskRunner):
             # transient retry never re-pays the 1/qps delay). The returned
             # first element is always 0 here (pre-lease caller owns it).
             resume_start_ts = time.time()
-            _, resume_inflight_wait_sec, resume_api_sec = self._resume()
+            _, resume_inflight_wait_sec, resume_api_sec = self._resume(trajectory_id=trajectory_id)
 
             # Ready probe (post-resume, not QPS-gated; config-gated + lifecycle)
             resume_ready_wait_sec = 0.0
@@ -200,19 +200,22 @@ class ReplayBaseRunner(TaskRunner):
             resume_sec = resume_inflight_wait_sec + resume_api_sec + resume_ready_wait_sec
             resume_end_ts = time.time()
 
-            # Exec phase
+            # Exec phase. _execute measures the "command" QPS-bucket pacing
+            # EXPLICITLY (before the provider call) and times ONLY the
+            # provider.exec body, returning both: exec_elapsed IS the pure
+            # body wall (the pacing is NOT inside exec_sec -- comparable
+            # across qps on/off) and the pacing rides in its own segment.
+            # The pacing is a real in-slice wall wait, so it re-enters
+            # interaction_total_sec below (documented >= slice_total).
             exec_start_ts = time.time()
-            exec_start = time.perf_counter()
-            result = self._execute(step)
-            exec_end = time.perf_counter()
+            result, command_rate_pacing_wait_sec, exec_elapsed = self._execute(step)
             exec_end_ts = time.time()
-            exec_elapsed = exec_end - exec_start
 
             # Pause phase. Rate pacing is IN-lease (sandbox running, memory held
             # until pause confirms), so _pause passes rate_wait=True. Returns
             # (rate_pacing, inflight, api).
             pause_start_ts = time.time()
-            pause_rate_pacing_wait_sec, pause_inflight_wait_sec, pause_api_sec = self._pause()
+            pause_rate_pacing_wait_sec, pause_inflight_wait_sec, pause_api_sec = self._pause(trajectory_id=trajectory_id)
             pause_sec = pause_rate_pacing_wait_sec + pause_inflight_wait_sec + pause_api_sec
             pause_end_ts = time.time()
 
@@ -227,6 +230,13 @@ class ReplayBaseRunner(TaskRunner):
                 action_type=step.action_type,
                 exit_code=result.exit_code,
                 exec_elapsed_sec=exec_elapsed,
+                # slice_total is the in-slice WALL DECOMPOSITION (resume+exec+
+                # pause); the command pacing sits between them in the wall but
+                # is deliberately excluded here so slice_total stays the
+                # sum of the three phase segments (each pure). The full wall
+                # (incl. pacing) is interaction_total_sec; the gap between the
+                # two is exactly command_rate_pacing_wait_sec + the
+                # out-of-slice waits.
                 slice_total_sec=resume_sec + exec_elapsed + pause_sec,
                 resume_sec=resume_sec,
                 pause_sec=pause_sec,
@@ -244,10 +254,16 @@ class ReplayBaseRunner(TaskRunner):
                 # (the slept think-delay) + capacity_wait. The think-delay lives
                 # in natural_delay (set above), NOT a separate + delay term --
                 # adding both would double-count once natural_delay is populated.
+                # command_rate_pacing_wait is a real in-slice wall wait that
+                # _execute keeps OUT of exec_elapsed (the pure body wall), so
+                # it is re-added here explicitly: interaction_total stays an
+                # honest superset of the slice wall with the pacing counted
+                # exactly once across the two decompositions.
                 interaction_total_sec=(
                     resume_rate_pacing_wait_sec
                     + resume_sec
                     + exec_elapsed
+                    + command_rate_pacing_wait_sec
                     + pause_sec
                     + natural_delay_sec
                     + capacity_wait_sec
@@ -256,6 +272,7 @@ class ReplayBaseRunner(TaskRunner):
                 capacity_wait_sec=capacity_wait_sec,
                 resume_inflight_wait_sec=resume_inflight_wait_sec,
                 pause_inflight_wait_sec=pause_inflight_wait_sec,
+                command_rate_pacing_wait_sec=command_rate_pacing_wait_sec,
             )
             # Success-path record. On exception _run_slice raises (no record here);
             # the caller's except block emits a slice_failed=True record instead.
@@ -295,6 +312,10 @@ class ReplayBaseRunner(TaskRunner):
                         "pause_rate_pacing_wait_sec": pause_rate_pacing_wait_sec,
                         "pause_api_sec": pause_api_sec,
                         "pause_inflight_wait_sec": pause_inflight_wait_sec,
+                        # Command-bucket QPS pacing, measured inside the exec
+                        # wall (part of exec_sec's span) but attributed to its
+                        # own segment; the pure body time is exec_sec.
+                        "command_rate_pacing_wait_sec": command_rate_pacing_wait_sec,
                         "rate_pacing_wait_sec": rate_pacing_wait_sec,
                         "inflight_wait_sec": inflight_wait_sec,
                         "running_slot_held_sec": sr.running_slot_held_sec,
@@ -343,7 +364,7 @@ class ReplayBaseRunner(TaskRunner):
         return prev + step.delay_time_sec * self.cfg.replay_delay_scale + extra
 
     # --- lifecycle hooks (lifecycle: real call + G3 retry; exec_only / exec_ephemeral: no-op) ---
-    def _resume(self) -> tuple[float, float, float]:
+    def _resume(self, *, trajectory_id: str = "") -> tuple[float, float, float]:
         """Resume the sandbox (restore from snapshot) before exec.
 
         lifecycle: real call with G3 transient retry. Rate pacing is
@@ -356,9 +377,11 @@ class ReplayBaseRunner(TaskRunner):
         """
         if self.cfg.replay_mode != "lifecycle":
             return 0.0, 0.0, 0.0
-        return self._lifecycle_call_with_retry("resume", lambda: self.provider.resume(self.state), rate_wait=False)
+        return self._lifecycle_call_with_retry(
+            "resume", lambda: self.provider.resume(self.state), rate_wait=False, trajectory_id=trajectory_id
+        )
 
-    def _pause(self) -> tuple[float, float, float]:
+    def _pause(self, *, trajectory_id: str = "") -> tuple[float, float, float]:
         """Pause the sandbox (memory-snapshot) after exec.
 
         lifecycle: real call with G3 transient retry. Rate pacing is
@@ -370,7 +393,9 @@ class ReplayBaseRunner(TaskRunner):
         """
         if self.cfg.replay_mode != "lifecycle":
             return 0.0, 0.0, 0.0
-        return self._lifecycle_call_with_retry("pause", lambda: self.provider.pause(self.state), rate_wait=True)
+        return self._lifecycle_call_with_retry(
+            "pause", lambda: self.provider.pause(self.state), rate_wait=True, trajectory_id=trajectory_id
+        )
 
     def _series_write(self, record: dict) -> None:
         """Best-effort series write; a logging failure must never change control flow."""
@@ -431,7 +456,9 @@ class ReplayBaseRunner(TaskRunner):
             }
         )
 
-    def _lifecycle_call_with_retry(self, operation: str, fn, *, rate_wait: bool = True) -> tuple[float, float, float]:
+    def _lifecycle_call_with_retry(
+        self, operation: str, fn, *, rate_wait: bool = True, trajectory_id: str = ""
+    ) -> tuple[float, float, float]:
         """Run a lifecycle call with transient-error retry (G3) + retry events.
 
         Returns ``(rate_pacing_wait_sec, inflight_wait_sec, api_sec)``. Rate
@@ -445,6 +472,10 @@ class ReplayBaseRunner(TaskRunner):
         series writes are best-effort. ``ShutdownInterrupted`` (BaseException)
         bypasses the ``except Exception`` retry path, so no ``retry_exhausted``
         is emitted for a shutdown.
+
+        Retry events carry ``trajectory_id``/``round_id`` so a consumer can
+        attribute resume retries per run (the exact ``resume_attempts`` count
+        derives from ``retry_queued(operation="resume")`` events).
         """
         retries = self.cfg.replay_lifecycle_retries
         rate_pacing_wait = 0.0
@@ -485,6 +516,8 @@ class ReplayBaseRunner(TaskRunner):
                         {
                             "event": "retry_recovered",
                             "sandbox_index": self.state.index,
+                            "trajectory_id": trajectory_id,
+                            "round_id": getattr(self, "round_id", None),
                             "timestamp": time.time(),
                             "operation": operation,
                             "attempt": attempt + 1,
@@ -506,6 +539,8 @@ class ReplayBaseRunner(TaskRunner):
                         {
                             "event": "retry_exhausted",
                             "sandbox_index": self.state.index,
+                            "trajectory_id": trajectory_id,
+                            "round_id": getattr(self, "round_id", None),
                             "timestamp": time.time(),
                             "operation": operation,
                             "attempt": attempt + 1,
@@ -520,6 +555,8 @@ class ReplayBaseRunner(TaskRunner):
                     {
                         "event": "retry_queued",
                         "sandbox_index": self.state.index,
+                        "trajectory_id": trajectory_id,
+                        "round_id": getattr(self, "round_id", None),
                         "timestamp": time.time(),
                         "operation": operation,
                         "attempt": attempt + 1,
@@ -605,8 +642,19 @@ class ReplayBaseRunner(TaskRunner):
             f"after {READY_PROBE_MAX_ATTEMPTS} attempts"
         )
 
-    def _execute(self, step: ReplayStep) -> CommandResult:
+    def _execute(self, step: ReplayStep) -> tuple[CommandResult, float, float]:
         """Exec the recorded action verbatim -- cwd/env via the exec contract.
+
+        Returns ``(result, command_rate_pacing_wait_sec, body_elapsed_sec)``.
+        The "command" QPS-bucket 1/qps time-wait is measured EXPLICITLY (0.0
+        with no gate) and the timer wraps ONLY the ``provider.exec`` body --
+        so ``exec_sec`` (the caller's name for ``body_elapsed_sec``) is the
+        PURE provider body wall, comparable across qps on/off, with the
+        pacing never inside it. This completes the wait accounting (the
+        resume/pause phases already split their rate pacing): pacing + body
+        equals the old ungated exec wall exactly, each component in its own
+        segment; the caller re-adds the pacing into interaction_total_sec
+        (an in-slice wall wait interaction_total is documented to cover).
 
         G1: in lifecycle mode the exec dispatch is QPS-gated under the
         ``"command"`` bucket but with ``hold_inflight=False`` -- the QPS time-wait
@@ -619,22 +667,18 @@ class ReplayBaseRunner(TaskRunner):
         admission controller).
         """
         if self.admission is not None and self.admission.qps is not None:
-            with self.admission.qps.slot("command", hold_inflight=False):
-                result = self.provider.exec(
-                    self.state,
-                    step.action,
-                    cwd=self.cfg.replay_workdir or None,
-                    env=self.cfg.replay_env or None,
-                    timeout=self.cfg.replay_action_timeout,
-                )
+            command_rate_pacing_wait_sec = self.admission.qps.time_wait("command")
         else:
-            result = self.provider.exec(
-                self.state,
-                step.action,
-                cwd=self.cfg.replay_workdir or None,
-                env=self.cfg.replay_env or None,
-                timeout=self.cfg.replay_action_timeout,
-            )
+            command_rate_pacing_wait_sec = 0.0
+        body_start = time.perf_counter()
+        result = self.provider.exec(
+            self.state,
+            step.action,
+            cwd=self.cfg.replay_workdir or None,
+            env=self.cfg.replay_env or None,
+            timeout=self.cfg.replay_action_timeout,
+        )
+        body_elapsed = time.perf_counter() - body_start
         if result.exit_code != 0:
             # Non-zero exits were previously invisible: metrics counted them
             # but neither the action nor its stderr reached any log. DEBUG
@@ -648,7 +692,7 @@ class ReplayBaseRunner(TaskRunner):
                 step.action[:120],
                 (result.stderr or "")[-300:],
             )
-        return result
+        return result, command_rate_pacing_wait_sec, body_elapsed
 
     # --- shared metric recording ---
     def _record_step(
@@ -692,6 +736,7 @@ class ReplayBaseRunner(TaskRunner):
             capacity_wait_sec=step_result.capacity_wait_sec,
             resume_inflight_wait_sec=step_result.resume_inflight_wait_sec,
             pause_inflight_wait_sec=step_result.pause_inflight_wait_sec,
+            command_rate_pacing_wait_sec=step_result.command_rate_pacing_wait_sec,
         )
         self.state.update_last_task_time(time.time())
 
@@ -920,6 +965,7 @@ class ReplayBaseRunner(TaskRunner):
             "capacity_wait_sec": 0.0,
             "resume_inflight_wait_sec": 0.0,
             "pause_inflight_wait_sec": 0.0,
+            "command_rate_pacing_wait_sec": 0.0,
             "rate_pacing_wait_sec": 0.0,
             "inflight_wait_sec": 0.0,
             "action": _compact_action(step.action),
@@ -966,3 +1012,4 @@ class ReplayBaseRunner(TaskRunner):
 # Imported last: the subclasses need ReplayBaseRunner above, and importing
 # them registers the ``replay`` workflow in the registry.
 from .replay_runners import ReplayRoundRunner, ReplayTaskRunner, ReplayWarmupRunner  # noqa: E402,F401
+

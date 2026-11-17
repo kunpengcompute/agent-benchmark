@@ -580,6 +580,7 @@ class XlsxReportRenderer:
                     "pause_rate_pacing_wait_median_s",
                     "resume_inflight_wait_median_s",
                     "pause_inflight_wait_median_s",
+                    "command_rate_pacing_wait_median_s",
                     "running_slot_held_median_s",
                     "avg_slice_median_s",
                     "n_timeout_median",

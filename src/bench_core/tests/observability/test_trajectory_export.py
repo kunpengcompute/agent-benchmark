@@ -35,6 +35,7 @@ def _step(
     resume_ready_wait_sec=0.0,
     pause_rate_pacing_wait_sec=0.0,
     pause_api_sec=0.0,
+    command_rate_pacing_wait_sec=0.0,
     running_slot_held_sec=0.0,
     action="echo step",
     stdout=None,
@@ -67,6 +68,7 @@ def _step(
         "resume_ready_wait_sec": resume_ready_wait_sec,
         "pause_rate_pacing_wait_sec": pause_rate_pacing_wait_sec,
         "pause_api_sec": pause_api_sec,
+        "command_rate_pacing_wait_sec": command_rate_pacing_wait_sec,
         "running_slot_held_sec": running_slot_held_sec,
         "slice_failed": slice_failed,
         "timed_out": timed_out,
@@ -413,7 +415,13 @@ def test_export_writes_index_json_catalog(tmp_path):
             "pause_rate_pacing_wait",
             "resume_inflight_wait",
             "pause_inflight_wait",
+            "command_rate_pacing_wait",
             "running_slot_held",
+            # legacy-compat aliases (old agent-benchmark CSV parser shape);
+            # resume_attempts is NOT here -- it is a count, not a duration
+            "post_command_pause",
+            "command_wait",
+            "command_start",
         }
 
 
@@ -536,3 +544,129 @@ def test_export_action_series_picks_fullest_run(tmp_path):
     # the create-failed run (sandbox 0) is first by sort order but has 0 steps;
     # action_series falls back to the fullest run (sandbox 1).
     assert idx["trajectories"][0]["action_series"] == "cmd-zero\ncmd-one"
+
+
+def test_export_legacy_aliases_map_onto_real_segments(tmp_path):
+    # Legacy-compat duration columns are ALIASES at the export boundary -- each
+    # resolves EXACTLY onto a kernel-measured segment (never an improvised
+    # value under a borrowed name): post_command_pause == pause sum,
+    # command_wait == exec sum, command_start == command_rate_pacing_wait sum
+    # (the "command" QPS dispatch wait -- the quantity the name promises; 0
+    # with the gate off, NOT the resume/pause rate_pacing_wait).
+    sp = tmp_path / "s.jsonl"
+    _write(
+        sp,
+        [
+            _step(
+                "t",
+                step_index=0,
+                resume_sec=0.1,
+                exec_sec=0.4,
+                pause_sec=0.2,
+                resume_rate_pacing_wait_sec=0.05,
+                command_rate_pacing_wait_sec=0.03,
+                resume_start=10.0,
+                pause_end=10.7,
+            ),
+            _step(
+                "t",
+                step_index=1,
+                resume_sec=0.1,
+                exec_sec=0.4,
+                pause_sec=0.2,
+                resume_rate_pacing_wait_sec=0.05,
+                command_rate_pacing_wait_sec=0.03,
+                resume_start=11.0,
+                pause_end=11.7,
+            ),
+        ],
+    )
+    export_trajectories(sp, tmp_path)
+    idx = json.loads((tmp_path / "trajectories" / "index.json").read_text(encoding="utf-8"))
+    tr = idx["trajectories"][0]
+    top_bd = tr["time_breakdown_sec"]
+    assert top_bd["post_command_pause"] == top_bd["pause"]
+    assert top_bd["command_wait"] == top_bd["exec"]
+    assert top_bd["command_start"] == top_bd["command_rate_pacing_wait"]
+    assert top_bd["command_start"] == round(0.06, 6)
+    # command_start must NOT alias the resume/pause shaping total even though
+    # resume_rate_pacing is nonzero here (the name promises the command gate).
+    assert top_bd["command_start"] != top_bd["rate_pacing_wait"]
+    # per-run rows carry the same aliasing
+    run_bd = tr["runs"][0]["time_breakdown_sec"]
+    assert run_bd["post_command_pause"] == run_bd["pause"]
+    assert run_bd["command_wait"] == run_bd["exec"]
+    assert run_bd["command_start"] == run_bd["command_rate_pacing_wait"]
+    # resume_attempts is a COUNT beside the counts, not a breakdown key
+    assert "resume_attempts" not in run_bd
+    assert tr["runs"][0]["resume_attempts"] == 2  # n_steps, no retries
+
+
+def test_export_resume_attempts_counts_retry_events(tmp_path):
+    # resume_attempts is EXACT: n_steps first-try resumes + one per
+    # retry_queued(operation="resume") event attributable to the run (the
+    # transient re-attempts). pause retries and resume retries on OTHER runs
+    # must not leak into this run's count.
+    sp = tmp_path / "s.jsonl"
+    _write(
+        sp,
+        [
+            _step("t", step_index=0, resume_sec=0.1, exec_sec=0.4, pause_sec=0.2, resume_start=10.0, pause_end=10.7),
+            # one transient resume retry before step 1 (same run identity)
+            {
+                "event": "retry_queued",
+                "sandbox_index": 0,
+                "trajectory_id": "t",
+                "round_id": None,
+                "operation": "resume",
+                "attempt": 1,
+            },
+            # a PAUSE retry: not a resume attempt, must not count
+            {
+                "event": "retry_queued",
+                "sandbox_index": 0,
+                "trajectory_id": "t",
+                "round_id": None,
+                "operation": "pause",
+                "attempt": 1,
+            },
+            # a resume retry on ANOTHER trajectory: must not leak into "t"
+            {
+                "event": "retry_queued",
+                "sandbox_index": 0,
+                "trajectory_id": "other",
+                "round_id": None,
+                "operation": "resume",
+                "attempt": 1,
+            },
+            _step("t", step_index=1, resume_sec=0.1, exec_sec=0.4, pause_sec=0.2, resume_start=11.0, pause_end=11.7),
+        ],
+    )
+    export_trajectories(sp, tmp_path)
+    idx = json.loads((tmp_path / "trajectories" / "index.json").read_text(encoding="utf-8"))
+    by_tid = {tr["trajectory_id"]: tr for tr in idx["trajectories"]}
+    # "t": 2 steps (first tries) + 1 resume retry = 3
+    assert by_tid["t"]["runs"][0]["resume_attempts"] == 3
+    assert by_tid["t"]["resume_attempts"] == 3  # p50 across its runs
+    # the orphan retry on "other" attributes to that (step-less) run's count
+    # alone: 0 first tries + 1 retry = 1
+    assert by_tid["other"]["runs"][0]["resume_attempts"] == 1
+
+
+def test_trajectory_csv_columns_carry_legacy_aliases():
+    # The oversub driver's trajectory-detail.csv keeps the old parser's column
+    # shape: the three duration aliases live in the breakdown block, and
+    # resume_attempts is a COUNT column beside n_steps/n_failed/n_timeout --
+    # never in the seconds-typed breakdown (it must not land in
+    # time_breakdown_sec percentiles or a rounded seconds CSV column).
+    from bench_core.oversub import TRAJECTORY_COLUMNS, _TRAJECTORY_BREAKDOWN_COLUMNS
+
+    assert "post_command_pause_sec" in _TRAJECTORY_BREAKDOWN_COLUMNS
+    assert "command_wait_sec" in _TRAJECTORY_BREAKDOWN_COLUMNS
+    assert "command_start_sec" in _TRAJECTORY_BREAKDOWN_COLUMNS
+    assert "command_rate_pacing_wait_sec" in _TRAJECTORY_BREAKDOWN_COLUMNS
+    assert "resume_attempts" in TRAJECTORY_COLUMNS
+    assert "resume_attempts" not in _TRAJECTORY_BREAKDOWN_COLUMNS
+    # the count sits with the other counts, before success_rate/elapsed_sec
+    cols = TRAJECTORY_COLUMNS
+    assert cols.index("n_timeout") < cols.index("resume_attempts") < cols.index("success_rate")
