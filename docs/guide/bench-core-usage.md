@@ -5,7 +5,7 @@
 > New here? The repo [README](../../README.md) has the one-command quick start (fake → docker →
 > aenv); this guide picks up from there.
 >
-> The host-agnostic stress-test kernel. It drives e2b / docker / aenv / cubesandbox / fake
+> The host-agnostic stress-test kernel. It drives e2b / docker / aenv / aenv-go / cubesandbox / fake
 > backends through the `EnvironmentProvider` abstraction. It coexists with — and shares no code
 > with — the frozen legacy `e2b_bench/` and `docker_bench/`. Adding a backend means one new
 > `env_provider` submodule; the kernel and the contract stay untouched.
@@ -14,17 +14,17 @@
 
 `bench_core` decouples the stress flow from the sandbox implementation: the kernel issues
 every command through a single `exec()` primitive, and a sandbox backend (e2b / docker /
-aenv / cubesandbox / future kata …) only has to run that command inside a sandbox and return the
+aenv / aenv-go / cubesandbox / future kata …) only has to run that command inside a sandbox and return the
 result. Swapping a backend is therefore just `--provider` — **the same stress profile runs the
 same load curve on any backend**.
 
 - `src/bench_core/` — the kernel: `run_benchmark` spine, stats / round-robin / task
   runners, `KernelConfig`. It never statically imports a backend SDK.
 - `src/env_provider/` — the contract (`EnvironmentProvider` ABC + `SandboxInstance`) and
-  the e2b / docker / aenv / cubesandbox / fake provider impls (opt-in submodules; the contract
+  the e2b / docker / aenv / aenv-go / cubesandbox / fake provider impls (opt-in submodules; the contract
   itself stays SDK-free).
 - `config/common/` — backend-agnostic workflow configs. Each carries the backend blocks its
-  providers need (`e2b:` + `docker:` for browser/coding/document; `aenv:`/`cubesandbox:` too for
+  providers need (`e2b:` + `docker:` for browser/coding/document; `aenv:`/`aenv_go:`/`cubesandbox:` too for
   replay); `--provider` selects which block is read.
 
 ---
@@ -54,6 +54,9 @@ box:
 
 - **aenv** — the `aenv:` block must point at your server (`template` = image/disk name,
   `env.E2B_API_URL` / `E2B_SANDBOX_URL`, pasted `E2B_ACCESS_TOKEN` / `E2B_API_KEY`).
+- **aenv-go** — same `aenv:` server, but driven by a resident Go worker instead of the e2b SDK.
+  Build the worker first ([go-client/README.md](../../go-client/README.md)),
+  then `--provider aenv-go` reuses the same YAML (`aenv_go:` keys fall back to `aenv:`).
 - **replay** — the pool and its template manifest are pre-wired to the bundled 55
   (`artifacts/traces/replays` + `artifacts/traces/image-map.json`, §8.3), so a fresh checkout runs.
 - **docker** — `docker.image` must exist locally (the shipped names are placeholders, §7).
@@ -99,6 +102,18 @@ The remaining backend SDKs are opt-in — install only the one you use (`fake` n
 pip install docker                    # --provider docker
 pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
+
+**aenv-go** uses no SDK — same AENV server, resident Go worker client (protocol v2, line-
+delimited JSON over stdin/stdout). Build the worker first (stdlib-only Go, needs Go 1.22+):
+
+```bash
+bash go-client/build.sh               # produces go-client/bin/agent-benchmark-go
+```
+
+Override the path with `AGENT_BENCHMARK_GO_BIN` or the `aenv_go:` block's `go_client_bin`
+(missing keys fall back to `aenv:`, §2.1 / [go-client/README.md](../../go-client/README.md)).
+A missing binary is a **hard error, no e2b fallback** — the point of aenv-go is a client A/B
+against the e2b SDK.
 
 > Verify in one command (no SDK): `bench-core --provider fake --config config/common/browser.yaml --create-only -n 1`
 > — if it runs, the kernel + CLI + config parse are all ready.
@@ -379,9 +394,10 @@ placeholders — build them first (with the language toolchain + project repo) b
 
 `workflow_type: replay` replays recorded SWE-bench agent trajectories (ordered shell +
 `str_replace_editor` actions, each with a per-step `delay_time`) verbatim through
-`provider.exec()`. The same profile runs on aenv (lifecycle pause/resume / ephemeral),
-cubesandbox, or e2b/docker (exec_only). `config/common/replay.yaml` is the aenv lifecycle
-**1:1 (no-oversubscription) baseline**.
+`provider.exec()`. The same profile runs on aenv / aenv-go (lifecycle pause/resume / ephemeral),
+cubesandbox, or e2b/docker (exec_only). `aenv-go` inherits all capabilities (lifecycle /
+ephemeral / snapshot) from `aenv`, so `--provider aenv-go` switches the same replay to the
+Go-worker client. `config/common/replay.yaml` is the aenv lifecycle **1:1 (no-oversubscription) baseline**.
 
 ### 8.1 The three modes
 

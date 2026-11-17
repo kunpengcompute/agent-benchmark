@@ -3,20 +3,20 @@
 > 第一次用先看仓库 [README](../../README.md) 的「快速开始」(fake → docker → aenv 三档);
 > 本文覆盖其后的一切细节。
 >
-> 主机无关的压测内核,通过 `EnvironmentProvider` 抽象驱动 e2b / docker / aenv / cubesandbox / fake。
+> 主机无关的压测内核,通过 `EnvironmentProvider` 抽象驱动 e2b / docker / aenv / aenv-go / cubesandbox / fake。
 > 与冻结的 legacy `e2b_bench/`、`docker_bench/` 并存,互不影响(共享零代码)。
 > 加一个后端 = 新增一个 `env_provider` 子模块,内核和契约都不用动。
 
 ## 概述
 
 `bench_core` 把压测流程从沙箱实现里解耦:内核只通过一个 `exec()` 原语下发命令,
-沙箱后端(e2b / docker / aenv / cubesandbox / 未来的 kata)只负责把命令送进沙箱并返回结果。
+沙箱后端(e2b / docker / aenv / aenv-go / cubesandbox / 未来的 kata)只负责把命令送进沙箱并返回结果。
 因此切换后端只需 `--provider`,**同一份压测配置在任一后端上跑同一套压力曲线**。
 
 - `src/bench_core/` — 内核:`run_benchmark` 脊柱、stats/round_robin/task_runner、KernelConfig
-- `src/env_provider/` — 契约(`EnvironmentProvider` ABC + `SandboxInstance`)+ e2b/docker/aenv/cubesandbox/fake 实现
+- `src/env_provider/` — 契约(`EnvironmentProvider` ABC + `SandboxInstance`)+ e2b/docker/aenv/aenv-go/cubesandbox/fake 实现
 - `config/common/` — 后端无关的工作流配置(每个文件带它涉及的后端块:browser/coding/document 是
-  `e2b:` + `docker:`;replay 另外还有 `aenv:` / `cubesandbox:`),`--provider` 决定读哪块
+  `e2b:` + `docker:`;replay 另外还有 `aenv:` / `aenv_go:` / `cubesandbox:`),`--provider` 决定读哪块
 
 ---
 
@@ -43,6 +43,9 @@ bench-core --provider docker --config config/common/docker-browser.yaml --create
 
 - **aenv** —— `aenv:` 块要指向你的服务端(`template` = 镜像/disk 名字、`env.E2B_API_URL` /
   `E2B_SANDBOX_URL`,贴上 `E2B_ACCESS_TOKEN` / `E2B_API_KEY`)。
+- **aenv-go** —— 同一 `aenv:` 服务端,但走常驻 Go worker 客户端,先
+  [go-client/README.md](../../go-client/README.md) 构建 worker;
+  构建后 `--provider aenv-go` 直接用同一份配置(`aenv_go:` 块缺键全部回落 `aenv:`)。
 - **replay** —— 轨迹池与模板清单已预置为仓库自带的 55 条
   (`artifacts/traces/replays` + `artifacts/traces/image-map.json`,§8.3),开箱即可回放。
 - **docker** —— `docker.image` 必须是本地已存在的镜像(仓库里的名字是占位,见 §7)。
@@ -86,6 +89,17 @@ pip install docker                    # --provider docker
 pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
 
+**aenv-go** 不走 SDK——同一个 AENV 服务端换走常驻 Go worker 客户端(协议 v2,stdin/stdout
+JSON lines),需要先构建 worker 二进制(仓库内标准库依赖,g只需要 Go 1.22+):
+
+```bash
+bash go-client/build.sh               # 产出 go-client/bin/agent-benchmark-go
+```
+
+worker 路径可用 `AGENT_BENCHMARK_GO_BIN` 覆盖,或写在 `aenv_go:` 块的 `go_client_bin` 上
+(缺省回落 `aenv:` 块,见 §2.1/§go-client [README](../../go-client/README.md))。二进制缺失时
+该 provider **硬报错不回落 e2b**——aenv-go 的定位就是和 e2b SDK 做客户端对比。
+
 > 验证安装:`bench-core --provider fake --config config/common/browser.yaml --create-only -n 1`
 > 能跑通即内核 + CLI + 配置解析全部就绪(fake 不需要任何 SDK)。
 
@@ -96,7 +110,7 @@ pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ### 2.1 配置文件结构
 
 `config/common/` 下每个 YAML = 一个工作流,携带它涉及的后端块(browser/coding/document 是
-`e2b:` + `docker:`;replay 还有 `aenv:` + `cubesandbox:`):
+`e2b:` + `docker:`;replay 还有 `aenv:` + `aenv_go:` + `cubesandbox:`):
 
 ```yaml
 workflow_type: browser        # browser | coding | document | replay
@@ -319,7 +333,9 @@ coding 配置里的 `ubuntu-openclaw-coding-{ts,go,python}:24.04-arm64` 是占�
 
 `workflow_type: replay` 把录制的 SWE-bench agent 轨迹(有序 shell + `str_replace_editor`
 动作,带 per-step `delay_time`)通过 `provider.exec()` 原样回放。同一份压力曲线可跑在
-aenv(lifecycle pause/resume / 临时模式)、cubesandbox 或 e2b/docker(exec_only)上。
+aenv / aenv-go(lifecycle pause/resume / 临时模式)、cubesandbox 或 e2b/docker(exec_only)上。
+`aenv-go` 从 `aenv` 继承全部 capability(lifecycle / ephemeral / snapshot),换 `--provider aenv-go`
+即把同一份回放压测切到 Go worker 客户端。
 `config/common/replay.yaml` 是 aenv lifecycle 内存超卖压测的 1:1 基线配置。
 
 ### 8.1 三种 mode
