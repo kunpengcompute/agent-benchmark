@@ -354,9 +354,13 @@ def _run_trial(
     trial_dir.mkdir(parents=True, exist_ok=True)
     test_duration = args.test_duration or (base_yaml.get("test") or {}).get("duration", 600)
     # multiplier (M) applies only to exec_ephemeral (each sandbox runs M
-    # trajectories, stop-when-done); a no-op for lifecycle. M=0 disables it, so a
-    # trial can still use the base benchmark_mode / total_count model.
-    m = (args.multiplier or None) if mode == "exec_ephemeral" else None
+    # trajectories, stop-when-done); a no-op for lifecycle. The raw value is
+    # passed through (not ``or None``) so 0 stays distinct from unset: M=0 is an
+    # explicit "disable M" -- build_trial_config then clears any base
+    # replay.multiplier so a stray base value cannot fire the kernel's
+    # fixed+exec_ephemeral+M triple (stop_when_done). compute_valid reads 0 as
+    # falsy (``if multiplier``), identical to unset -- no M-aware floor.
+    m = args.multiplier if mode == "exec_ephemeral" else None
     # Shardable modes (exec_ephemeral/exec_only) get a plan at every P, including
     # P == 1, so a ratio-1 trial keeps the sharded layout (shard-00/ + merged/ +
     # driver-owned vm_monitor) byte-identical to P >= 2 trials; lifecycle (its

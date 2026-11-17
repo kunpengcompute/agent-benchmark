@@ -295,6 +295,21 @@ def test_build_trial_config_no_multiplier_keeps_benchmark_mode():
     assert cfg["test"]["benchmark_mode"] == "round_robin"  # base value preserved
 
 
+def test_build_trial_config_multiplier_zero_clears_base_multiplier():
+    """--multiplier 0 explicitly disables M: a base carrying replay.multiplier must
+    have it cleared (popped) so the kernel's stop_when_done triple
+    (fixed+exec_ephemeral+replay_multiplier) cannot fire on the stray base value,
+    and the driver must not force benchmark_mode=fixed. replay.multiplier=0 in the
+    trial would otherwise trip replay_config's ``must be >= 1`` validator."""
+    base = _base_yaml()
+    base.setdefault("replay", {})["multiplier"] = 2
+    cfg = build_trial_config(
+        base, mode="exec_ephemeral", ratio=2, n=384, test_duration=600, trial_dir="out", prefix="rb", multiplier=0
+    )
+    assert "multiplier" not in cfg["replay"]
+    assert cfg["test"]["benchmark_mode"] == "round_robin"  # base value preserved, not forced to fixed
+
+
 def test_compute_valid_multiplier_aware_happy():
     """M=5, ratio=2, N=384 -> expected trajectory completions = 5*2*384 = 3840.
     Since run_summary schema 2, throughput.total = trajectory ATTEMPTS and

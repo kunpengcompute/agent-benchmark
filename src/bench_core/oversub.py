@@ -243,14 +243,19 @@ def build_trial_config(
     cfg.setdefault("report", {})
     cfg["report"]["output_dir"] = trial_dir
     cfg["report"]["filename_prefix"] = prefix
-    # When multiplier (M) is set, switch this trial to fixed+exec_ephemeral+M:
-    # each of the ratio*N sandboxes runs exactly M trajectories then exits
-    # (stop-when-done). total_count/round_size/trajectory_limit are retained
-    # for config-object compatibility but unused under fixed+M -- the per-slot
-    # bound is replay.multiplier; round_count/round_size are round_robin knobs.
-    if multiplier is not None:
+    # multiplier (M): N>0 -> switch this trial to fixed+exec_ephemeral+M (each of
+    # the ratio*N sandboxes runs exactly M trajectories then exits,
+    # stop-when-done); 0 -> explicitly disable M (clear any base replay.multiplier
+    # so the kernel's stop_when_done triple cannot fire on a stray base value,
+    # and keep the base benchmark_mode); None -> leave the base untouched.
+    # total_count/round_size/trajectory_limit are retained for config-object
+    # compatibility but unused under fixed+M -- the per-slot bound is
+    # replay.multiplier; round_count/round_size are round_robin knobs.
+    if multiplier is not None and multiplier > 0:
         cfg["replay"]["multiplier"] = multiplier
         cfg["test"]["benchmark_mode"] = "fixed"
+    elif multiplier == 0:
+        cfg["replay"].pop("multiplier", None)
     return cfg
 
 
