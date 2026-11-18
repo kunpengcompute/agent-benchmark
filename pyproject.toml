@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agent-benchmark"
 version = "0.1.0"
@@ -9,7 +13,116 @@ dependencies = [
     "openpyxl",
     "matplotlib",
     "Pillow",
+    "psutil>=5.8.0",
+    "paramiko>=2.7.0",
+    "flask>=2.0.0",
+    "PyYAML>=6.0",
+    "pandas>=1.3.0",
+    "xlsxwriter>=3.0.0",
+    "python-dotenv>=0.19.0",
+    "aiohttp>=3.8.0",
 ]
 
-[tool.uv]
-package = false
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "ruff>=0.1.0",
+]
+# CubeSandbox provider SDK (Cloud Hypervisor microVM, lifecycle-capable). The
+# provider module imports it under try/except, so the kernel runs without it;
+# install only when using --provider cubesandbox.
+cubesandbox = ["cubesandbox>=0.7.0"]
+
+[project.scripts]
+bench-core = "bench_core.bench_cli:main"
+oversub-bench = "bench_core.oversub_run:main"
+oversub-compare = "bench_core.compare_sweeps:main"
+vm-monitor = "vm_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bench_core*", "env_provider*", "vm_monitor*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+# src-layout: put src/ on sys.path so tests can ``import bench_core`` without an
+# editable install.
+pythonpath = ["src"]
+addopts = [
+    "-ra",
+    "-q",
+    "--strict-markers",
+    "--strict-config",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests that require external services",
+    "unit: marks fast unit tests",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B905",   # zip without explicit strict
+    "ARG001", # unused function argument (common in callbacks)
+    "ARG002", # unused method argument
+    "SIM108", # use ternary operator
+    "SIM115", # use context manager for opening files (intentional in some places)
+    "SIM105", # use contextlib.suppress (intentional try-except-pass)
+    "SIM118", # use key in dict instead of dict.keys()
+    "B007",   # loop control variable not used
+    "C401",   # unnecessary generator
+    "C416",   # unnecessary dict comprehension
+    "C408",   # unnecessary dict() call
+    "UP022",  # prefer capture_output
+    "UP015",  # unnecessary mode argument
+    "UP009",  # UTF-8 encoding declaration
+    "UP024",  # replace aliased errors
+    "E722",   # bare except
+    "E712",   # equality comparisons to True/False
+    "E741",   # ambiguous variable name
+    "E701",   # multiple statements on one line (colon)
+    "E702",   # multiple statements on one line (semicolon)
+    "F401",   # unused import (handled in per-file-ignores)
+    "F403",   # star imports
+    "F541",   # f-string without placeholders
+    "F821",   # undefined name
+    "F841",   # local variable assigned but never used
+    "ARG004", # unused static method argument
+    "ARG005", # unused lambda argument
+    "E402",   # module level import not at top
+    "W291",   # trailing whitespace
+    "W292",   # no newline at end of file
+    "W293",   # blank line contains whitespace
+    "I001",   # import block unsorted
+    "SIM102", # use single if statement
+    "SIM114", # combine if branches
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bench_core", "env_provider", "vm_monitor"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "S101"]
+"__init__.py" = ["F401"]

@@ -1,0 +1,922 @@
+"""Phase 3: xlsx observability renderer over the shared ReplayObservability model.
+
+One data layer (ReplayObservability), two renderers (text ReportFormatter +
+this xlsx). Emits a multi-sheet workbook; openpyxl is a core dep. Semantic
+metrics (throughput / retry / trajectory percentiles) are owned by the model;
+this renderer only flattens raw per-sandbox series into percentile rows for
+the step / lifecycle / trajectory tables (the model exposes percentile dicts,
+not the raw lists + counts those tables need). A render failure (e.g. openpyxl
+missing on a minimal install) is caught by the caller (run_benchmark) which
+falls back to the text report + a warning; this module raises normally.
+"""
+from __future__ import annotations
+
+import io
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.comments import Comment
+from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from bench_core.observability.trajectory_summary import SEG_KEYS, aggregate_trajectories, trajectory_summaries
+from bench_core.utils import calc_percentiles
+
+if TYPE_CHECKING:
+    from bench_core.observability.replay_obs import ReplayObservability
+
+# Host-level vm_monitor sheets copied into the obs workbook during the single
+# render pass (cell values only). Kept here -- the renderer owns the merge -- so
+# there is no second openpyxl load/save round-trip on the obs file (a round-trip
+# would drop every chart and PNG embedded by this renderer).
+_MERGE_SHEETS = ("VM_Stats", "NUMA_Overview", "DevKit_TopDown")
+
+# Gantt render cost scales with total phase segments (a 1:1/384-sandbox
+# lifecycle run yields ~600k; drawing one ax.barh Patch per segment hung the
+# 1:1 run for 24h). broken_barh (one PolyCollection per sandbox/phase) kills
+# the per-Patch cost; this cap bounds the rectangle count itself, stride-
+# sampling per sandbox when exceeded. The Step detail sheet keeps the full-
+# resolution timeline, so the overview Gantt losing resolution at extreme
+# scale is acceptable.
+MAX_GANTT_SEGMENTS = 200_000
+
+
+def _cap_gantt_segments(
+    rows: list[tuple[str, list[tuple[float, float, str]]]],
+    max_segments: int = MAX_GANTT_SEGMENTS,
+) -> list[tuple[str, list[tuple[float, float, str]]]]:
+    """Bound total Gantt segments via per-sandbox stride-sampling when over cap.
+
+    Returns the input unchanged when the total is within the bound (the common
+    case) or when the sandbox count itself meets/exceeds the cap (each sandbox
+    needs >=1 segment, so nothing can be dropped without hiding a row).
+    Otherwise strides each sandbox's segments so the result total stays at or
+    below the cap: with ``stride = ceil(total / (cap - n))`` the per-sandbox
+    ceil-rounding slack sums to ``<= total/stride + n <= cap``. ``[::stride]``
+    keeps index 0, so each sandbox keeps its earliest segment + row order.
+    """
+    n = len(rows)
+    total = sum(len(segs) for _, segs in rows)
+    if total <= max_segments or n >= max_segments:
+        return rows
+    stride = (total + (max_segments - n) - 1) // (max_segments - n)
+    return [(name, segs[::stride]) for name, segs in rows]
+
+
+# Per-step line charts (Per-step timings + Lifecycle overhead sheets) are
+# downsampled to this many points. An uncapped reference makes openpyxl inline
+# a numCache for every referenced cell at save time -- a 1:1/384-sandbox run
+# yields ~150k steps, so each sheet's chart spanned ~150k rows and wb.save
+# exploded. The Step detail sheet keeps every step (filterable), so capping the
+# overview chart loses no data.
+MAX_PERSTEP_POINTS = 2000
+
+
+def _downsample_indices(n: int, max_points: int = MAX_PERSTEP_POINTS) -> list[int]:
+    """Indices to stride-sample a length-n series down to <= max_points.
+
+    Returns ``range(n)`` (every index) when ``n <= max_points``. Otherwise
+    strides by ``ceil(n / max_points)`` and forces the last index (``n-1``) in
+    so the chart x-range still spans the full run; if that endpoint append
+    overshoots by one, the second-to-last sampled index is dropped so the result
+    stays within the cap while always keeping first + last. The result is
+    monotonic. The same index list is reused across the resume/pause/slice
+    series so the Lifecycle overhead chart's series stay aligned.
+    """
+    if n <= max_points:
+        return list(range(n))
+    stride = (n + max_points - 1) // max_points
+    idxs = list(range(0, n, stride))
+    if idxs[-1] != n - 1:
+        idxs.append(n - 1)
+    if len(idxs) > max_points:  # the endpoint append overflowed by one
+        del idxs[-2]
+    return idxs
+
+
+def _write_table(ws, headers: list[str], rows: list[list]) -> int:
+    """Write a header row (bold) + data rows to a worksheet; return the row the
+    header landed on.
+
+    Bold the row just appended (tracked via ``ws.max_row`` after the append),
+    not always row 1, so a sheet with multiple sub-tables (e.g. Trajectory
+    summary) styles each header correctly. Callers that need to anchor a chart
+    Reference on the header (titles_from_data) MUST use the returned row rather
+    than ``ws.max_row + 1`` computed before the write: openpyxl reports
+    ``max_row == 1`` for a fresh empty sheet, so a pre-write ``+1`` lands one row
+    past the header and points chart title refs at the first data row.
+    """
+    bold = Font(bold=True)
+    ws.append(headers)
+    header_row = ws.max_row
+    for c in ws[header_row]:
+        c.font = bold
+    for row in rows:
+        ws.append(row)
+    return header_row
+
+
+def _attach_rate_pacing_notes(ws, headers: list[str], header_row: int) -> None:
+    """Pin a concise fixed header note on the two rate-pacing columns flagging the
+    pre-lease / in-lease归属, so a reader does not sum resume rate-pacing into
+    ``resume_sec`` (resume excludes it; pause includes it). A cell comment is the
+    non-displacing Excel-native annotation -- the table layout (header row 1, data
+    from row 2, autofilter, freeze panes) is preserved.
+    """
+    resume_col = headers.index("resume_rate_pacing_wait_sec") + 1
+    pause_col = headers.index("pause_rate_pacing_wait_sec") + 1
+    ws.cell(header_row, resume_col).comment = Comment(
+        "PRE-lease: excluded from resume_sec + running_slot_held (sandbox paused, no memory demand).",
+        "bench-core",
+    )
+    ws.cell(header_row, pause_col).comment = Comment(
+        "IN-lease: included in pause_sec + running_slot_held (sandbox holds memory until pause confirms).",
+        "bench-core",
+    )
+
+
+def _add_line_chart(
+    ws,
+    title: str,
+    y_title: str,
+    cat_col: int,
+    data_cols: list[int],
+    n_rows: int,
+    anchor: str,
+    *,
+    header_row: int = 1,
+    first_data_row: int = 2,
+) -> None:
+    """Add a LineChart with one series per data column; categories from cat_col.
+
+    n_rows is the number of DATA rows (excluding the header). The header lives
+    at ``header_row``; data occupies ``header_row+1 .. header_row+n_rows``.
+    """
+    if n_rows <= 0:
+        return
+    ch = LineChart()
+    ch.title = title
+    ch.y_axis.title = y_title
+    ch.x_axis.title = ws.cell(header_row, cat_col).value
+    ch.height = 8
+    ch.width = 16
+    for col in data_cols:
+        ref = Reference(ws, min_col=col, min_row=header_row, max_row=header_row + n_rows)
+        ch.add_data(ref, titles_from_data=True)
+    cats = Reference(ws, min_col=cat_col, min_row=first_data_row, max_row=header_row + n_rows)
+    ch.set_categories(cats)
+    ws.add_chart(ch, anchor)
+
+
+def _add_trajectory_cost_chart(ws, headers: list[str], header_row: int, n_traj: int) -> None:
+    """Stacked bar of per-trajectory exec / resume / pause sums (bar height ==
+    slice_total_sum) so the cost-attribution table's "where did each
+    trajectory's wall-clock go" reads at a glance.
+
+    Categories = trajectory_id (col 1); the three series take their titles from
+    the table header (exec_sum_s / resume_sum_s / pause_sum_s) -- located by
+    HEADER NAME so a column reorder never silently breaks the chart. The anchor
+    is COMPUTED from the header count (1-col gap past the table) so adding
+    columns never lands the floating chart on top of data: the old hardcoded
+    "N2" overlapped data once the failure cluster widened the table to 15 cols
+    (col N became a data column)."""
+    if n_traj <= 0:
+        return
+    ch = BarChart()
+    ch.type = "col"
+    ch.grouping = "stacked"
+    ch.overlap = 100
+    ch.title = "Per-trajectory cost decomposition (s)"
+    ch.y_axis.title = "seconds"
+    ch.x_axis.title = "trajectory_id"
+    ch.height = 8
+    ch.width = 16
+    for name in ("exec_median_s", "resume_median_s", "pause_median_s"):
+        col = headers.index(name) + 1
+        ref = Reference(ws, min_col=col, min_row=header_row, max_row=header_row + n_traj)
+        ch.add_data(ref, titles_from_data=True)
+    cats = Reference(ws, min_col=1, min_row=header_row + 1, max_row=header_row + n_traj)
+    ch.set_categories(cats)
+    anchor_col = get_column_letter(len(headers) + 2)
+    ws.add_chart(ch, f"{anchor_col}2")
+
+
+def _pcts_row(label: str, values: list[float]) -> list:
+    """One row: [label, n, min, max, avg, p50, p90, p95, p99] for a latency list."""
+    s = calc_percentiles(values)
+    return [label, len(values), s["min"], s["max"], s["avg"], s["p50"], s["p90"], s["p95"], s["p99"]]
+
+
+def _round_or_none(v, ndigits: int = 3):
+    """Round a series float to ndigits, preserving None/missing as None."""
+    if v is None:
+        return None
+    try:
+        return round(float(v), ndigits)
+    except (TypeError, ValueError):
+        return None
+
+
+# Overview dashboard styling. The metric-name column (col A) gets a light fill
+# so the label stands out from its value, and section banners (Run / Throughput
+# / Admission & QPS / Retry impact) delimit the areas that used to be separate
+# scalar sheets. The three standalone sheets are gone; Overview is the single
+# summary -- duplicating their scalars across two places would be the
+# redundancy the lean-docs rule warns against.
+_OVERVIEW_NAME_FILL = PatternFill(fill_type="solid", fgColor="DDEBF7")
+_OVERVIEW_BANNER_FILL = PatternFill(fill_type="solid", fgColor="2E5496")
+_OVERVIEW_BANNER_FONT = Font(bold=True, color="FFFFFF")
+_OVERVIEW_NAME_FONT = Font(bold=True)
+
+
+def _overview_banner(ws, title: str) -> None:
+    """A filled section-divider row spanning the first 3 columns."""
+    ws.append([title])
+    row = ws.max_row
+    for col in range(1, 4):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = _OVERVIEW_BANNER_FILL
+        cell.font = _OVERVIEW_BANNER_FONT
+
+
+def _overview_kv(ws, name, value) -> None:
+    """A metric row: name (filled + bold col A) | value (col B)."""
+    ws.append([name, value])
+    cell = ws.cell(row=ws.max_row, column=1)
+    cell.fill = _OVERVIEW_NAME_FILL
+    cell.font = _OVERVIEW_NAME_FONT
+
+
+def _overview_subtable(ws, headers: list[str], rows: list[list]) -> None:
+    """A small multi-column sub-table (e.g. the per-operation dispatched/waiting
+    breakdown) inside the Overview dashboard. Header bolded; col A of each data
+    row filled so the data-name column stays visually consistent across the
+    sheet."""
+    bold = Font(bold=True)
+    ws.append(headers)
+    for c in ws[ws.max_row]:
+        c.font = bold
+    for row in rows:
+        ws.append(row)
+        ws.cell(row=ws.max_row, column=1).fill = _OVERVIEW_NAME_FILL
+
+
+class XlsxReportRenderer:
+    """Render a ReplayObservability model to a multi-sheet xlsx workbook."""
+
+    def __init__(
+        self,
+        observability: ReplayObservability,
+        series_path: Path | None = None,
+        host_xlsx: Path | None = None,
+    ) -> None:
+        self.obs = observability
+        self.series_path = series_path
+        self.host_xlsx = host_xlsx
+
+    def render(self, path: str | Path) -> None:
+        """Write the workbook to ``path`` (overwrites). Creates all 8 base sheets.
+
+        Overview is the consolidated summary dashboard (Run / Throughput /
+        Admission & QPS / Retry impact sections); the former standalone scalar
+        sheets were folded into it.
+        """
+        wb = Workbook()
+        # openpyxl seeds one default sheet; remove it after building named sheets.
+        wb.remove(wb.active)
+        self._sheet_overview(wb)
+        self._sheet_per_step_timings(wb)
+        self._sheet_lifecycle_overhead(wb)
+        self._sheet_trajectory_summary(wb)
+        self._sheet_step_detail(wb)
+        self._sheet_concurrency_states(wb)
+        gantt_png = Path(path).parent / f"{Path(path).stem.split('_obs')[0]}_gantt.png"
+        self._sheet_gantt(wb, out_png=gantt_png)
+        self._sheet_snapshot_sizes(wb)
+        # Merge host-level sheets last, in the same write pass -- avoids a second
+        # load/save round-trip that would drop the charts/PNG embedded above.
+        self._sheet_host_merged(wb)
+        wb.save(path)
+
+    # --- sheets ---
+
+    def _sheet_overview(self, wb: Workbook) -> None:
+        """The single summary dashboard.
+
+        Consolidates the former Admission & QPS / Throughput & overcommit /
+        Retry impact scalar sheets into grouped, color-coded sections here, so
+        the whole run reads on one sheet. The metric-name column is filled +
+        bolded to make labels prominent against their values; section banners
+        delimit the areas.
+        """
+        ws = wb.create_sheet("Overview")
+        obs = self.obs
+        cfg = obs.config
+        rcfg = cfg.workflow_config
+        total_success = sum(s.replay_metrics.success_count for s in obs.states.values())
+        total_failed = sum(s.replay_metrics.failed_count for s in obs.states.values())
+        total_timeout = sum(s.replay_metrics.timeout_count for s in obs.states.values())
+        na = "n/a"
+
+        # --- Run (identity + outcome) ---
+        _overview_banner(ws, "Run")
+        for name, value in (
+            ("workflow_type", cfg.workflow_type),
+            ("replay_mode", rcfg.replay_mode),
+            ("total_count", cfg.total_count),
+            ("running_concurrency", rcfg.replay_running_concurrency),
+            ("test_duration", cfg.test_duration),
+            ("wall_sec", obs.wall_sec),
+            ("total_steps", obs.total_steps),
+            ("success", total_success),
+            ("timed_out", total_timeout),
+            ("failed (non-timeout)", total_failed - total_timeout),
+            ("overcommit_ratio", obs.overcommit_ratio),
+        ):
+            _overview_kv(ws, name, value)
+
+        # --- Throughput & overcommit ---
+        ws.append([])
+        _overview_banner(ws, "Throughput & overcommit")
+        for name, value in (
+            ("steps_per_sec", obs.steps_per_sec if obs.steps_per_sec is not None else na),
+            ("effective_parallelism", obs.effective_parallelism if obs.effective_parallelism is not None else na),
+            ("exec_wall_utilization", obs.exec_wall_utilization if obs.exec_wall_utilization is not None else na),
+            ("concurrency", obs.concurrency),
+        ):
+            _overview_kv(ws, name, value)
+        # Lifecycle overhead % (lifecycle only -- exec_only has no
+        # pause/resume; parity with the txt report's [Lifecycle Overhead] block).
+        # The model owns the ratio (semantic metric); this only renders it.
+        if rcfg.replay_mode == "lifecycle":
+            oh = obs.lifecycle_overhead
+            if oh is not None:
+                for name, value in (
+                    ("lifecycle_overhead_aggregate_pct", round(oh["aggregate_pct"], 1)),
+                    ("lifecycle_overhead_mean_pct", round(oh["mean_pct"], 1)),
+                    ("lifecycle_overhead_p95_pct", round(oh["p95_pct"], 1)),
+                ):
+                    _overview_kv(ws, name, value)
+
+        # --- Per-step timing (the 4 phases of each step) ---
+        # exec derived = slice_total - resume - pause; think = natural_delay (LLM).
+        # The duration lists are length-aligned (all appended under slice_total>0
+        # in ReplayMetrics.add), so zip is safe. The Lifecycle overhead sheet
+        # carries resume/pause/slice_total/slot_held/interaction percentiles for
+        # the overhead-ratio lens (slice_total as denominator); this Overview
+        # subtable is the per-step time-decomposition lens the reference's
+        # make_obs_xlsx.py puts in its Overview (exec/think/pause/resume).
+        timing: dict[str, list[float]] = {"exec": [], "think": [], "pause": [], "resume": []}
+        for s in obs.states.values():
+            m = s.replay_metrics
+            if m is None:
+                continue
+            rs, ps, ss = m.resume_secs, m.pause_secs, m.slice_total_secs
+            timing["resume"].extend(rs)
+            timing["pause"].extend(ps)
+            timing["think"].extend(m.natural_delay_secs)
+            timing["exec"].extend(t - r - p for t, r, p in zip(ss, rs, ps))
+        if timing["resume"]:
+            ws.append([])
+            _overview_banner(ws, "Per-step timing")
+            _overview_subtable(
+                ws,
+                ["segment", "n", "min_s", "max_s", "avg_s", "p50_s", "p90_s", "p95_s", "p99_s"],
+                [_pcts_row(k, v) for k, v in timing.items() if v],
+            )
+
+        # --- Admission & QPS (running-slot lease + QPS rate limiter) ---
+        snap = obs.admission_snapshot or {}
+        rs = snap.get("running_slots") or {}
+        ql = snap.get("qps_limiter") or {}
+        if rs or ql:
+            ws.append([])
+            _overview_banner(ws, "Admission & QPS")
+            admission_rows: list[tuple] = []
+            if rs:
+                for k in ("maximum", "active", "peak_active", "granted", "average_queue_wait_sec", "waiting"):
+                    admission_rows.append((f"running_slots.{k}", rs.get(k)))
+            if ql:
+                for k in ("qps", "inflight_cap", "in_flight", "dispatched", "average_wait_sec", "max_wait_sec"):
+                    admission_rows.append((k, ql.get(k)))
+            for name, value in admission_rows:
+                _overview_kv(ws, name, value)
+            # Per-operation dispatched/waiting sub-table (the lifecycle calls
+            # the limiter sees, broken down by resume/pause/create/...).
+            dispatched_by_op = (ql.get("dispatched_by_operation") or {}) if ql else {}
+            waiting_by_op = (ql.get("waiting_by_operation") or {}) if ql else {}
+            if dispatched_by_op or waiting_by_op:
+                ws.append([])
+                _overview_subtable(
+                    ws,
+                    ["operation", "dispatched", "waiting"],
+                    [
+                        [op, dispatched_by_op.get(op, 0), waiting_by_op.get(op, 0)]
+                        for op in sorted(set(dispatched_by_op) | set(waiting_by_op))
+                    ],
+                )
+
+        # --- Retry impact ---
+        ws.append([])
+        _overview_banner(ws, "Retry impact")
+        retry_rows: list[tuple] = [
+            ("retry_count", obs.retry_count),
+            ("time_lost_to_retry_sec", obs.time_lost_to_retry_sec),
+            ("retries_per_slice_p95", obs.retries_per_slice_p95),
+        ]
+        for op, n in obs.retry_count_by_op.items():
+            retry_rows.append((f"retry_queued:{op}", n))
+        for name, value in retry_rows:
+            _overview_kv(ws, name, value)
+
+        # Wide metric names (running_slots.average_queue_wait_sec, retry_queued:*)
+        # need a generous col A to read without truncation.
+        ws.column_dimensions["A"].width = 34
+        ws.column_dimensions["B"].width = 16
+
+    def _sheet_per_step_timings(self, wb: Workbook) -> None:
+        ws = wb.create_sheet("Per-step timings")
+        all_lat: list[float] = []
+        for s in self.obs.states.values():
+            all_lat.extend(s.replay_metrics.latencies)
+        rows = [_pcts_row("latency", all_lat)]
+        # per action_type
+        by_action: dict[str, list[float]] = {}
+        for s in self.obs.states.values():
+            for act, vals in s.replay_metrics.action_type_latencies.items():
+                by_action.setdefault(act, []).extend(vals)
+        for act in sorted(by_action):
+            rows.append(_pcts_row(act, by_action[act]))
+        _write_table(ws, ["bucket", "n", "min_s", "max_s", "avg_s", "p50_s", "p90_s", "p95_s", "p99_s"], rows)
+        # Per-step detail rows (latency per step, concatenated across sandboxes).
+        # Downsampled: openpyxl inlines a numCache for every charted cell at save
+        # time, so an uncapped 150k-point chart makes wb.save explode. The Step
+        # detail sheet keeps every step; the x-axis still uses real step indices.
+        idxs = _downsample_indices(len(all_lat))
+        step_rows = [[i + 1, round(all_lat[i] * 1000, 1)] for i in idxs]
+        if step_rows:
+            ws.append([])
+            ws.append(["step_index", "latency_ms"])
+            hdr = ws.max_row
+            for c in ws[hdr]:
+                c.font = Font(bold=True)
+            for r in step_rows:
+                ws.append(r)
+            # Anchor to the right of the percentile table (cols A-H) so the chart
+            # stays visible without scrolling past the per-step detail rows.
+            _add_line_chart(
+                ws,
+                "Per-step latency",
+                "ms",
+                ws.cell(hdr, 1).column,
+                [ws.cell(hdr, 2).column],
+                len(step_rows),
+                "J2",
+                header_row=hdr,
+                first_data_row=hdr + 1,
+            )
+
+    def _sheet_lifecycle_overhead(self, wb: Workbook) -> None:
+        ws = wb.create_sheet("Lifecycle overhead")
+        obs = self.obs
+        lists = {
+            "resume": [],
+            "pause": [],
+            "slice_total": [],
+            "slot_held": [],
+            "interaction": [],
+        }
+        for s in obs.states.values():
+            m = s.replay_metrics
+            lists["resume"].extend(m.resume_secs)
+            lists["pause"].extend(m.pause_secs)
+            lists["slice_total"].extend(m.slice_total_secs)
+            lists["slot_held"].extend(m.running_slot_held_secs)
+            lists["interaction"].extend(m.interaction_total_secs)
+        rows = [_pcts_row(label, vals) for label, vals in lists.items()]
+        _write_table(ws, ["segment", "n", "min_s", "max_s", "avg_s", "p50_s", "p90_s", "p95_s", "p99_s"], rows)
+        # Per-step detail + line chart (resume/pause/slice ms over step index).
+        n = len(lists["resume"])
+        if n:
+            ws.append([])
+            ws.append(["step_index", "resume_ms", "pause_ms", "slice_ms"])
+            hdr = ws.max_row
+            for c in ws[hdr]:
+                c.font = Font(bold=True)
+            # Same downsampled indices across all three series so the chart's
+            # resume/pause/slice lines stay aligned (see Per-step timings note).
+            idxs = _downsample_indices(n)
+            for i in idxs:
+                ws.append(
+                    [
+                        i + 1,
+                        round(lists["resume"][i] * 1000, 1),
+                        round(lists["pause"][i] * 1000, 1),
+                        round(lists["slice_total"][i] * 1000, 1),
+                    ]
+                )
+            _add_line_chart(
+                ws,
+                "Per-step lifecycle overhead",
+                "ms",
+                1,
+                [2, 3, 4],
+                len(idxs),
+                "J2",
+                header_row=hdr,
+                first_data_row=hdr + 1,
+            )
+
+    def _sheet_trajectory_summary(self, wb: Workbook) -> None:
+        ws = wb.create_sheet("Trajectory summary")
+        obs = self.obs
+        # Per-trajectory aggregate (medians across runs, NOT sums). When pool <
+        # N the round-robin wraps and each trajectory is run by ~N/pool
+        # sandboxes; summing would inflate the breakdown. The headline
+        # elapsed_sec is the success-only median (all_runs median + all_failed
+        # flag when no run succeeded) so short failed runs cannot drag it down.
+        # n_runs/n_success/n_failed are counts OF runs; per-step distributions
+        # live in the Step detail sheet and pooled in the Lifecycle overhead sheet.
+        if self.series_path is not None and Path(self.series_path).exists():
+            from bench_core.observability.lifecycle_series import load_events
+
+            # Two-tier: per-run records (trajectory_summaries) rolled up to a
+            # per-trajectory aggregate (aggregate_trajectories). Medians across
+            # runs, NOT sums -- when pool < N the round-robin wraps and each
+            # trajectory is run by ~N/pool sandboxes; summing would inflate the
+            # breakdown ~7x. A run that failed at create still appears (union-
+            # keyed) so the worst trajectories surface.
+            aggregates = aggregate_trajectories(trajectory_summaries(load_events(Path(self.series_path))))
+            if aggregates:
+                headers = [
+                    "trajectory_id",
+                    "n_runs",
+                    "n_success",
+                    "n_failed",
+                    "success_rate",
+                    "all_failed",
+                    "elapsed_sec",
+                    # Per-run wall decomposition (medians across runs):
+                    # elapsed_sec = create + kill + stress, so the sheet shows
+                    # the total AND where it went without opening the JSONL.
+                    "create_median_s",
+                    "kill_median_s",
+                    "stress_median_s",
+                    "n_steps_median",
+                    "slice_total_median_s",
+                    "exec_median_s",
+                    "resume_median_s",
+                    "pause_median_s",
+                    "interaction_total_median_s",
+                    "slot_contention_wait_median_s",
+                    "natural_delay_median_s",
+                    "capacity_wait_median_s",
+                    "rate_pacing_wait_median_s",
+                    "inflight_wait_median_s",
+                    "resume_rate_pacing_wait_median_s",
+                    "pause_rate_pacing_wait_median_s",
+                    "resume_inflight_wait_median_s",
+                    "pause_inflight_wait_median_s",
+                    "command_rate_pacing_wait_median_s",
+                    "running_slot_held_median_s",
+                    "avg_slice_median_s",
+                    "n_timeout_median",
+                ]
+                sr_idx = headers.index("success_rate")
+                rows = []
+                for a in aggregates:
+                    use_set = a["successful_runs"] or a["all_runs"]
+                    tbs = use_set["time_breakdown_sec"]
+                    rows.append(
+                        [
+                            a["trajectory_id"],
+                            a["n_runs"],
+                            a["n_success"],
+                            a["n_failed"],
+                            a["success_rate"],  # None when no run has steps
+                            a["all_failed"],
+                            round(a["elapsed_sec"], 3),  # success-median (or all-median if all_failed)
+                            round(use_set["create_sec"]["p50"], 3),
+                            round(use_set["kill_sec"]["p50"], 3),
+                            round(use_set["stress_sec"]["p50"], 3),
+                            round(use_set["n_steps"]["p50"], 3),
+                            *(round(tbs[k]["p50"], 3) for k in SEG_KEYS),
+                            round(use_set["avg_slice"]["p50"], 3),
+                            round(use_set["n_timeout"]["p50"], 3),
+                        ]
+                    )
+                header_row = _write_table(ws, headers, rows)
+                _add_trajectory_cost_chart(ws, headers, header_row, len(rows))
+                # At-a-glance outlier highlighting: data bars on the two cost
+                # drivers (total slice + slot queueing -- longer bar = slower /
+                # more queueing) and a red color scale on the failed-run count.
+                # success_rate=None (no run has steps) gets a hover comment so
+                # the blank cell is not mistaken for "0 = all runs failed".
+                first, last = header_row + 1, header_row + len(rows)
+                for ri, row in enumerate(rows, start=first):
+                    if row[sr_idx] is None:
+                        ws.cell(ri, sr_idx + 1).comment = Comment(
+                            "no steps attempted in any run (created/killed with 0 steps); " "0.0 = all runs failed",
+                            "bench-core",
+                        )
+
+                def _col_range(col: int) -> str:
+                    letter = get_column_letter(col)
+                    return f"{letter}{first}:{letter}{last}"
+
+                ws.conditional_formatting.add(
+                    _col_range(headers.index("slice_total_median_s") + 1),
+                    DataBarRule(start_type="min", end_type="max", color="638EC6"),
+                )
+                ws.conditional_formatting.add(
+                    _col_range(headers.index("slot_contention_wait_median_s") + 1),
+                    DataBarRule(start_type="min", end_type="max", color="638EC6"),
+                )
+                ws.conditional_formatting.add(
+                    _col_range(headers.index("n_failed") + 1),
+                    ColorScaleRule(
+                        start_type="num",
+                        start_value=0,
+                        start_color="FFFFFF",
+                        end_type="max",
+                        end_color="FF0000",
+                    ),
+                )
+
+    def _sheet_step_detail(self, wb: Workbook) -> None:
+        """Per-trajectory per-step raw rows -- the detail behind the percentile tables.
+
+        The Per-step timings sheet pools every step (no trajectory_id); the
+        Trajectory summary sheet shows per-trajectory percentiles only. This sheet
+        is the missing middle: one row per recorded step event (success and
+        slice_failed), broken down by trajectory, so each trajectory's per-step
+        resume/exec/pause/slice timings are inspectable directly. Sourced from the
+        series JSONL; empty when there is no series file (e.g. a minimal install).
+
+        Duration columns are seconds (matching the reference step-detail.csv), not
+        the milliseconds used by the Per-step/Lifecycle chart sheets. The
+        sub-segments sit next to their parent total so the sum invariants are
+        visually verifiable. Post-decoupling:
+
+        * ``resume_sec == resume_inflight_wait_sec + resume_api_sec +
+          resume_ready_wait_sec`` -- resume rate-pacing
+          (``resume_rate_pacing_wait_sec``) is PRE-lease, so it is NOT part of
+          ``resume_sec`` (the decoupling: it cannot inflate running_slot_held).
+        * ``pause_sec == pause_rate_pacing_wait_sec + pause_inflight_wait_sec +
+          pause_api_sec`` -- pause rate-pacing is IN-lease (sandbox running
+          until pause confirms), so it IS part of ``pause_sec``.
+        * ``slot_contention_wait_sec == natural_delay_sec + capacity_wait_sec``
+          (the composite; the four-component split is the columns below it).
+        """
+        ws = wb.create_sheet("Step detail")
+        headers = [
+            "trajectory_id",
+            "sandbox_index",
+            "round_id",
+            "step_index",
+            "action_type",
+            # The recorded command text (single-line, <=512 chars from the series
+            # ``_compact_action``). Reading down a trajectory's rows = its executed
+            # command sequence; the full per-step body lives in replay_result.json.
+            "action",
+            "slice_failed",
+            "resume_sec",
+            "resume_rate_pacing_wait_sec",
+            "resume_api_sec",
+            "resume_ready_wait_sec",
+            "exec_sec",
+            "pause_sec",
+            "pause_rate_pacing_wait_sec",
+            "pause_api_sec",
+            "slice_total_sec",
+            "interaction_total_sec",
+            "slot_contention_wait_sec",
+            # Wait-decomposition components (the four independent waits).
+            # slot_contention_wait_sec stays as the natural_delay+capacity_wait
+            # composite; the four below are the split. resume_sec excludes
+            # rate-pacing (pre-lease); pause_sec includes it (in-lease).
+            "natural_delay_sec",
+            "capacity_wait_sec",
+            "rate_pacing_wait_sec",
+            "inflight_wait_sec",
+            "resume_inflight_wait_sec",
+            "pause_inflight_wait_sec",
+            "running_slot_held_sec",
+            "exit_code",
+            "timed_out",
+        ]
+        if self.series_path is None or not Path(self.series_path).exists():
+            _attach_rate_pacing_notes(ws, headers, _write_table(ws, headers, []))
+            return
+        from bench_core.observability.lifecycle_series import load_events
+
+        rows: list[list] = []
+        for ev in load_events(Path(self.series_path)):
+            if ev.get("event") != "step":
+                continue
+            rows.append(
+                [
+                    ev.get("trajectory_id") or "",
+                    ev.get("sandbox_index"),
+                    ev.get("round_id"),
+                    ev.get("step_index"),
+                    ev.get("action_type") or "",
+                    ev.get("action") or "",
+                    bool(ev.get("slice_failed")),
+                    _round_or_none(ev.get("resume_sec")),
+                    _round_or_none(ev.get("resume_rate_pacing_wait_sec")),
+                    _round_or_none(ev.get("resume_api_sec")),
+                    _round_or_none(ev.get("resume_ready_wait_sec")),
+                    _round_or_none(ev.get("exec_sec")),
+                    _round_or_none(ev.get("pause_sec")),
+                    _round_or_none(ev.get("pause_rate_pacing_wait_sec")),
+                    _round_or_none(ev.get("pause_api_sec")),
+                    _round_or_none(ev.get("slice_total_sec")),
+                    _round_or_none(ev.get("interaction_total_sec")),
+                    _round_or_none(ev.get("slot_contention_wait_sec")),
+                    _round_or_none(ev.get("natural_delay_sec")),
+                    _round_or_none(ev.get("capacity_wait_sec")),
+                    _round_or_none(ev.get("rate_pacing_wait_sec")),
+                    _round_or_none(ev.get("inflight_wait_sec")),
+                    _round_or_none(ev.get("resume_inflight_wait_sec")),
+                    _round_or_none(ev.get("pause_inflight_wait_sec")),
+                    _round_or_none(ev.get("running_slot_held_sec")),
+                    ev.get("exit_code"),
+                    bool(ev.get("timed_out")),
+                ]
+            )
+        # Sort by trajectory, then sandbox, then step -- so each trajectory's
+        # steps read top-to-bottom in execution order.
+        rows.sort(key=lambda r: (str(r[0]), r[1] if r[1] is not None else 0, r[3] if r[3] is not None else 0))
+        _attach_rate_pacing_notes(ws, headers, _write_table(ws, headers, rows))
+        if rows:
+            # Freeze the header + enable autofilter so the user can pivot by
+            # trajectory / action_type / exit_code without re-sorting in Excel.
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+
+    def _paused_gaps(self) -> bool:
+        """Whether this run's mode really snapshots (lifecycle).
+
+        The series alone cannot tell: exec_ephemeral emits
+        trajectory_create/kill and its no-op pause/resume still produce
+        microsecond-wide timestamp pairs. Painting its think-time idle
+        "paused" would report N paused / 0 active on a fleet that never
+        snapshotted.
+        """
+        from bench_core.observability.lifecycle_reconstruct import PAUSING_MODES
+
+        workflow = getattr(getattr(self.obs, "config", None), "workflow_config", None)
+        return getattr(workflow, "replay_mode", None) in PAUSING_MODES
+
+    def _sheet_concurrency_states(self, wb: Workbook) -> None:
+        ws = wb.create_sheet("Concurrency states")
+        headers = ["second", "pausing", "paused", "resuming", "exec", "active"]
+        if self.series_path is None or not Path(self.series_path).exists():
+            _write_table(ws, headers, [])
+            return
+        from bench_core.observability.lifecycle_reconstruct import reconstruct_concurrency
+        from bench_core.observability.lifecycle_series import load_events
+
+        bins = reconstruct_concurrency(load_events(Path(self.series_path)), paused_gaps=self._paused_gaps())
+        rows = [[b["second"], b["pausing"], b["paused"], b["resuming"], b["exec"], b["active"]] for b in bins]
+        _write_table(ws, headers, rows)
+        if rows:
+            _add_line_chart(ws, "Tasks per state (dominant each second)", "count", 1, [2, 3, 4, 5, 6], len(rows), "H2")
+
+    def _sheet_gantt(self, wb: Workbook, *, out_png: Path | None = None) -> None:
+        ws = wb.create_sheet("Gantt")
+        ws.append(["Gantt (per-sandbox phase timeline)"])
+        if self.series_path is None or not Path(self.series_path).exists():
+            ws.append(["no series data"])
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            ws.append(["matplotlib not installed; install with 'pip install matplotlib'"])
+            return
+
+        from bench_core.observability.lifecycle_reconstruct import gantt_segments
+        from bench_core.observability.lifecycle_series import load_events
+
+        rows = _cap_gantt_segments(gantt_segments(load_events(Path(self.series_path)), paused_gaps=self._paused_gaps()))
+        if not rows:
+            ws.append(["no step events"])
+            return
+        color = {"pausing": "#d62728", "paused": "#ffd8a8", "resuming": "#9467bd", "exec": "#2ca02c"}
+        n = len(rows)
+        # Cap total height -- without a cap a 768-sandbox fleet yields a ~424 in
+        # figure (explodes memory / renders unreadable). 40 in fits ~70 sandboxes
+        # at 0.55 in/row; larger fleets scale the per-row height down proportionally.
+        fig_h = min(max(8, n * 0.55 + 2), 40)
+        fig, ax = plt.subplots(figsize=(28, fig_h))
+        t0 = min(a for _, segs in rows for a, _, _ in segs)
+        for yi, (name, segs) in enumerate(rows):
+            # Group segments by phase -> one broken_barh (PolyCollection) per phase,
+            # not one Patch per segment. A 1:1/384-sandbox lifecycle run yields
+            # ~600k segments; 600k ax.barh Patches hung the report for 24h.
+            # broken_barh vectorizes the same rectangles into a few collections.
+            by_phase: dict[str, list[tuple[float, float]]] = {ph: [] for ph in color}
+            for a, b, ph in segs:
+                by_phase[ph].append((a - t0, b - a))
+            for ph, xranges in by_phase.items():
+                if xranges:
+                    ax.broken_barh(xranges, (yi - 0.375, 0.75), facecolors=color[ph], edgecolor="none", zorder=3)
+        ax.set_yticks(range(n))
+        ax.set_yticklabels([r[0] for r in rows])
+        # Cramped fleets: shrink the per-row label so 768 rows stay legible.
+        if n > 60:
+            ax.tick_params(axis="y", labelsize=4)
+        ax.set_xlabel("Relative time (s, from earliest event)")
+        ax.invert_yaxis()
+        ax.grid(True, axis="x", linestyle=":", alpha=0.4)
+        ax.legend(
+            [plt.Rectangle((0, 0), 1, 1, fc=c) for c in color.values()],
+            list(color.keys()),
+            loc="upper right",
+        )
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, dpi=130, format="png")
+        png_bytes = buf.getvalue()
+        plt.close(fig)
+        if out_png is not None:
+            out_png.write_bytes(png_bytes)
+        from openpyxl.drawing.image import Image as XLImage
+
+        ws.add_image(XLImage(io.BytesIO(png_bytes)), "A3")
+
+    def _sheet_snapshot_sizes(self, wb: Workbook) -> None:
+        ws = wb.create_sheet("Snapshot sizes")
+        headers = [
+            "pause_seq",
+            "sandbox_index",
+            "sandbox_id",
+            "logical_mb",
+            "disk_mb",
+            "inherited_mb",
+            "cumulative_mb",
+            "generations",
+            "files",
+        ]
+        if self.series_path is None or not Path(self.series_path).exists():
+            _write_table(ws, headers, [])
+            return
+        from bench_core.observability.lifecycle_reconstruct import snapshot_rows
+        from bench_core.observability.lifecycle_series import load_events
+
+        rows = snapshot_rows(load_events(Path(self.series_path)))
+        out = [
+            [
+                r["pause_seq"],
+                r["sandbox_index"],
+                r["sandbox_id"],
+                r["logical_mb"],
+                r["disk_mb"],
+                r["inherited_mb"],
+                r["cumulative_mb"],
+                r["generations"],
+                r["files"],
+            ]
+            for r in rows
+        ]
+        _write_table(ws, headers, out)
+        if out:
+            _add_line_chart(ws, "Snapshot size per pause", "MiB", 1, [4, 5, 7], len(out), "K2")
+
+    def _sheet_host_merged(self, wb: Workbook) -> None:
+        """Copy host-level vm_monitor sheets (cell values) into the workbook.
+
+        Done in the single render pass so the charts/PNG embedded above survive
+        (a post-save ``load_workbook``+``save`` round-trip would drop them).
+        Cell values only -- vm_monitor's own charts stay in its source file.
+        """
+        if self.host_xlsx is None or not Path(self.host_xlsx).exists():
+            return
+        try:
+            from openpyxl import load_workbook
+        except ImportError:  # pragma: no cover - openpyxl is a core dep
+            return
+        try:
+            src = load_workbook(self.host_xlsx, read_only=True)
+        except Exception:
+            # Missing/corrupt host report must never break the obs workbook.
+            return
+        try:
+            for name in _MERGE_SHEETS:
+                if name not in src.sheetnames or name in wb.sheetnames:
+                    continue
+                src_ws = src[name]
+                dst_ws = wb.create_sheet(name)
+                for row in src_ws.iter_rows():
+                    for cell in row:
+                        if cell.value is not None:
+                            dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+        finally:
+            src.close()

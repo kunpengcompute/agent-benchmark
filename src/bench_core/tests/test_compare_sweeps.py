@@ -1,0 +1,684 @@
+"""Unit tests for the oversub cross-architecture compare tool.
+
+Pure helpers in ``bench_core.compare_sweeps`` are module-level so pytest
+imports them directly. The CSVs are synthetic (no live sweep runs): they match
+the driver's ``trajectory-detail.csv`` / ``trial-summary.csv`` contract
+(column names from ``bench_core.oversub.TRAJECTORY_COLUMNS`` /
+``TRIAL_COLUMNS``), so a real sweep's output is consumable unchanged.
+"""
+from __future__ import annotations
+
+import csv
+import math
+from pathlib import Path
+
+import pytest
+import yaml
+
+from bench_core.compare_sweeps import (
+    build_ratio_summary,
+    build_tidy,
+    build_trajectory_delta,
+    check_n_parity,
+    load_manifest,
+    main,
+    run_comparison,
+)
+from bench_core.oversub import TRAJECTORY_COLUMNS, TRIAL_COLUMNS, load_sweep_config
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+# ---- synthetic CSV fixtures -----------------------------------------------
+
+
+def _write_traj(path: Path, rows: list[dict]) -> None:
+    """Write a trajectory-detail.csv; missing fields -> blank (restval)."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=TRAJECTORY_COLUMNS, extrasaction="ignore", restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def _write_trial(path: Path, rows: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS, extrasaction="ignore", restval="")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def _traj_row(mode: str, ratio: int, traj_id: str, elapsed: float) -> dict:
+    """One trajectory-detail row; breakdown cols derived from elapsed so the
+    component heatmaps have non-degenerate data."""
+    return {
+        "mode": mode,
+        "ratio": ratio,
+        "repeat": 1,
+        "trajectory_id": traj_id,
+        "sandbox_index": 0,
+        "n_steps": 3,
+        "n_failed": 0,
+        "n_timeout": 0,
+        "success_rate": 1.0,
+        "elapsed_sec": elapsed,
+        "slice_total_sec": elapsed * 0.9,
+        "exec_sec": elapsed * 0.5,
+        "resume_sec": elapsed * 0.1,
+        "pause_sec": elapsed * 0.1,
+        "requested_delay_sec": elapsed * 0.05,
+        "create_sec": 0.05,
+        "kill_sec": 0.05,
+        # stress window: elapsed - create - kill (the per-run identity).
+        "stress_sec": elapsed - 0.1,
+        "interaction_total_sec": elapsed * 0.8,
+        "slot_contention_wait_sec": elapsed * 0.1,
+        "natural_delay_sec": elapsed * 0.05,
+        "capacity_wait_sec": 0.0,
+        "rate_pacing_wait_sec": 0.0,
+        "inflight_wait_sec": 0.0,
+        "resume_rate_pacing_wait_sec": 0.0,
+        "pause_rate_pacing_wait_sec": 0.0,
+        "resume_inflight_wait_sec": 0.0,
+        "pause_inflight_wait_sec": 0.0,
+        "running_slot_held_sec": elapsed * 0.9,
+        "create_error_type": "",
+        "kill_error_type": "",
+    }
+
+
+def _trial_row(
+    mode: str, ratio: int, *, n: int, wall: float, valid: bool = True, lifecycle_overhead_pct: float | None = 10.0
+) -> dict:
+    return {
+        "mode": mode,
+        "ratio": ratio,
+        "oversubscription_ratio": ratio,
+        "repeat": 1,
+        "running_concurrency": n,
+        "target_count": ratio * n,
+        "total": ratio * n,
+        "succeeded": ratio * n,
+        "failed": 0,
+        "failure_rate": 0.0,
+        "peak_active": n,
+        "granted": n,
+        "avg_queue_wait_sec": 0.0,
+        "control_dispatched": n,
+        "test_duration": 600,
+        "wall_sec": wall,
+        "tasks_per_sec": (ratio * n) / wall if wall else 0.0,
+        "steps_per_sec": 0.01,
+        "lifecycle_overhead_pct": lifecycle_overhead_pct,
+        "return_code": 0 if valid else 1,
+        "valid": valid,
+        "reused": False,
+        "started_at": "",
+        "completed_at": "",
+        "error": "",
+        "trial_dir": "",
+        "run_summary_path": "",
+    }
+
+
+def _seed_series(
+    root: Path,
+    *,
+    ratios: list[int],
+    elapsed: dict[tuple[int, str], float],
+    n: int = 384,
+    valid: bool = True,
+    mode: str = "lifecycle",
+) -> Path:
+    """Write a series dir with trajectory-detail.csv + trial-summary.csv.
+
+    elapsed: {(ratio, trajectory_id): seconds}. trial wall_sec = the per-ratio
+    max elapsed (any positive number; the trial-derived metrics are not the
+    focus of the assertion math, just non-degenerate). exec_only mirrors the
+    real driver: it emits no lifecycle_overhead, so the cell is empty -> pandas
+    NaN, and the lifecycle-overhead chart self-skips on an exec_only comparison.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    traj_rows = [_traj_row(mode, r, t, e) for (r, t), e in elapsed.items()]
+    _write_traj(root / "trajectory-detail.csv", traj_rows)
+    wall = {r: max((e for (rr, _), e in elapsed.items() if rr == r), default=10.0) for r in ratios}
+    overhead = None if mode == "exec_only" else 10.0
+    trial_rows = [_trial_row(mode, r, n=n, wall=wall[r], valid=valid, lifecycle_overhead_pct=overhead) for r in ratios]
+    _write_trial(root / "trial-summary.csv", trial_rows)
+    return root
+
+
+# ---- manifest load --------------------------------------------------------
+
+
+def test_load_manifest_valid(tmp_path):
+    arm = _seed_series(
+        tmp_path / "arm", ratios=[1, 2], elapsed={(1, "t0"): 2.0, (1, "t1"): 4.0, (2, "t0"): 4.0, (2, "t1"): 8.0}
+    )
+    x86 = _seed_series(
+        tmp_path / "x86", ratios=[1, 2], elapsed={(1, "t0"): 1.0, (1, "t1"): 2.0, (2, "t0"): 2.0, (2, "t1"): 4.0}
+    )
+    m_path = tmp_path / "m.yaml"
+    m_path.write_text(
+        yaml.safe_dump(
+            {
+                "baseline_series": "arm",
+                "series": [
+                    {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {"l3_mb": 256}},
+                    {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {"freq_ghz": 3.0, "l3_mb": 64}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    m = load_manifest(m_path)
+    assert m["baseline_series"] == "arm"
+    assert [s["label"] for s in m["series"]] == ["arm", "x86"]
+    assert m["series"][0]["caps"] == {"l3_mb": 256}
+
+
+def test_load_manifest_rejects_unknown_key(tmp_path):
+    m_path = tmp_path / "m.yaml"
+    m_path.write_text(
+        yaml.safe_dump({"baseline_series": "a", "serie": []}),  # typo
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown manifest key"):
+        load_manifest(m_path)
+
+
+def test_load_manifest_rejects_unknown_baseline(tmp_path):
+    m_path = tmp_path / "m.yaml"
+    m_path.write_text(
+        yaml.safe_dump({"baseline_series": "ghost", "series": [{"label": "arm", "dir": str(tmp_path)}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="baseline_series"):
+        load_manifest(m_path)
+
+
+def test_load_manifest_rejects_duplicate_label(tmp_path):
+    m_path = tmp_path / "m.yaml"
+    m_path.write_text(
+        yaml.safe_dump(
+            {
+                "baseline_series": "arm",
+                "series": [
+                    {"label": "arm", "dir": str(tmp_path)},
+                    {"label": "arm", "dir": str(tmp_path)},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate series label"):
+        load_manifest(m_path)
+
+
+def test_shipped_lifecycle_1to6_sweep_config_loads():
+    """lifecycle-1to6.yaml must load via the sweep-config known-keys check
+    (every key must be a real oversub-bench knob, not a manifest key)."""
+    cfg = load_sweep_config(REPO / "config" / "oversub" / "lifecycle-1to6.yaml")
+    assert cfg["base_config"] == "config/common/replay.yaml"
+    assert cfg["ratios"] == [1, 2, 3, 4, 5, 6]
+    assert cfg["modes"] == ["lifecycle"]
+    assert cfg["running_concurrency"] == 384  # pinned so both archs share N
+    assert cfg["repeats"] == 3
+
+
+def test_shipped_compare_manifest_loads():
+    """The shipped manifest template loads structurally (paths resolve even
+    though the dirs do not exist on disk -- load_manifest does not stat them)."""
+    m = load_manifest(REPO / "config" / "oversub" / "compare-manifest.yaml")
+    assert m["baseline_series"] == "arm-ampere"
+    labels = [s["label"] for s in m["series"]]
+    assert "arm-ampere" in labels and "x86-base" in labels
+
+
+# ---- tidy + ratio summary -------------------------------------------------
+
+
+def _two_series(tmp_path, *, x86_n: int = 384):
+    """arm baseline (slower) + x86 (faster, degrades worse). Clean numbers."""
+    arm = _seed_series(
+        tmp_path / "arm",
+        ratios=[1, 2],
+        elapsed={(1, "t0"): 2.0, (1, "t1"): 4.0, (2, "t0"): 4.0, (2, "t1"): 8.0},  # medians 3.0, 6.0
+    )
+    x86 = _seed_series(
+        tmp_path / "x86",
+        ratios=[1, 2],
+        n=x86_n,
+        elapsed={(1, "t0"): 1.0, (1, "t1"): 2.0, (2, "t0"): 3.0, (2, "t1"): 5.0},  # medians 1.5, 4.0
+    )
+    return {
+        "baseline_series": "arm",
+        "series": [
+            {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {"l3_mb": 256}},
+            {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {"freq_ghz": 3.0, "l3_mb": 64}},
+        ],
+    }
+
+
+def test_build_tidy_shape_and_caps(tmp_path):
+    manifest = _two_series(tmp_path)
+    from bench_core.compare_sweeps import _read_series_tables
+
+    tables = _read_series_tables(manifest)
+    tidy = build_tidy(manifest, tables)
+    # 2 series * 2 ratios * 2 trajectories * 21 metrics (20 CSV cols + the
+    # derived cmd_exec_sec) = 168 rows.
+    assert len(tidy) == 2 * 2 * 2 * 21
+    # caps exploded to columns (union: freq_ghz, l3_mb); arm lacks freq_ghz -> NaN.
+    assert {"series", "arch", "l3_mb", "freq_ghz", "mode", "ratio", "trajectory_id", "metric", "value"} <= set(
+        tidy.columns
+    )
+    arm_rows = tidy[tidy["series"] == "arm"]
+    assert arm_rows["l3_mb"].iloc[0] == 256
+    assert arm_rows["freq_ghz"].isna().all()
+
+
+def test_build_tidy_old_csv_without_stress_col(tmp_path):
+    """Backward compat through the CLI path: a trajectory-detail.csv written
+    before stress_sec (or any later-added metric column) existed must pass
+    _read_series_tables' contract check AND melt without KeyError -- optional
+    columns are simply absent from tidy, so old sweep dirs stay comparable.
+    The fixture mirrors a real pre-stress_sec sweep dir: every other contract
+    column present, only stress_sec missing."""
+    old_cols = [c for c in TRAJECTORY_COLUMNS if c != "stress_sec"]
+    with open(tmp_path / "trajectory-detail.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=old_cols, extrasaction="ignore", restval="")
+        w.writeheader()
+        w.writerow(_traj_row("lifecycle", 1, "t0", 2.0))
+    _write_trial(tmp_path / "trial-summary.csv", [{"mode": "lifecycle", "ratio": 1, "repeat": 1}])
+    manifest = {
+        "baseline_series": "old",
+        "series": [{"label": "old", "arch": "", "dir": str(tmp_path), "caps": {}}],
+    }
+    from bench_core.compare_sweeps import TRAJECTORY_METRIC_COLS, _read_series_tables
+
+    tables = _read_series_tables(manifest)  # must not reject the old CSV
+    tidy = build_tidy(manifest, tables)
+    # cmd_exec_sec is derived (exec_sec + n_steps are contract cols), so it is
+    # present even in an old CSV; only the optional stress_sec is absent.
+    expected_metrics = {c for c in TRAJECTORY_METRIC_COLS if c != "stress_sec"} | {"cmd_exec_sec"}
+    assert set(tidy["metric"]) == expected_metrics
+    assert len(tidy) == len(expected_metrics)  # one traj row x present metrics
+
+
+def test_read_series_tables_still_requires_core_metric_cols(tmp_path):
+    """The OPTIONAL_METRIC_COLS exemption is narrow: a CSV missing a core
+    metric (elapsed_sec) still fails the contract check loudly."""
+    (tmp_path / "trajectory-detail.csv").write_text(
+        "mode,ratio,repeat,trajectory_id,exec_sec\nlifecycle,1,1,t0,1.0\n", encoding="utf-8"
+    )
+    (tmp_path / "trial-summary.csv").write_text("mode,ratio,repeat\nlifecycle,1,1\n", encoding="utf-8")
+    manifest = {
+        "baseline_series": "bad",
+        "series": [{"label": "bad", "arch": "", "dir": str(tmp_path), "caps": {}}],
+    }
+    from bench_core.compare_sweeps import _read_series_tables
+
+    with pytest.raises(ValueError, match="elapsed_sec"):
+        _read_series_tables(manifest)
+
+
+def test_build_ratio_summary_medians_and_deltas(tmp_path):
+    manifest = _two_series(tmp_path)
+    from bench_core.compare_sweeps import _read_series_tables
+
+    tables = _read_series_tables(manifest)
+    tidy = build_tidy(manifest, tables)
+    rs = build_ratio_summary(tidy, tables, manifest)
+
+    def get(series, ratio, metric):
+        row = rs[(rs["series"] == series) & (rs["ratio"] == ratio) & (rs["metric"] == metric)]
+        assert len(row) == 1, f"expected one row for {series}/{ratio}/{metric}, got {len(row)}"
+        return row.iloc[0]
+
+    # Trajectory-derived medians.
+    assert get("arm", 1, "elapsed_sec")["median_sec"] == 3.0
+    assert get("arm", 2, "elapsed_sec")["median_sec"] == 6.0
+    assert get("x86", 1, "elapsed_sec")["median_sec"] == 1.5
+    assert get("x86", 2, "elapsed_sec")["median_sec"] == 4.0
+
+    # delta vs baseline (arm).
+    r = get("x86", 1, "elapsed_sec")
+    assert r["delta_vs_baseline_sec"] == pytest.approx(1.5 - 3.0)
+    assert r["pct_delta_vs_baseline"] == pytest.approx((1.5 - 3.0) / 3.0 * 100)
+    # arm's own delta vs baseline is 0.
+    assert get("arm", 1, "elapsed_sec")["delta_vs_baseline_sec"] == 0.0
+
+    # within-series degradation vs k=1.
+    assert get("arm", 1, "elapsed_sec")["degradation_vs_ratio1_pct"] == 0.0  # k=1 by definition
+    assert get("arm", 2, "elapsed_sec")["degradation_vs_ratio1_pct"] == pytest.approx((6.0 - 3.0) / 3.0 * 100)
+    assert get("x86", 2, "elapsed_sec")["degradation_vs_ratio1_pct"] == pytest.approx(round((4.0 - 1.5) / 1.5 * 100, 3))
+    # x86 degrades worse (~167%) than arm (100%) -- the cross-arch insight.
+    assert (
+        get("x86", 2, "elapsed_sec")["degradation_vs_ratio1_pct"]
+        > get("arm", 2, "elapsed_sec")["degradation_vs_ratio1_pct"]
+    )
+
+
+def test_build_ratio_summary_no_k1_blanks_degradation(tmp_path):
+    """A series with no k=1 trial -> degradation blank, not a crash."""
+    arm = _seed_series(tmp_path / "arm", ratios=[1, 2], elapsed={(1, "t0"): 2.0, (2, "t0"): 4.0})
+    x86 = _seed_series(tmp_path / "x86", ratios=[2], elapsed={(2, "t0"): 3.0})  # no k=1
+    manifest = {
+        "baseline_series": "arm",
+        "series": [
+            {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {}},
+            {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {}},
+        ],
+    }
+    from bench_core.compare_sweeps import _read_series_tables
+
+    tables = _read_series_tables(manifest)
+    tidy = build_tidy(manifest, tables)
+    rs = build_ratio_summary(tidy, tables, manifest)
+    row = rs[(rs["series"] == "x86") & (rs["ratio"] == 2) & (rs["metric"] == "elapsed_sec")].iloc[0]
+    # No k=1 baseline for x86 -> degradation is NaN (not a crash, not 0).
+    import math
+
+    assert math.isnan(row["degradation_vs_ratio1_pct"])
+
+
+# ---- per-trajectory delta -------------------------------------------------
+
+
+def test_build_trajectory_delta_aligned_and_orphan(tmp_path):
+    """t0 aligns across series; t1 is an orphan (present in arm, absent in x86)
+    -> x86 columns blank + delta NaN."""
+    arm = _seed_series(
+        tmp_path / "arm",
+        ratios=[1],
+        elapsed={(1, "t0"): 2.0, (1, "t1"): 5.0},
+    )
+    x86 = _seed_series(
+        tmp_path / "x86",
+        ratios=[1],
+        elapsed={(1, "t0"): 1.5},  # no t1
+    )
+    manifest = {
+        "baseline_series": "arm",
+        "series": [
+            {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {}},
+            {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {}},
+        ],
+    }
+    from bench_core.compare_sweeps import _read_series_tables
+
+    tables = _read_series_tables(manifest)
+    td = build_trajectory_delta(tables, manifest)
+    by_id = {r["trajectory_id"]: r for _, r in td.iterrows()}
+    # t0 aligns: arm=2.0, x86=1.5, delta=-0.5.
+    assert by_id["t0"]["elapsed_sec_baseline"] == 2.0
+    assert by_id["t0"]["elapsed_sec__x86"] == 1.5
+    assert by_id["t0"]["delta_sec__x86"] == pytest.approx(-0.5)
+    # t1 orphan: arm has it (5.0), x86 blank -> delta NaN.
+    assert by_id["t1"]["elapsed_sec_baseline"] == 5.0
+    assert pd_isna(by_id["t1"]["elapsed_sec__x86"])
+    assert pd_isna(by_id["t1"]["delta_sec__x86"])
+
+
+def test_build_trajectory_delta_collapses_per_run_rows(tmp_path):
+    """Post-#197 trajectory-detail.csv has multiple per-run rows per tid (one per
+    sandbox/round). build_trajectory_delta must collapse them to ONE row per tid
+    via median elapsed_sec -- without the per-tid groupby the left join on a
+    non-unique key explodes into a cartesian product (n_runs x n_runs per tid)."""
+    arm = _seed_series(
+        tmp_path / "arm",
+        ratios=[1],
+        elapsed={(1, "t0"): 2.0, (1, "t1"): 5.0},
+    )
+    # Overwrite arm's trajectory-detail.csv with two per-run rows per tid: the
+    # median of [2.0, 4.0] is 3.0 for t0; [5.0, 7.0] -> 6.0 for t1.
+    arm_rows = [
+        _traj_row("lifecycle", 1, "t0", 2.0) | {"sandbox_index": 0, "round_id": 0},
+        _traj_row("lifecycle", 1, "t0", 4.0) | {"sandbox_index": 1, "round_id": 0},
+        _traj_row("lifecycle", 1, "t1", 5.0) | {"sandbox_index": 0, "round_id": 0},
+        _traj_row("lifecycle", 1, "t1", 7.0) | {"sandbox_index": 1, "round_id": 0},
+    ]
+    _write_traj(arm / "trajectory-detail.csv", arm_rows)
+    x86 = _seed_series(
+        tmp_path / "x86",
+        ratios=[1],
+        elapsed={(1, "t0"): 1.5, (1, "t1"): 3.0},
+    )
+    manifest = {
+        "baseline_series": "arm",
+        "series": [
+            {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {}},
+            {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {}},
+        ],
+    }
+    from bench_core.compare_sweeps import _read_series_tables
+
+    tables = _read_series_tables(manifest)
+    td = build_trajectory_delta(tables, manifest)
+    # One row per (mode, ratio, trajectory_id) -- no cartesian explosion.
+    by_id = {r["trajectory_id"]: r for _, r in td.iterrows()}
+    assert sorted(by_id) == ["t0", "t1"]
+    # arm collapsed to median across its 2 runs: t0=3.0, t1=6.0.
+    assert by_id["t0"]["elapsed_sec_baseline"] == pytest.approx(3.0)
+    assert by_id["t1"]["elapsed_sec_baseline"] == pytest.approx(6.0)
+    # x86 (1 run) unchanged: t0=1.5 -> delta -1.5.
+    assert by_id["t0"]["elapsed_sec__x86"] == pytest.approx(1.5)
+    assert by_id["t0"]["delta_sec__x86"] == pytest.approx(-1.5)
+
+
+def pd_isna(v) -> bool:
+    import pandas as pd
+
+    return bool(pd.isna(v))
+
+
+# ---- N-parity -------------------------------------------------------------
+
+
+def test_check_n_parity_matched(tmp_path):
+    manifest = _two_series(tmp_path, x86_n=384)
+    from bench_core.compare_sweeps import _read_series_tables
+
+    ok, warns = check_n_parity(_read_series_tables(manifest))
+    assert ok is True
+    assert all("MISMATCH" not in w for w in warns)
+
+
+def test_check_n_parity_mismatched(tmp_path):
+    manifest = _two_series(tmp_path, x86_n=200)  # different N -> mismatch
+    from bench_core.compare_sweeps import _read_series_tables
+
+    ok, warns = check_n_parity(_read_series_tables(manifest))
+    assert ok is False
+    assert any("not comparable" in w for w in warns)
+
+
+# ---- end-to-end run -------------------------------------------------------
+
+
+def test_run_comparison_writes_outputs(tmp_path):
+    manifest = _two_series(tmp_path)
+    out = tmp_path / "out"
+    rc = run_comparison(manifest, out)
+    assert rc == 0
+    assert (out / "comparison-tidy.csv").exists()
+    assert (out / "comparison-ratio-summary.csv").exists()
+    assert (out / "comparison-trajectory-delta.csv").exists()
+    assert (out / "comparison-cross-ratio-trajectory.csv").exists()
+    assert (out / "comparison.xlsx").exists()
+    # xlsx has the 5 sheets + LineChart on Per-ratio + ColorScale on heatmaps.
+    from openpyxl import load_workbook
+
+    wb = load_workbook(out / "comparison.xlsx")
+    assert wb.sheetnames == [
+        "Overview",
+        "Per-ratio",
+        "Component heatmaps",
+        "Per-trajectory delta",
+        "Cross-ratio per-traj",
+    ]
+    # >= 3 charts on Per-ratio for a lifecycle comparison: absolute e2e +
+    # degradation + lifecycle_overhead_pct (Block 3) + per-series task-time
+    # degradation stat blocks (Block 4).
+    assert len(wb["Per-ratio"]._charts) >= 3
+    assert len(wb["Component heatmaps"]._charts) == 0  # heatmaps are conditional fmt, not charts
+    assert len(list(wb["Component heatmaps"].conditional_formatting)) >= 1
+    # Component set is exec/resume/pause/wait only -- create/kill are not
+    # per-trajectory in lifecycle/exec_only (flat zeros), so they're omitted.
+    hm_cells = [str(c.value) for row in wb["Component heatmaps"].iter_rows() for c in row if c.value]
+    for comp in ("exec_sec", "resume_sec", "pause_sec", "slot_contention_wait_sec"):
+        assert any(c.startswith(comp) for c in hm_cells), f"{comp} heatmap missing"
+    assert not any("create_sec" in c or "kill_sec" in c for c in hm_cells), "create/kill must not be heatmapped"
+
+
+def test_per_ratio_lifecycle_overhead_chart_skips_for_exec_only(tmp_path):
+    """exec_only emits no lifecycle_overhead (cells NaN), so Block 3 self-skips
+    -- the Per-ratio sheet carries only the absolute + degradation charts, and
+    no "Lifecycle overhead" banner row. Mirrors the real driver, which leaves
+    the cell empty when the kernel reports no lifecycle_overhead."""
+    arm = _seed_series(tmp_path / "arm", ratios=[1, 2], mode="exec_only", elapsed={(1, "t0"): 2.0, (2, "t0"): 4.0})
+    x86 = _seed_series(tmp_path / "x86", ratios=[1, 2], mode="exec_only", elapsed={(1, "t0"): 1.0, (2, "t0"): 2.0})
+    manifest = {
+        "baseline_series": "arm",
+        "series": [
+            {"label": "arm", "arch": "arm", "dir": str(arm), "caps": {}},
+            {"label": "x86", "arch": "x86", "dir": str(x86), "caps": {}},
+        ],
+    }
+    out = tmp_path / "out"
+    assert run_comparison(manifest, out) == 0
+    from openpyxl import load_workbook
+
+    ws = load_workbook(out / "comparison.xlsx")["Per-ratio"]
+    # absolute + degradation + one task-time stat-degradation chart per series
+    # (Block 4, 2 series); no lifecycle-overhead chart.
+    assert len(ws._charts) == 4
+    banners = [c.value for row in ws.iter_rows() for c in row if isinstance(c.value, str)]
+    assert not any("Lifecycle overhead" in b for b in banners)
+
+
+def test_run_comparison_refuses_mismatched_n(tmp_path):
+    manifest = _two_series(tmp_path, x86_n=200)
+    rc = run_comparison(manifest, tmp_path / "out")
+    assert rc == 2  # refused
+    # --allow-mismatched-n bypasses the gate (exposed via run_comparison kwarg).
+    rc2 = run_comparison(manifest, tmp_path / "out2", allow_mismatched_n=True)
+    assert rc2 == 0
+    assert (tmp_path / "out2" / "comparison.xlsx").exists()
+
+
+def test_main_shorthand_arm_x86(tmp_path):
+    """--arm/--x86 shorthand synthesizes a 2-series manifest (arm baseline)."""
+    _seed_series(tmp_path / "arm", ratios=[1], elapsed={(1, "t0"): 2.0})
+    _seed_series(tmp_path / "x86", ratios=[1], elapsed={(1, "t0"): 1.0})
+    out = tmp_path / "out"
+    rc = main(["--arm", str(tmp_path / "arm"), "--x86", str(tmp_path / "x86"), "--output-dir", str(out)])
+    assert rc == 0
+    assert (out / "comparison.xlsx").exists()
+
+
+def test_main_needs_manifest_or_arm_x86(tmp_path):
+    assert main([]) == 2
+
+
+# ---- stat pack (p50/p90/p99/avg) + per-stat degradation -------------------
+
+
+def _single_series(root: Path) -> dict:
+    return {"baseline_series": "s", "series": [{"label": "s", "arch": "", "dir": str(root), "caps": {}}]}
+
+
+def test_ratio_summary_stat_pack_and_per_stat_degradation(tmp_path):
+    from bench_core.compare_sweeps import _read_series_tables
+
+    root = _seed_series(tmp_path / "s", ratios=[1, 2], elapsed={(1, "t0"): 2.0, (2, "t0"): 5.0})
+    manifest = _single_series(root)
+    tables = _read_series_tables(manifest)
+    rs = build_ratio_summary(build_tidy(manifest, tables), tables, manifest)
+
+    e2 = rs[rs["metric"] == "elapsed_sec"]
+    r1 = e2[e2["ratio"] == 1].iloc[0]
+    r2 = e2[e2["ratio"] == 2].iloc[0]
+    # One run per ratio: every stat collapses to the value itself.
+    assert r1["median_sec"] == r1["p90_sec"] == r1["p99_sec"] == r1["avg_sec"] == 2.0
+    assert r2["p90_sec"] == r2["p99_sec"] == r2["avg_sec"] == 5.0
+    # (5-2)/2*100 = 150% for every stat; ratio-1 rows are 0 by definition.
+    for col in ("degradation_vs_ratio1_pct", "deg_p90_vs_ratio1_pct", "deg_p99_vs_ratio1_pct", "deg_avg_vs_ratio1_pct"):
+        assert r2[col] == pytest.approx(150.0), col
+        assert r1[col] == 0.0, col
+    # Trial-only metric: median present, stat pack + its degradations NaN.
+    wall = rs[(rs["metric"] == "wall_sec") & (rs["ratio"] == 2)].iloc[0]
+    assert not math.isnan(wall["median_sec"])
+    for col in ("p90_sec", "p99_sec", "avg_sec", "deg_p90_vs_ratio1_pct"):
+        assert math.isnan(wall[col]), col
+
+
+def test_cmd_exec_sec_derived_metric(tmp_path):
+    """cmd_exec_sec = exec_sec/n_steps; failed runs and zero-step runs -> NaN
+    (excluded from every downstream stat, never a ZeroDivisionError)."""
+    from bench_core.compare_sweeps import _read_series_tables
+
+    good = _traj_row("lifecycle", 1, "t0", 3.0)  # exec 1.5 / 3 steps = 0.5
+    failed = _traj_row("lifecycle", 1, "t1", 3.0)
+    failed["n_failed"] = 1
+    zero = _traj_row("lifecycle", 1, "t2", 3.0)
+    zero["n_steps"] = 0
+    _write_traj(tmp_path / "trajectory-detail.csv", [good, failed, zero])
+    _write_trial(tmp_path / "trial-summary.csv", [_trial_row("lifecycle", 1, n=3, wall=10.0)])
+    manifest = _single_series(tmp_path)
+    tables = _read_series_tables(manifest)
+    tidy = build_tidy(manifest, tables)
+    cmd = tidy[tidy["metric"] == "cmd_exec_sec"].set_index("trajectory_id")["value"]
+    assert cmd["t0"] == pytest.approx(0.5)
+    assert math.isnan(cmd["t1"])
+    assert math.isnan(cmd["t2"])
+
+
+def test_cross_ratio_trajectory_same_tid_degradation(tmp_path):
+    """Same-trajectory cross-ratio: per (mode, tid, ratio) median elapsed +
+    degradation vs the SAME trajectory's ratio-1 median; a tid missing at
+    ratio 1 -> NaN degradation, no crash."""
+    from bench_core.compare_sweeps import _read_series_tables, build_cross_ratio_trajectory
+
+    root = _seed_series(
+        tmp_path / "s",
+        ratios=[1, 2],
+        elapsed={(1, "t0"): 2.0, (2, "t0"): 5.0, (1, "t1"): 4.0, (2, "t1"): 4.0, (2, "t2"): 9.0},
+    )
+    manifest = _single_series(root)
+    tables = _read_series_tables(manifest)
+    cr = build_cross_ratio_trajectory(tables, manifest)
+
+    t0k2 = cr[(cr["trajectory_id"] == "t0") & (cr["ratio"] == 2)].iloc[0]
+    assert t0k2["elapsed_sec_median"] == 5.0
+    assert t0k2["elapsed_sec_k1"] == 2.0
+    assert t0k2["degradation_vs_ratio1_pct"] == pytest.approx(150.0)
+    t0k1 = cr[(cr["trajectory_id"] == "t0") & (cr["ratio"] == 1)].iloc[0]
+    assert t0k1["degradation_vs_ratio1_pct"] == 0.0
+    t1k2 = cr[(cr["trajectory_id"] == "t1") & (cr["ratio"] == 2)].iloc[0]
+    assert t1k2["degradation_vs_ratio1_pct"] == pytest.approx(0.0)  # 4.0 == 4.0
+    t2k2 = cr[(cr["trajectory_id"] == "t2") & (cr["ratio"] == 2)].iloc[0]
+    assert math.isnan(t2k2["elapsed_sec_k1"])
+    assert math.isnan(t2k2["degradation_vs_ratio1_pct"])
+
+
+def test_run_comparison_writes_cross_ratio_outputs(tmp_path):
+    """End-to-end: the cross-ratio CSV + sheet carry the same-tid rows."""
+    root = _seed_series(tmp_path / "s", ratios=[1, 2], elapsed={(1, "t0"): 2.0, (2, "t0"): 5.0})
+    out = tmp_path / "out"
+    assert run_comparison(_single_series(root), out) == 0
+    import pandas as pd
+
+    cr = pd.read_csv(out / "comparison-cross-ratio-trajectory.csv")
+    assert list(cr.columns) == [
+        "series",
+        "mode",
+        "trajectory_id",
+        "ratio",
+        "elapsed_sec_median",
+        "elapsed_sec_k1",
+        "degradation_vs_ratio1_pct",
+    ]
+    assert len(cr) == 2

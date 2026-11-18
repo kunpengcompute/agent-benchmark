@@ -1,0 +1,340 @@
+"""KernelConfig tests (host-agnostic core fields only)."""
+import pytest
+
+from bench_core.config import KernelConfig
+from bench_core.task_runner.browser import BrowserConfig
+from bench_core.task_runner.replay import ReplayConfig
+
+
+def test_defaults():
+    c = KernelConfig()
+    assert c.total_count == 100
+    assert c.detect_existing is False
+    assert c.create_only is False
+    assert c.benchmark_mode == "fixed"
+    assert c.workflow_type == "browser"
+    assert c.test_duration == 600
+
+
+def test_benchmark_count():
+    c = KernelConfig(total_count=100, benchmark_percent=0.5)
+    assert c.benchmark_count == 50
+
+
+def test_benchmark_count_floor_is_one():
+    c = KernelConfig(total_count=1, benchmark_percent=0.0)
+    assert c.benchmark_count == 1
+
+
+def test_validation_rejects_bad_workflow():
+    # V1 reads WORKFLOW_REGISTRY (populated by the task_runner imports above);
+    # an unknown workflow_type is rejected.
+    with pytest.raises(ValueError):
+        KernelConfig(workflow_type="bogus").validate()
+
+
+def test_validation_rejects_bad_round_size():
+    with pytest.raises(ValueError):
+        KernelConfig(round_size=0).validate()
+
+
+def test_create_batch_count_concurrent_when_unset():
+    assert KernelConfig().create_batch_count == 1
+
+
+def test_create_batch_count_rounds_up():
+    c = KernelConfig(total_count=10, create_batch_size=3)
+    assert c.create_batch_count == 4
+
+
+# --- KernelConfig.from_raw: the shared loader (unified YAML schema) ---
+# Mirrors the nested->flat mapping the e2b/docker Configs used to each carry.
+# This is what load_config calls, so the kernel actually reads create_batch /
+# test / browser / sandbox sections instead of running on defaults.
+
+
+def _unified_raw(**overrides):
+    """A raw dict in the unified schema shape (backend block omitted)."""
+    raw = {
+        "workflow_type": "browser",
+        "sandbox": {"total_count": 100, "detect_existing": False, "create_only": False},
+        "create_batch": {"size": 20, "interval": 3},
+        "task_batch": {"size": 10, "interval": 5},
+        "browser": {
+            "urls": ["http://x/page.html"],
+            "task_timeout": 200,
+            "interval_min": 5,
+            "interval_max": 15,
+            "warmup_urls": ["http://x/w.html"],
+            "warmup_loops": 1,
+            "warmup_delay": 5,
+            "warmup_only": False,
+        },
+        "test": {
+            "duration": 160,
+            "stats_interval": 10,
+            "benchmark_percent": 1.0,
+            "benchmark_mode": "round_robin",
+            "round_size": 5,
+            "round_count": 5,
+            "round_interval": 5,
+        },
+        "report": {"output_dir": "results/common", "filename_prefix": "bench"},
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_from_raw_reads_nested_sections():
+    c = KernelConfig.from_raw(_unified_raw())
+
+    # sandbox -> shared control
+    assert c.total_count == 100
+    assert c.detect_existing is False
+    assert c.create_only is False
+    # create_batch / task_batch
+    assert c.create_batch_size == 20
+    assert c.create_batch_interval == 3
+    assert c.task_batch_size == 10
+    assert c.task_batch_interval == 5
+    # browser (incl warmup) -> BrowserConfig view
+    assert isinstance(c.workflow_config, BrowserConfig)
+    bc = c.workflow_config
+    assert bc.browser_urls == ["http://x/page.html"]
+    assert bc.browser_timeout == 200
+    assert bc.warmup_urls == ["http://x/w.html"]
+    assert bc.warmup_loops == 1
+    # test (incl round-robin)
+    assert c.test_duration == 160
+    assert c.stats_interval == 10
+    assert c.benchmark_mode == "round_robin"
+    assert c.round_size == 5
+    assert c.round_count == 5
+    assert c.round_interval == 5
+    # report
+    assert c.output_dir == "results/common"
+    assert c.filename_prefix == "bench"
+    assert c.workflow_type == "browser"
+
+
+def test_from_raw_missing_sections_use_defaults():
+    # An empty dict (no shared sections) must not raise; every field falls back
+    # to its KernelConfig default, so a backend-only YAML still loads.
+    c = KernelConfig.from_raw({})
+
+    assert c.total_count == 100  # default
+    assert c.create_batch_size is None
+    assert c.test_duration == 600
+    assert c.benchmark_mode == "fixed"
+    assert c.workflow_type == "browser"
+
+
+def test_from_raw_partial_sections_fill_gaps():
+    # Partial sections merge with defaults (only the keys present are applied).
+    raw = {"sandbox": {"total_count": 7}, "test": {"duration": 30}}
+
+    c = KernelConfig.from_raw(raw)
+
+    assert c.total_count == 7
+    assert c.test_duration == 30
+    assert c.detect_existing is False  # default (key absent from sandbox)
+    assert c.benchmark_mode == "fixed"  # default (key absent from test)
+
+
+def test_from_raw_workflow_type_legacy_top_level():
+    # workflow_type may appear top-level OR as workflow.type (legacy); both resolve.
+    assert KernelConfig.from_raw({"workflow_type": "coding"}).workflow_type == "coding"
+    assert KernelConfig.from_raw({"workflow": {"type": "document"}}).workflow_type == "document"
+
+
+def test_from_raw_ignores_backend_block():
+    # Backend sections (e2b: / docker:) are passed through untouched; the kernel
+    # never reads them, so from_raw must not choke on or copy them.
+    raw = _unified_raw(e2b={"template": "t", "numa_bind": 2}, docker={"image": "img"})
+
+    c = KernelConfig.from_raw(raw)
+
+    assert not hasattr(c, "template")
+    assert not hasattr(c, "docker_image")
+
+
+def test_from_raw_replay_section():
+    raw = {
+        "workflow_type": "replay",
+        "replay": {
+            "trajectory_dir": "trajectories/swe",
+            "trajectory_glob": "*.replay.json",
+            "workdir": "/testbed",
+            "env": {"PAGER": "cat"},
+            "action_timeout": 120,
+            "delay_scale": 0.5,
+            "stop_on_error": True,
+            "mode": "exec_only",
+        },
+    }
+    cfg = KernelConfig.from_raw(raw)
+    assert cfg.workflow_type == "replay"
+    assert isinstance(cfg.workflow_config, ReplayConfig)
+    rc = cfg.workflow_config
+    assert rc.replay_trajectory_dir == "trajectories/swe"
+    assert rc.replay_trajectory_glob == "*.replay.json"
+    assert rc.replay_workdir == "/testbed"
+    assert rc.replay_env == {"PAGER": "cat"}
+    assert rc.replay_action_timeout == 120
+    assert rc.replay_delay_scale == 0.5
+    assert rc.replay_stop_on_error is True
+    assert rc.replay_mode == "exec_only"
+    # exec_only normalizes the ready-probe off (Block 8, now on the view).
+    assert rc.replay_ready_probe is False
+
+
+def test_validate_accepts_replay():
+    # Direct construction (no from_raw -> workflow_config stays None); validate()
+    # only checks shared fields + the workflow_type registry set. replay_mode
+    # validation lives on ReplayConfig.validate (exercised via from_raw below).
+    cfg = KernelConfig(workflow_type="replay")
+    cfg.validate()  # must not raise
+
+
+def test_replay_defaults():
+    cfg = KernelConfig.from_raw({"workflow_type": "replay"})
+    assert isinstance(cfg.workflow_config, ReplayConfig)
+    rc = cfg.workflow_config
+    assert rc.replay_trajectory_dir == "trajectories"
+    assert rc.replay_trajectory_glob == "*.replay.json"
+    assert rc.replay_workdir == "/"
+    assert rc.replay_env == {}
+    assert rc.replay_action_timeout == 300
+    assert rc.replay_delay_scale == 1.0
+    assert rc.replay_stop_on_error is False
+    assert rc.replay_mode is None
+
+
+def test_validate_accepts_replay_lifecycle():
+    cfg = KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "lifecycle"}})
+    cfg.validate()  # must not raise
+
+
+def test_validate_accepts_replay_none_sentinel():
+    cfg = KernelConfig.from_raw({"workflow_type": "replay"})
+    assert cfg.workflow_config.replay_mode is None
+    cfg.validate()  # must not raise (None = pre-resolution sentinel)
+
+
+def test_validate_rejects_bad_replay_mode():
+    with pytest.raises(ValueError, match="replay_mode"):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "bogus"}})
+
+
+def test_from_raw_replay_mode_none_when_absent():
+    cfg = KernelConfig.from_raw({"workflow_type": "replay", "replay": {"trajectory_dir": "t"}})
+    assert cfg.workflow_config.replay_mode is None
+
+
+# --- replay lifecycle / exec_ephemeral knobs (P1 Task 2) ---
+
+
+def test_config_defaults_replay_retries_and_pacing():
+    rc = ReplayConfig()
+    assert rc.replay_lifecycle_retries == 2
+    assert rc.replay_launch_interval_sec == 0.0
+    assert rc.replay_pause_duration_sec == 0.0
+
+
+def test_config_validates_lifecycle_mode():
+    cfg = KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "lifecycle"}})
+    cfg.validate()  # must not raise
+
+
+def test_config_rejects_negative_retries():
+    with pytest.raises(ValueError):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"lifecycle_retries": -1}})
+
+
+def test_config_rejects_negative_launch_interval():
+    with pytest.raises(ValueError):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"launch_interval_sec": -0.1}})
+
+
+def test_config_rejects_negative_pause_duration():
+    with pytest.raises(ValueError):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"pause_duration_sec": -0.5}})
+
+
+def test_config_rejects_removed_trajectory_mode():
+    # trajectory was removed as a replay mode; it must now fail validation.
+    with pytest.raises(ValueError, match="replay_mode"):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "trajectory"}})
+
+
+def test_config_from_raw_reads_lifecycle_knobs():
+    raw = {
+        "workflow_type": "replay",
+        "replay": {"mode": "lifecycle", "lifecycle_retries": 5, "launch_interval_sec": 1.5},
+    }
+    cfg = KernelConfig.from_raw(raw)
+    assert isinstance(cfg.workflow_config, ReplayConfig)
+    rc = cfg.workflow_config
+    assert rc.replay_mode == "lifecycle"
+    assert rc.replay_lifecycle_retries == 5
+    assert rc.replay_launch_interval_sec == 1.5
+
+
+# --- exec_ephemeral multiplier (M) + stop-when-done ---
+
+
+def test_stop_when_done_property():
+    """stop_when_done is True iff the triple holds: fixed mode + exec_ephemeral
+    + replay.multiplier set. Any one off -> False. Non-replay workflows are a
+    safe no-op (getattr defaults over a browser config / None)."""
+    on = KernelConfig(
+        workflow_type="replay",
+        benchmark_mode="fixed",
+        workflow_config=ReplayConfig(replay_mode="exec_ephemeral", replay_multiplier=3),
+    )
+    assert on.stop_when_done is True
+
+    # benchmark_mode != fixed
+    off_mode = KernelConfig(
+        workflow_type="replay",
+        benchmark_mode="round_robin",
+        workflow_config=ReplayConfig(replay_mode="exec_ephemeral", replay_multiplier=3),
+    )
+    assert off_mode.stop_when_done is False
+
+    # replay_mode != exec_ephemeral
+    off_replay = KernelConfig(
+        workflow_type="replay",
+        benchmark_mode="fixed",
+        workflow_config=ReplayConfig(replay_mode="lifecycle", replay_multiplier=3),
+    )
+    assert off_replay.stop_when_done is False
+
+    # multiplier unset
+    off_m = KernelConfig(
+        workflow_type="replay",
+        benchmark_mode="fixed",
+        workflow_config=ReplayConfig(replay_mode="exec_ephemeral"),
+    )
+    assert off_m.stop_when_done is False
+
+    # non-replay workflow -> getattr defaults -> False, no crash
+    assert KernelConfig(workflow_type="browser").stop_when_done is False
+
+
+def test_replay_multiplier_validation_rejects_zero():
+    """multiplier < 1 is rejected at validate time (from_raw runs validate)."""
+    with pytest.raises(ValueError, match="replay_multiplier"):
+        KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "exec_ephemeral", "multiplier": 0}})
+
+
+def test_replay_multiplier_ignored_warning(caplog):
+    """multiplier set under a non-exec_ephemeral mode is a warned no-op (the bound
+    lives in the fixed exec_ephemeral branch), not a hard error: constructed fine,
+    multiplier preserved, one WARNING surfaced."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="bench_core.task_runner.replay_config"):
+        cfg = KernelConfig.from_raw({"workflow_type": "replay", "replay": {"mode": "lifecycle", "multiplier": 3}})
+    assert any("replay.multiplier" in r.message and "ignoring" in r.message for r in caplog.records)
+    assert cfg.workflow_config.replay_multiplier == 3

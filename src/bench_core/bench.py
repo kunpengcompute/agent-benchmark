@@ -1,0 +1,861 @@
+"""Host-agnostic benchmark spine (ported from ``e2b_bench.bench.run_benchmark``).
+
+``run_benchmark`` drives any :class:`EnvironmentProvider` through the full
+single-test flow: prepare -> create/detect -> (create-only | warmup-only |
+benchmark) -> stop -> report. The four e2b-specific seams in the original spine
+become provider calls:
+
+  ``setup_e2b_env``           -> ``provider.prepare_env()``
+  ``SandboxManager(...)``      -> injected ``provider``
+  ``detect_from_file`` / file  -> ``provider.detect_from_ids()`` / ``save_ids()``
+  ``kill_all``                 -> ``provider.cleanup_all()``
+
+The wave-based warmup path (e2b's >100-sandbox create-in-waves optimisation) is
+out of scope here: it belongs to the batch scheduler, which is a follow-on phase.
+The kernel creates all sandboxes in one ``provider.create_all()`` call -- a
+provider that needs to batch does so inside that method.
+
+``main()`` is the host-agnostic smoke entry (``--provider fake``); real entries
+live in ``e2b_bench`` / ``docker_bench``, which build their provider and call
+:func:`run_benchmark` directly.
+"""
+from __future__ import annotations
+
+import importlib
+import logging
+import signal
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from bench_core.config import KernelConfig
+from bench_core.observability.lifecycle_series import LifecycleSeriesWriter
+from bench_core.observability.monitor import MonitorController
+from bench_core.observability.snapshot_scanner import SnapshotSizeScanner
+from bench_core.observability.stats_collector import StatsCollector
+from bench_core.task_manager.round_robin import RoundRobinTaskManager
+from bench_core.schemas import BenchSandbox
+from bench_core.task_manager.fixed import TaskManager
+from bench_core.task_runner.coding import CodingConfig
+from bench_core.task_runner.document import DocumentConfig
+from bench_core.task_runner.replay import ReplayConfig
+from bench_core.utils import calc_percentiles, setup_logging
+from env_provider import (
+    CreationMetrics,
+    EnvironmentProvider,
+    EphemeralCapable,
+    LifecycleCapable,
+    SandboxInstance,
+    SandboxStatus,
+    SnapshotSizeCapable,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Roster of provider names -> (submodule, provider class). Single source of
+# truth for the ``--provider`` argparse choices and the capability hint in
+# run_benchmark; construction stays in _build_provider (provider build
+# callables differ, so the dispatch is explicit there). Adding a provider = add
+# an entry here (choices + hint) AND a branch in _build_provider (construction);
+# both touch points are documented in CLAUDE.md "Adding a new provider".
+# Submodules guard their optional SDK imports, so the lazy imports in
+# _capability_hint are side-effect-free without an SDK installed.
+_PROVIDERS: dict[str, tuple[str, str]] = {
+    "fake": ("env_provider.fake", "FakeProvider"),
+    "e2b": ("env_provider.e2b", "E2BProvider"),
+    "docker": ("env_provider.docker", "DockerProvider"),
+    "aenv": ("env_provider.aenv", "AenvProvider"),
+    "aenv-go": ("env_provider.aenv_go", "AenvGoProvider"),
+    "cubesandbox": ("env_provider.cubesandbox", "CubesandboxProvider"),
+}
+
+
+def provider_vmm_type(name: str) -> str | None:
+    """A provider's VMM hint, resolved without constructing it (no SDK needed).
+
+    Same lazy-import trick as :func:`_capability_hint`: provider submodules
+    guard their SDK imports, so reading the class attribute is side-effect-free.
+    A consumer that holds no provider handle -- the oversub driver, which runs
+    the host collector for a whole sharded trial -- needs this to honour
+    ``monitor.vmm: auto`` exactly as the kernel would.
+    """
+    module_path, class_name = _PROVIDERS[name]
+    return getattr(getattr(importlib.import_module(module_path), class_name, None), "vmm_type", None)
+
+
+def _capability_hint(protocol_cls: type) -> str:
+    """Comma-joined ``--provider`` names whose class satisfies ``protocol_cls``.
+
+    Class-level mirror of the ``isinstance(provider, protocol_cls)`` gate in
+    :func:`run_benchmark`: the lifecycle/ephemeral errors list every
+    registered provider implementing the required capability instead of a
+    hardcoded name. Lazy-imports each submodule (their SDK imports are
+    guarded, so this never forces an SDK install) and checks ``issubclass``.
+    """
+    capable: list[str] = []
+    for name, (module_path, class_name) in _PROVIDERS.items():
+        cls = getattr(importlib.import_module(module_path), class_name, None)
+        if isinstance(cls, type) and issubclass(cls, protocol_cls):
+            capable.append(name)
+    return ", ".join(capable) or "none"
+
+
+def _promote(instances: dict[int, SandboxInstance], workflow_type: str) -> dict[int, BenchSandbox]:
+    """Promote each provider :class:`SandboxInstance` to a kernel state.
+
+    The provider returns lean lifecycle instances; the kernel attaches the
+    workflow metrics + runtime counters it reads. ``from_instance`` copies the
+    lifecycle fields generically, so the provider stays unaware of ``BenchSandbox``.
+    """
+    return {i: BenchSandbox.from_instance(s, workflow_type) for i, s in instances.items()}
+
+
+def _make_sigterm_handler(stop_event: threading.Event, sigterm_flag: list[bool] | None = None):
+    """Build a SIGTERM handler that cooperatively unwinds ``run_benchmark``.
+
+    Installs on the MAIN thread only (signal handlers must be registered from
+    the main thread; ``main()`` calls ``run_benchmark`` there). The handler:
+
+      1. sets ``stop_event`` so worker / runner threads wind down during the
+         finally's joins, and
+      2. raises ``KeyboardInterrupt`` so a blocked ``round_robin.run()`` round
+         (which only checks ``stop_event`` at round boundaries) or
+         ``time.sleep(test_duration)`` (which never polls ``stop_event``) unwinds
+         promptly into the ``finally`` partial-flush instead of a hard die.
+
+    ``KeyboardInterrupt`` is a ``BaseException``, so it bypasses the dispatch
+    ``except Exception`` block and propagates straight to the ``finally``.
+
+    ``sigterm_flag`` (a one-element list the handler mutates) lets ``run_benchmark``
+    tell a driver-issued SIGTERM apart from a user Ctrl+C (SIGINT), which also
+    surfaces as ``KeyboardInterrupt`` but does not invoke this handler. The
+    ``finally`` skips sandbox cleanup when the flag is set so the driver's
+    ``--cleanup-between-trials`` reaper owns teardown (and the partial-artifact
+    flush stays fast within the driver's terminate grace); a plain Ctrl+C leaves
+    the flag unset, so the ``finally`` tears down the sandboxes this run created.
+
+    Limitation: cooperative unwinding only happens when SIGTERM is received on
+    the main thread mid-run. A SECOND SIGTERM during the ``finally``
+    partial-flush cannot be cooperatively handled -- the kernel writes each
+    artifact atomically (temp file + ``os.replace``), so a mid-flush kill
+    leaves a previously fully-written artifact intact rather than torn.
+    Completion is not guaranteed under a hard kill; integrity of
+    already-written files is. The bench runs on Linux only; the Windows
+    ``TerminateProcess`` hard-kill path (no handler invocation) is out of scope.
+    """
+
+    def _handler(signum, frame):
+        stop_event.set()
+        if sigterm_flag is not None:
+            sigterm_flag[0] = True
+        raise KeyboardInterrupt
+
+    return _handler
+
+
+def _replay_template_map(config: KernelConfig) -> dict[int, str | None] | None:
+    """Round-robin the pool's distinct templates over total_count slots.
+
+    Returns None when no manifest is configured (legacy single-template path)
+    or when the workflow is not replay. Sandbox k gets ``distinct[k % T]`` --
+    a *balanced* round-robin over the distinct templates (NOT over pool
+    entries), so each template gets ~total_count/T sandboxes at every ratio
+    and the fleet mix is ratio-stable (the precondition for oversub
+    linearity). May be None -> provider uses its default.
+
+    The ``load_pool`` import is function-local to avoid a circular import at
+    module load time (``replay_payload`` imports ``config``, not ``bench``).
+    """
+    if config.workflow_type != "replay":
+        return None
+    cfg = config.workflow_config
+    assert isinstance(cfg, ReplayConfig)
+    if not cfg.replay_template_manifest:
+        return None
+    from bench_core.payload.replay_payload import load_pool, template_fleet
+
+    pool = load_pool(config)
+    if not pool:
+        return None
+    return template_fleet(pool, config.total_count)
+
+
+def _print_header(config: KernelConfig, provider: EnvironmentProvider) -> None:
+    """Print the run configuration banner (host-agnostic)."""
+    lines = ["=" * 80, "Sandbox Bench - Performance Test", "=" * 80]
+    lines.append(f"  Backend:   {provider.name}")
+    lines.append(f"  Workflow:  {config.workflow_type}")
+    if config.detect_existing:
+        lines.append("  Mode:      Detect existing sandboxes")
+    elif config.create_only:
+        lines.append("  Mode:      Create-only (Phase 0)")
+    elif config.warmup_only:
+        lines.append("  Mode:      Warmup-only")
+    else:
+        lines.append("  Mode:      Full workflow")
+    lines.append(f"  Total:     {config.total_count} sandboxes")
+
+    if config.workflow_type == "coding":
+        cfg = config.workflow_config
+        assert isinstance(cfg, CodingConfig)
+        lines.append(f"  Project:   {cfg.coding_project_dir}")
+        lines.append(f"  Language:  {cfg.coding_language}")
+        lines.append(f"  Verify:    {'enabled' if not cfg.coding_skip_verify else 'skipped'}")
+    elif config.workflow_type == "document":
+        cfg = config.workflow_config
+        assert isinstance(cfg, DocumentConfig)
+        lines.append(f"  Case:      {cfg.document_case_kind.upper()}")
+        lines.append(f"  Workspace: {cfg.document_workspace_dir}")
+    elif config.workflow_type == "replay":
+        cfg = config.workflow_config
+        assert isinstance(cfg, ReplayConfig)
+        lines.append(f"  Traj dir:  {cfg.replay_trajectory_dir}")
+        lines.append(f"  Workdir:   {cfg.replay_workdir}")
+        lines.append(f"  Mode:      {cfg.replay_mode}")
+        lines.append(f"  Delay:     {cfg.replay_delay_scale}x")
+    elif config.workflow_type != "browser":
+        raise ValueError(f"Unsupported workflow_type: {config.workflow_type}")
+
+    if config.create_batch_size:
+        lines.append(
+            f"  Create Batch: {config.create_batch_count} x {config.create_batch_size} "
+            f"(interval {config.create_batch_interval}s)"
+        )
+    else:
+        lines.append("  Create Batch: Full concurrent creation")
+    if not config.create_only:
+        if config.task_batch_size:
+            lines.append(
+                f"  Task Batch:   {config.task_batch_count} x {config.task_batch_size} "
+                f"(interval {config.task_batch_interval}s)"
+            )
+        else:
+            lines.append("  Task Batch:   Full concurrent start")
+    lines.append(f"  Duration: {config.test_duration}s")
+
+    if config.benchmark_mode == "round_robin":
+        rounds_label = f"{config.round_count} rounds" if config.round_count else "unlimited"
+        if config.workflow_type == "replay":
+            # In replay a "round" = one trajectory per sandbox (all concurrent);
+            # round_count>1 rotates each sandbox through the pool. A single round
+            # is all-concurrent (no rotation), so the label avoids "round_robin"
+            # jargon inherited from the browser stress model.
+            if config.round_count and config.round_count <= 1:
+                lines.append("  Benchmark Mode: replay (1 trajectory/sandbox, all concurrent)")
+            else:
+                lines.append(
+                    f"  Benchmark Mode: replay round-robin ({rounds_label}, "
+                    f"1 trajectory/sandbox/round, interval {config.round_interval}s)"
+                )
+        else:
+            lines.append(f"  Benchmark Mode: round_robin ({rounds_label}, interval {config.round_interval}s)")
+    else:
+        lines.append("  Benchmark Mode: fixed")
+        if config.benchmark_percent < 1.0:
+            lines.append(
+                f"  Benchmark: {config.benchmark_count}/{config.total_count} "
+                f"({config.benchmark_percent * 100:.0f}%)"
+            )
+    logger.info("\n".join(lines))
+    logger.info("=" * 80)
+
+
+def _percentile_section(title: str, values: list[float], desc: str) -> list[str]:
+    """Build a percentile section; empty when there are no values."""
+    if not values:
+        return []
+    stats = calc_percentiles(values)
+    return [
+        f"\n[{title}]",
+        f"  ({desc})" if desc else "",
+        f"  Min: {stats['min']:.1f}s  Max: {stats['max']:.1f}s  Avg: {stats['avg']:.1f}s",
+        f"  P50: {stats['p50']:.1f}s  P95: {stats['p95']:.1f}s  P99: {stats['p99']:.1f}s",
+    ]
+
+
+def _create_only_report(config: KernelConfig, instances: dict[int, SandboxInstance]) -> str:
+    """Build the creation-timing report for create-only mode.
+
+    Create-only exits before the stats collector starts, so it gets its own
+    compact report (no snapshots, no task metrics). Uses the same
+    :func:`calc_percentiles` helper as the full report.
+    """
+    ready = [s for s in instances.values() if s.creation_metrics.status == SandboxStatus.READY]
+    failed = [s for s in instances.values() if s.creation_metrics.status == SandboxStatus.FAILED]
+    ready_failed = [s for s in instances.values() if s.creation_metrics.status == SandboxStatus.READY_FAILED]
+
+    lines = ["=" * 70, "Creation Timing Report", "=" * 70]
+    lines.append("\n[Sandbox Status]")
+    lines.append(f"  Total:              {len(instances)}")
+    lines.append(f"  Ready:              {len(ready)}")
+    lines.append(f"  Create Failed:      {len(failed)}")
+    lines.append(f"  Ready Check Failed: {len(ready_failed)}")
+    if failed:
+        lines.append(f"  Create Failed IDs:  {[s.index for s in failed[:10]]}")
+    if ready_failed:
+        lines.append(f"  Ready Failed IDs:   {[s.index for s in ready_failed[:10]]}")
+
+    create_times = [
+        s.creation_metrics.create_elapsed
+        for s in instances.values()
+        if s.creation_metrics.create_elapsed > 0
+        and s.creation_metrics.status not in (SandboxStatus.FAILED, SandboxStatus.PENDING, SandboxStatus.CREATING)
+    ]
+    ready_check_times = [
+        s.creation_metrics.ready_check_elapsed for s in ready if s.creation_metrics.ready_check_elapsed > 0
+    ]
+    total_times = [s.creation_metrics.total_elapsed for s in ready if s.creation_metrics.total_elapsed > 0]
+
+    lines.extend(
+        _percentile_section("Sandbox.create Performance", create_times, "create API call time, excluding ready check")
+    )
+    lines.extend(
+        _percentile_section(
+            "Ready Check Wait Performance",
+            ready_check_times,
+            "waiting for readiness (port probe / command / validate)",
+        )
+    )
+    lines.extend(_percentile_section("Total Startup Performance", total_times, "sandbox.create + ready check"))
+    lines.append("\n" + "=" * 70)
+    # Drop blank placeholder lines from empty sections.
+    return "\n".join(line for line in lines if line != "")
+
+
+def run_benchmark(config: KernelConfig, provider: EnvironmentProvider) -> dict[str, Any]:
+    """Run the host-agnostic single-test benchmark flow.
+
+    Args:
+        config: Kernel configuration (host-agnostic fields).
+        provider: The sandbox backend, already constructed.
+
+    Returns:
+        ``{"report": str, "filepath": str | None, "admission_snapshot": dict | None}``,
+        or ``{}`` when no sandboxes reached ready state. ``admission_snapshot`` is
+        the merged running-slot + QPS-limiter snapshot (``None`` outside
+        the lifecycle replay mode).
+    """
+    # Narrow to the typed replay view once (None outside replay). The view is the
+    # source of truth for replay knobs; ``rcfg is not None`` short-circuits every
+    # replay read for non-replay configs (behavior-identical to the old flat-default
+    # None, which never matched a real mode).
+    rcfg: ReplayConfig | None
+    if config.workflow_type == "replay":
+        rcfg = config.workflow_config
+        assert isinstance(rcfg, ReplayConfig), "replay workflow requires a ReplayConfig view"
+    else:
+        rcfg = None
+
+    # Resolve replay_mode sentinel -> provider default before validation.
+    if rcfg is not None and rcfg.replay_mode is None:
+        rcfg.replay_mode = getattr(provider, "default_replay_mode", "exec_only")
+    config.validate()
+    if rcfg is not None and rcfg.replay_mode == "lifecycle":
+        if not isinstance(provider, LifecycleCapable):
+            raise ValueError(
+                f"replay.mode=lifecycle requires a LifecycleCapable provider "
+                f"(pause/resume); provider '{provider.name}' does not support it. "
+                f"Providers that support it: {_capability_hint(LifecycleCapable)}."
+            )
+    if rcfg is not None and rcfg.replay_mode == "exec_ephemeral":
+        if not isinstance(provider, EphemeralCapable):
+            raise ValueError(
+                f"replay.mode={rcfg.replay_mode} requires an EphemeralCapable provider "
+                f"(create_one/kill_one); provider '{provider.name}' does not support it. "
+                f"Providers that support it: {_capability_hint(EphemeralCapable)}."
+            )
+    # exec_only / exec_ephemeral have no lifecycle calls; force the ready probe
+    # off regardless of whether the mode was explicit in YAML or resolved from
+    # the provider default.
+    if rcfg is not None and rcfg.replay_mode in ("exec_only", "exec_ephemeral"):
+        rcfg.replay_ready_probe = False
+    if rcfg is not None:
+        logger.info(f"[Replay] mode={rcfg.replay_mode} runner={config.benchmark_mode} provider={provider.name}")
+    if config.workflow_type == "document":
+        from bench_core.task_runner.document import preflight_document
+
+        preflight_document(config)
+
+    # 1. Provider-level setup (e2b sets SDK env vars; docker needs nothing).
+    provider.prepare_env()
+
+    # 1b. Cleanup-only: list + kill existing sandboxes, then exit. Tears down
+    # what a prior --create-only / --detect run left running. Skips the
+    # readiness probe (see provider.cleanup_existing) so a dead/service-down
+    # sandbox can't stall teardown.
+    if config.cleanup_only:
+        logger.info("\n[Cleanup] Tearing down existing sandboxes...")
+        killed = provider.cleanup_existing()
+        logger.info(f"\nCleanup: tore down {killed} sandbox(es).")
+        return {"report": f"Cleanup: tore down {killed} sandbox(es).", "filepath": None}
+
+    _print_header(config, provider)
+
+    stop_event = threading.Event()
+
+    # 2. Create or detect sandboxes. exec_ephemeral skips create_all (each
+    # trajectory creates/kills its own sandbox in-runner); build N lightweight
+    # shells the workers fill per trajectory. detect mode is incompatible with
+    # it (no persistent pool to detect).
+    if rcfg is not None and rcfg.replay_mode == "exec_ephemeral":
+        if config.detect_existing:
+            logger.info(f"\n[Phase 1] detect mode incompatible with {rcfg.replay_mode} mode; building shells.")
+        logger.info(f"\n[Phase 1] {rcfg.replay_mode} mode: {config.total_count} worker shells (no pre-create).")
+        instances = {
+            i: SandboxInstance(
+                id=f"traj-shell-{i}",
+                index=i,
+                ready=True,  # the shell is "ready" to host trajectories
+                is_alive=True,
+                creation_metrics=CreationMetrics(status=SandboxStatus.PENDING),
+            )
+            for i in range(1, config.total_count + 1)
+        }
+    elif config.detect_existing:
+        instances = provider.detect_from_ids()
+        if instances is None:
+            instances = provider.detect_existing()
+        logger.info("\n[Phase 1] Detected existing sandboxes...")
+    else:
+        logger.info("\n[Phase 1] Creating sandboxes...")
+        templates = _replay_template_map(config) if config.workflow_type == "replay" else None
+        instances = provider.create_all(templates=templates)
+    instances = dict(instances)
+
+    ready_count = sum(1 for s in instances.values() if s.ready)
+    if ready_count == 0:
+        logger.info("No sandboxes ready for testing, exiting.")
+        return {}
+    logger.info(f"\nSandboxes ready: {ready_count}")
+
+    # 3. Create-only: emit the creation timing report and leave sandboxes running.
+    if config.create_only:
+        if rcfg is not None and rcfg.replay_mode == "exec_ephemeral":
+            # The ephemeral mode creates/kills per round inside the runner --
+            # there is no pool to pre-create, and the Phase-1 shells are
+            # placeholders, not real sandboxes. Exit honestly: a zero-filled
+            # creation report and a sandbox_ids_file full of "traj-shell-N"
+            # would both be lies.
+            logger.warning(
+                f"--create-only is a no-op for replay.mode={rcfg.replay_mode}: sandboxes are created "
+                "per round by the runner (creation cost is part of the measured workload). "
+                "Run the trial itself (optionally with a small -n) to exercise the creation path."
+            )
+            return {"report": f"create-only is a no-op for replay.mode={rcfg.replay_mode}", "filepath": None}
+        logger.info("\n[Phase 0 Complete] Create-only mode finished.")
+        report = _create_only_report(config, instances)
+        logger.info("\n" + report)
+        provider.save_ids(instances)
+        return {"report": report, "filepath": None}
+
+    # Promote to the kernel's working state (attaches workflow metrics).
+    states = _promote(instances, config.workflow_type)
+
+    # 4. Warmup-only: warm sandboxes and leave them running for a later run.
+    if config.warmup_only:
+        logger.info("\n[Phase 2] Running warmup phase...")
+        warmup_mgr = TaskManager(config, states, stop_event, provider)
+        warmup_mgr.start_warmup()
+        completed, failed = warmup_mgr.wait_warmup(timeout=300)
+        logger.info(f"\nWarmup completed: {completed} ready, {failed} failed")
+        provider.save_ids(states)
+        return {"report": f"Warmup-only: {completed}/{len(states)} ready, {failed} failed", "filepath": None}
+
+    # 5. Benchmark phase assumes warm sandboxes; mark ready ones warmed-up.
+    for state in states.values():
+        if state.ready:
+            state.warmup_done = True
+
+    # 6. Stats collection (background snapshots + final report).
+    logger.info("\n[Phase 3] Starting stats collector...")
+    stats_collector = StatsCollector(config, states, provider.name)
+    stats_collector.start()
+    monitor = MonitorController(config, provider)
+    monitor.start()
+
+    # Per-step JSONL time series for every replay run. The ``step`` event
+    # carries real exec timings in every mode -- exec_only included (resume/
+    # pause are no-ops there, but exec_sec / exec_end / the six timestamps are
+    # genuine epochs). The series feeds the obs workbook's Step detail /
+    # Trajectory summary / Concurrency states / Gantt sheets; lifecycle
+    # additionally emits pause/resume/initial_pause/snapshot_size
+    # events (exec_only emits step events only, so its Lifecycle-overhead and
+    # Snapshot-sizes sheets stay sparse). Without a writer those 4 sheets render
+    # header-only -- the old lifecycle-only gate threw exec_only's
+    # real per-step data out with its (genuinely empty) lifecycle fields.
+    series_writer: LifecycleSeriesWriter | None = None
+    series_path: Path | None = None
+    if rcfg is not None:
+        series_path = Path(config.output_dir) / f"{config.filename_prefix}_lifecycle_series.jsonl"
+        series_writer = LifecycleSeriesWriter(series_path)
+        logger.info(f"  Lifecycle series: {series_path}")
+
+    # P2.7: off-hot-path snapshot-size collector. The per-step scan moved off
+    # the sandbox step path to a background drain thread (see SnapshotSizeScanner)
+    # so a slow scan under heavy aenv snapshot I/O never stalls a resume. Built
+    # only when the provider actually stat-s snapshot dirs (SnapshotSizeCapable);
+    # otherwise the runner's _emit_snapshot_size early-returns. Closed BEFORE the
+    # series writer so every queued snapshot_size event is drained into the series
+    # before the series file is flushed + closed.
+    snapshot_scanner: SnapshotSizeScanner | None = None
+    if series_writer is not None and isinstance(provider, SnapshotSizeCapable) and rcfg.replay_mode == "lifecycle":
+        snapshot_scanner = SnapshotSizeScanner(provider, series_writer)
+        logger.info("  Snapshot-size scanner: background drain (off step path)")
+
+    # P2.6: Admission controllers (lifecycle-only). Construct only when a knob
+    # is set; thread through both managers into the replay runners.
+    from bench_core.admission import Admission, LaunchPacer, QpsRateLimiter, RunningSlotScheduler
+
+    admission: Admission | None = None
+    admission_snapshot: dict | None = None
+    if rcfg is not None and rcfg.replay_mode == "lifecycle":
+        slots = None
+        qps_lim = None
+        # Full-scale lifecycle (rc == total_count, the oversub driver's default)
+        # is a PASS-THROUGH scheduler: maximum = fleet, so no thread ever blocks,
+        # but the slot accounting still runs (slot_held / peak_active), which is
+        # what feeds effective_parallelism and the Concurrency-states sheet. With
+        # no scheduler at all those metrics would read 0.00/blank for the
+        # k*N fleet -- silently corrupting the headline oversub metric.
+        if rcfg.replay_running_concurrency is not None:
+            slots = RunningSlotScheduler(maximum=rcfg.replay_running_concurrency, stop_event=stop_event)
+        # Decoupled construction: build the limiter when EITHER knob is set; each
+        # function no-ops internally when its knob is None (qps=None -> time_wait
+        # is a no-op; inflight_cap=None -> the inflight fuse is a no-op). The two
+        # knobs are INDEPENDENT, not a pair -- omitting one bypasses only its own
+        # concern (rate pacing vs concurrency fuse), so e.g. inflight-only is a
+        # valid configuration with no rate shaping.
+        qps_val = rcfg.replay_control_plane_qps
+        cap_val = rcfg.replay_control_plane_inflight_cap
+        if qps_val is not None or cap_val is not None:
+            qps_lim = QpsRateLimiter(qps=qps_val, inflight_cap=cap_val, stop_event=stop_event)
+        if slots is not None or qps_lim is not None:
+            # If only the limiter is set (no oversub), provide a pass-through
+            # slots scheduler (cap=total) so the runner's admission path runs.
+            admission = Admission(
+                slots=slots or RunningSlotScheduler(maximum=config.total_count, stop_event=stop_event),
+                qps=qps_lim,
+            )
+            admission_snapshot = {
+                "running": rcfg.replay_running_concurrency or config.total_count,
+                "total": config.total_count,
+                "qps": qps_val if qps_val is not None else "off",
+                "inflight_cap": cap_val if cap_val is not None else "off",
+                "peak_active": 0,
+                "avg_queue_wait_sec": 0.0,
+            }
+            logger.info(
+                f"  Admission: running={admission_snapshot['running']}/{config.total_count}, "
+                f"qps={admission_snapshot['qps']}, inflight_cap={admission_snapshot['inflight_cap']}"
+            )
+
+    # G5: shared no-catch-up launch pacer (one per fleet). Paces per-trajectory
+    # create_one starts so multiple workers don't burst-create in the same
+    # instant. The pacer's lock + deadline cell are shared across all workers (a
+    # per-runner field would let each read its own 0.0 and burst). None outside
+    # exec_ephemeral (the only mode left with a per-trajectory create).
+    trajectory_launch_pacer = LaunchPacer() if (rcfg is not None and rcfg.replay_mode == "exec_ephemeral") else None
+
+    # Install a cooperative SIGTERM handler so a driver-initiated terminate
+    # (oversub _run_subprocess) unwinds into the finally below for a partial
+    # artifact flush instead of a hard die. Linux-only; see _make_sigterm_handler.
+    # ``_sigterm_flag`` distinguishes a driver SIGTERM (flag set -> finally skips
+    # sandbox cleanup; the driver's --cleanup-between-trials reaps leftovers) from
+    # a user Ctrl+C (flag unset -> finally cleans up the sandboxes it created).
+    _sigterm_flag = [False]
+    _prev_sigterm = signal.signal(signal.SIGTERM, _make_sigterm_handler(stop_event, _sigterm_flag))
+    _artifacts_flushed = False
+    # Tracks whether cleanup_all already ran on the happy/except paths so the
+    # finally does not double-teardown (and so it CAN tell that a Ctrl+C that
+    # skipped those paths still owes a cleanup).
+    _cleaned_up = False
+    task_manager: TaskManager | None = None
+    try:
+        monitor.begin_stress()
+        if config.benchmark_mode == "round_robin":
+            logger.info("\n[Phase 4] Starting round-robin tasks...")
+            round_robin = RoundRobinTaskManager(
+                config,
+                states,
+                stop_event,
+                stats_collector,
+                provider,
+                series=series_writer,
+                admission=admission,
+                launch_pacer=trajectory_launch_pacer,
+                scanner=snapshot_scanner,
+            )
+            round_robin.run()
+        else:
+            workflow_label = config.workflow_type.capitalize()
+            logger.info(f"\n[Phase 4] Starting {workflow_label} tasks...")
+            task_manager = TaskManager(
+                config,
+                states,
+                stop_event,
+                provider,
+                series=series_writer,
+                admission=admission,
+                launch_pacer=trajectory_launch_pacer,
+                scanner=snapshot_scanner,
+            )
+            task_manager.start_all()
+            if config.stop_when_done:
+                # Fixed+exec_ephemeral: each running slot runs M trajectories
+                # (replay.multiplier) then exits; block until all done or the
+                # test_duration safety ceiling -- not a plain timed sleep.
+                wf = config.workflow_config
+                m = getattr(wf, "replay_multiplier", None)
+                logger.info(
+                    f"\n[Phase 5] stop-when-done active: each slot runs multiplier={m} "
+                    f"trajectories (safety ceiling {config.test_duration}s)..."
+                )
+                try:
+                    finished = task_manager.wait_for_completion(config.test_duration)
+                except KeyboardInterrupt:
+                    logger.info("\nUser interrupt, stopping...")
+                    finished = False
+                if not finished:
+                    logger.warning(
+                        "stop-when-done hit the %ss safety ceiling before all slots "
+                        "finished their trajectories; reaping stragglers.",
+                        config.test_duration,
+                    )
+                # Final-total validation: each slot should have completed exactly M
+                # trajectories. Without this an early exit / crash under-runs
+                # silently (mirrors reference B's total==target_count check).
+                if m is not None:
+                    completed_total = 0
+                    for s in task_manager.sandbox_states.values():
+                        rm = getattr(s, "replay_metrics", None)
+                        if rm is not None:
+                            completed_total += rm.trajectory_completions
+                    expected_total = m * len(task_manager.runners)
+                    if completed_total < expected_total:
+                        logger.warning(
+                            "stop-when-done under-run: completed %d/%d trajectories "
+                            "(multiplier=%d x %d slots); some slots exited early.",
+                            completed_total,
+                            expected_total,
+                            m,
+                            len(task_manager.runners),
+                        )
+            else:
+                logger.info(f"\n[Phase 5] Running for {config.test_duration} seconds...")
+                try:
+                    time.sleep(config.test_duration)
+                except KeyboardInterrupt:
+                    logger.info("\nUser interrupt, stopping...")
+
+        # 7. Stop all components.
+        logger.info("\n[Phase 6] Stopping...")
+        stop_event.set()
+        monitor.end_stress()
+        if task_manager is not None:
+            task_manager.wait_all(timeout=5)
+        # Document workflow: force a final snapshot so the report captures the last
+        # task's metrics (document runners are one-shot per round / fixed iteration).
+        if config.workflow_type == "document":
+            stats_collector._take_snapshot()
+        stats_collector.stop()
+        if snapshot_scanner is not None:
+            snapshot_scanner.close()  # drain snapshot_size events into the series first
+        if series_writer is not None:
+            series_writer.close()
+
+        # Only tear down sandboxes the kernel created; detect mode leaves them running.
+        if not config.detect_existing:
+            provider.cleanup_all()
+            _cleaned_up = True
+        else:
+            logger.info("Sandboxes left running (detect mode - not killing)")
+
+        time.sleep(0.5)  # Let daemon threads finish writing output.
+
+        # Refresh admission snapshot from the controllers before the report.
+        if admission is not None:
+            snap = admission.slots.snapshot()
+            admission_snapshot["peak_active"] = snap["peak_active"]
+            admission_snapshot["avg_queue_wait_sec"] = snap["average_queue_wait_sec"]
+            admission_snapshot["running_slots"] = snap  # full sub-snapshot for the report/xlsx
+            if admission.qps is not None:
+                qps_snap = admission.qps.snapshot()
+                admission_snapshot["qps_dispatched"] = qps_snap["dispatched"]
+                admission_snapshot["qps_inflight_dispatched"] = qps_snap.get("inflight_dispatched")
+                admission_snapshot["qps_limiter"] = qps_snap  # full sub-snapshot
+            stats_collector.admission_snapshot = admission_snapshot
+
+        # 8. Generate and save the report.
+        monitor.stop()
+        report = stats_collector.generate_report()
+        filepath = stats_collector.save_report(report)
+
+        # Phase 3.5: optional xlsx observability workbook (replay workflows only).
+        obs_xlsx_path: Path | None = None
+        if config.workflow_type == "replay" and config.report_format in ("xlsx", "both"):
+            try:
+                from bench_core.observability.obs_xlsx import XlsxReportRenderer
+            except ImportError:  # openpyxl missing on a minimal install
+                logger.warning("openpyxl not installed; skipping xlsx report (txt only)")
+            else:
+                from bench_core.observability.replay_obs import ReplayObservability
+
+                wall_sec = (time.time() - stats_collector.start_time) if stats_collector.start_time else None
+                obs = ReplayObservability(
+                    config,
+                    stats_collector.sandbox_states,
+                    admission_snapshot=admission_snapshot,
+                    wall_sec=wall_sec,
+                )
+                xlsx_path = Path(config.output_dir) / f"{config.filename_prefix}_obs.xlsx"
+                XlsxReportRenderer(
+                    obs,
+                    series_path=series_path if series_writer else None,
+                    host_xlsx=monitor.merge_source(),
+                ).render(xlsx_path)
+                obs_xlsx_path = xlsx_path
+                logger.info(f"Xlsx report saved to: {xlsx_path}")
+
+        # Per-trajectory replay_result.json export (all replay modes; a no-op
+        # when the series file is absent). Emits one
+        # replay_result.json per trajectory + a trajectories/index.json catalog
+        # so a fleet of dozens/hundreds of trajectories is browsable without
+        # walking folders. Runs regardless of report_format (txt-only runs still
+        # get the per-trajectory JSON). Guarded like write_run_summary below: this
+        # is a non-critical browsable catalog, so an export failure must NOT
+        # abort step 8 -- an unguarded throw here would skip write_run_summary on
+        # the happy path, leave _artifacts_flushed False, and (via the except->
+        # raise->finally path) crash the run AFTER dispatch completed, turning a
+        # cosmetic artifact failure into an invalid oversub trial. Log + continue.
+        if series_path is not None and Path(series_path).exists():
+            try:
+                from bench_core.observability.trajectory_export import export_trajectories
+
+                n_traj = export_trajectories(series_path, config.output_dir, filename_prefix=config.filename_prefix)
+                logger.info("Per-trajectory replay_result.json exported: %d trajectories", n_traj)
+            except Exception:
+                logger.exception("trajectory export failed; continuing (replay_result.json/index.json may be absent)")
+
+        # Oversub driver contract: machine-readable run summary (replay only).
+        # Raw facts only; the driver computes experiment validity. Wrapped so a
+        # writer failure never breaks the kernel's primary report flow.
+        if config.workflow_type == "replay":
+            try:
+                from bench_core.observability.run_summary import write_run_summary
+
+                write_run_summary(
+                    config,
+                    stats_collector,
+                    series_path=series_path,
+                    obs_xlsx_path=obs_xlsx_path,
+                    report_path=filepath,
+                )
+            except Exception:
+                logger.exception("run_summary.json write failed; continuing")
+
+        _artifacts_flushed = True
+        logger.info("\n" + report)
+        logger.info(f"\nReport saved to: {filepath}")
+        return {"report": report, "filepath": filepath, "admission_snapshot": admission_snapshot}
+    except Exception:
+        stop_event.set()
+        monitor.end_stress()
+        monitor.stop()
+        stats_collector.stop()
+        if snapshot_scanner is not None:
+            snapshot_scanner.close()
+        if series_writer is not None:
+            series_writer.close()
+        if not config.detect_existing:
+            provider.cleanup_all()
+            _cleaned_up = True
+        raise
+    finally:
+        # Restore the default SIGTERM disposition for any post-run work.
+        signal.signal(signal.SIGTERM, _prev_sigterm)
+        # Fast, idempotent teardown so background threads join and the series
+        # flushes before readers touch it. Skips the slow monitor.stop() /
+        # cleanup_all (those ran on the happy/except paths; on a SIGTERM interrupt
+        # the driver's --cleanup-between-trials reaps leftover sandboxes).
+        try:
+            monitor.end_stress()
+        except Exception:
+            logger.exception("monitor.end_stress failed during teardown")
+        # Guarantee host_resources.xlsx on a Ctrl+C / SIGTERM interrupt: it's
+        # written FIRST in vm_monitor's export (reads only the line-flushed raw
+        # CSVs, seconds), so a short wait catches it without blocking on the
+        # slow resource_report.xlsx. No-op on the happy/except paths (stop()
+        # already set _started=False); on the interrupt path stop() was skipped,
+        # so this is the only thing that waits. vm_monitor finishes SVG/xlsx as
+        # a detached orphan.
+        try:
+            monitor.wait_for_host_resources(timeout=30)
+        except Exception:
+            logger.exception("monitor.wait_for_host_resources failed during teardown")
+        try:
+            stats_collector.stop()
+        except Exception:
+            logger.exception("stats_collector.stop failed during teardown")
+        if snapshot_scanner is not None:
+            try:
+                snapshot_scanner.close()
+            except Exception:
+                logger.exception("snapshot_scanner.close failed during teardown")
+        if series_writer is not None:
+            try:
+                series_writer.close()
+            except Exception:
+                logger.exception("series_writer.close failed during teardown")
+        if not _artifacts_flushed:
+            logger.warning("Trial interrupted, writing partial artifacts, skipping full " "report/xlsx generation")
+            if config.workflow_type == "replay" and series_path is not None and Path(series_path).exists():
+                try:
+                    from bench_core.observability.trajectory_export import export_trajectories
+
+                    export_trajectories(series_path, config.output_dir, filename_prefix=config.filename_prefix)
+                except Exception:
+                    logger.exception("partial trajectory export failed")
+            if config.workflow_type == "replay":
+                try:
+                    from bench_core.observability.run_summary import write_run_summary
+
+                    write_run_summary(
+                        config,
+                        stats_collector,
+                        series_path=series_path,
+                        obs_xlsx_path=None,
+                        report_path=None,
+                    )
+                except Exception:
+                    logger.exception("partial run_summary write failed")
+
+        # A user Ctrl+C (SIGINT) during dispatch raises KeyboardInterrupt, a
+        # BaseException that bypasses ``except Exception`` and the happy-path
+        # cleanup above, landing here with ``_cleaned_up`` still False. A
+        # driver SIGTERM also lands here (its handler raises KeyboardInterrupt)
+        # but sets ``_sigterm_flag`` -- the driver's --cleanup-between-trials
+        # owns teardown then, so we skip cleanup to keep the partial-flush fast
+        # within the terminate grace. Detect mode never owns its sandboxes.
+        # Guarded so a cleanup failure cannot replace the propagating interrupt.
+        if not _cleaned_up and not config.detect_existing and not _sigterm_flag[0]:
+            logger.info("\nUser interrupt: cleaning up sandboxes created by this run...")
+            try:
+                provider.cleanup_all()
+            except Exception:
+                logger.exception("cleanup_all failed during interrupt teardown")
+
+
+# CLI symbols live in :mod:`bench_core.bench_cli` (split so the spine imports
+# without argparse). Re-exported lazily to keep the historical
+# ``from bench_core.bench import main`` path working.
+_CLI_EXPORTS = {"_apply_monitor_override", "_build_provider", "build_arg_parser", "load_config", "main"}
+
+
+def __getattr__(name: str):
+    if name in _CLI_EXPORTS:
+        from bench_core import bench_cli
+
+        return getattr(bench_cli, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

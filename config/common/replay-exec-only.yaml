@@ -1,0 +1,216 @@
+# exec_only replay baseline — identical stress shape to replay.yaml (lifecycle)
+# but WITHOUT pause/resume. Same total_count / round_size / round_count /
+# action_timeout / trajectory pool / template_manifest; only mode differs.
+#
+# Purpose: the no-lifecycle baseline against which replay.yaml's lifecycle
+# pause/resume overhead is compared. Sandboxes are long-lived (created once,
+# reused across steps); each step is a bare provider.exec() — no resume, no
+# pause, no snapshot.
+#
+# CAVEAT: admission controllers (running_concurrency / control_plane_qps /
+# control_plane_inflight_cap) are wired ONLY for lifecycle mode
+# (bench.py wires Admission when replay_mode == "lifecycle").
+# In exec_only they are NO-OPS — kept below for config parity with replay.yaml
+# but they do not gate anything. At ratio 1:1 this is equivalent (lifecycle's
+# running_concurrency=384 == total_count also means no queueing), so the two
+# configs are directly comparable. exec_only CANNOT express memory
+# overcommit (ratio 1:k, k>1): with no pause to free RAM, k*N sandboxes just
+# run concurrently — there is no multiplexing. For overcommit use replay.yaml
+# (lifecycle).
+#
+#   bench-core --provider aenv --config config/common/replay-exec-only.yaml -n 384
+
+workflow_type: replay
+
+# === backend blocks (one per provider; only the matching one is read) ===
+e2b:
+  template: "openclaw-coding-python-v1"
+  create_timeout: 86400
+  numa_bind: 2
+  sandbox_ids_file: "sandboxs_replay.txt"
+  env:
+    E2B_ACCESS_TOKEN: "your_e2b_access_token_here"
+    E2B_API_KEY: "your_e2b_api_key_here"
+    E2B_DOMAIN: "e2b.app"
+    E2B_API_URL: "http://localhost:3000"
+    E2B_HTTP_SSL: "false"
+
+docker:
+  image: "ubuntu-openclaw-coding-python:24.04-arm64"
+  container_prefix: "oc-replay"
+  cpu_limit: 2.0
+  memory_limit: "2g"
+  create_timeout: 300
+
+aenv:
+  template: "openclaw-coding-python-v1"  # AENV snapshot-capable image (same /testbed shape)
+  create_timeout: 86400
+  sandbox_ids_file: "sandboxs_replay_aenv.txt"
+  # AENV server home path -- primary source for the snapshot-scan base. Irrelevant
+  # in exec_only (no pause/snapshot), kept for config parity with replay.yaml.
+  # Falls back to $AENV_HOME_PATH / $AENV_HOME, then /var/lib/aenv.
+  # aenv_home_path: "/var/lib/aenv"
+  # CCL CPU-affinity binding: pin each sandbox's firecracker -- ALL threads,
+  # one-shot at create -- to one sysfs-detected silicon L3 domain (AMD CCD /
+  # Kunpeng CL), round-robin by sandbox index. Needs root on the AENV host.
+  # Full docs (granularity, fallback arithmetic): config/common/replay.yaml.
+  ccl_bind: false              # <- the on/off switch
+  env:
+    E2B_ACCESS_TOKEN: "your_e2b_access_token_here"
+    E2B_API_KEY: "your_e2b_api_key_here"
+    E2B_DOMAIN: "your_aenv_domain_here"
+    E2B_API_URL: "http://127.0.0.1:8000"      # AENV control plane (POST /sandboxes)
+    E2B_SANDBOX_URL: "http://127.0.0.1:8000"  # AENV data plane (envd proxy; overrides subdomain build, forces http)
+
+cubesandbox:
+  template: "openclaw-coding-python-v1"  # CubeSandbox image with /testbed (cube template ID)
+  timeout: 86400            # idle TTL seconds (NOT create-wait; create is a synchronous
+                           # HTTP POST). Long-lived replay sandboxes want a long TTL so
+                           # they survive pauses between steps; -1 = NEVER_TIMEOUT.
+  sandbox_ids_file: "sandboxs_replay_cube.txt"
+  # request_timeout: 30.0     # control-plane HTTP cap, seconds (kill/pause/get_info/snapshots):
+  #                           # the SDK omits timeout= there, so the manager pins an adapter --
+  #                           # one blackholed DELETE would otherwise hang cleanup forever.
+  # cleanup_concurrency: 100  # bounded-concurrent kills in cleanup_all (serial is too slow
+  #                           # at 1k+ sandboxes; full-parallel overflows cubemaster's backlog).
+  # CubeSandbox snapshot dir override (Phase 2 snapshot_sizes; v1 unused -> the
+  # provider returns None and the snapshot-size series event is skipped).
+  # snapshot_dir: "/var/lib/cube/snapshots"
+  env:
+    CUBE_API_URL: "http://127.0.0.1:3000"     # CubeAPI control plane (POST /sandboxes)
+    CUBE_API_KEY: "your_cube_api_key_here"     # optional (placeholder -> no X-API-Key header)
+    CUBE_SANDBOX_DOMAIN: "cube.app"           # sandbox data-plane domain (get_host)
+
+# === shared stress sections (all -> KernelConfig) ===
+sandbox:
+  total_count: 384          # same as lifecycle baseline
+  detect_existing: false
+  create_only: false
+
+create_batch:
+  size: 96
+  interval: 1              # NOTE: int seconds. Fine-grained per-VM launch pacing
+                           # (launch_interval_sec) is exec_ephemeral-mode only; lifecycle
+                           # pre-creates via create_all in batches, so use batch
+                           # intervals as a coarse approximation. exec_only reuses
+                           # the same pre-created fleet for the whole run. See §8.1.
+
+task_batch:
+  size: 5
+  interval: 1
+
+# Replay configuration (host-agnostic; the sandbox runs the recorded commands).
+replay:
+  # Point these at your dataset (host-specific; do not commit real paths).
+  trajectory_dir: "artifacts/traces/replays"  # bundled 55-trajectory pool
+  trajectory_glob: "*.replay.json"
+  # Cap the pool to the first N trajectories PER TEMPLATE (natural sort within
+  # each template). Set by the oversub driver to running_concurrency (N) so each
+  # template's issue set stays fixed across ratios (per-issue execution count
+  # then scales linearly with k); without it a large pool lets the issue mix
+  # drift with ratio and confounds linearity. For a MULTI-template pool (T>1)
+  # the kernel further clamps N to N//T (the ratio-1 per-template fleet share)
+  # so count_t <= fleet_t(ratio 1) and the running issue set stays fixed
+  # (capping to N alone would let only N/T issues run at ratio 1 and grow with
+  # ratio until k>=T). Per-template (not a global first-N) keeps every template
+  # covered in a multi-template manifest. Omit / null = use the whole pool.
+  # trajectory_limit: 20
+  # Side manifest mapping trajectory file (path relative to trajectory_dir) ->
+  # concrete backend template. Lives with the dataset (not the benchmark config).
+  # Omit -> single-template legacy (all trajectories use the provider block's
+  # default `template`).
+  template_manifest: "artifacts/traces/image-map.json"
+  workdir: "/"                            # exec cwd (no shell wrap); "/" = run at root
+  env: {}                                   # optional {PAGER: cat, ...} via exec env param
+  action_timeout: 300                       # per-action exec timeout (same as lifecycle)
+  delay_scale: 1.0                          # 1.0=realtime; 0=no delay; 0.1=10x compressed
+  stop_on_error: false                      # abort current trajectory, advance to next (not the sandbox)
+
+  # mode: omit -> provider default (exec_only for e2b/docker/fake; lifecycle for
+  # aenv, which requires a LifecycleCapable provider). Set explicitly to override.
+  mode: exec_only   # <-- the only real difference from replay.yaml: no pause/resume.
+                     # aenv's default is lifecycle, so set this explicitly.
+                     # KernelConfig.__post_init__ force-disables ready_probe in exec_only.
+
+  # The knobs below are NO-OPS in exec_only (admission + launch pacer are
+  # lifecycle / exec_ephemeral only). Kept for parity with replay.yaml; at ratio 1:1
+  # the comparison is fair (lifecycle's running_concurrency=384 == total_count
+  # means no queueing either).
+  running_concurrency: 384             # ignored in exec_only (no admission)
+  control_plane_qps: 1000.0           # ignored in exec_only (no QPS limiter)
+  control_plane_inflight_cap: 1024     # ignored in exec_only (no inflight cap)
+  pause_duration_sec: 0.0             # ignored in exec_only (no pause phase)
+  ready_probe: true                   # force-disabled by __post_init__ in exec_only
+  lifecycle_retries: 2                # ignored in exec_only (no lifecycle calls)
+  # launch_interval_sec: 0.0          # exec_ephemeral-mode only; no effect here either.
+
+test:
+  duration: 3600      # hard time ceiling: round_robin stops at duration OR when all
+                       # rounds finish, whichever is first. With round_count=1 the
+                       # single trajectory round usually completes well under this, so
+                       # round_count gates run-to-completion; duration caps stalled
+                       # runs. Also feeds vm_monitor's -t backstop (duration + 60s).
+  stats_interval: 10
+  benchmark_percent: 1.0
+  benchmark_mode: "round_robin"
+  round_size: 384     # same as lifecycle: one group = all sandboxes -> all concurrent
+  round_count: 1      # each sandbox runs exactly 1 trajectory (= 1 repeat)
+  round_interval: 0
+
+report:
+  output_dir: "results/replay-exec-only"
+  filename_prefix: "replay_exec_only_bench"
+  format: both  # txt + xlsx observability workbook (Per-step timings, Trajectory summary)
+
+# Host-level monitor (optional). Default `auto` enables vm_monitor only when the
+# provider has a VMM (e2b/aenv -> firecracker); docker/fake are skipped.
+monitor:
+  enabled: auto          # auto | true | false
+  vmm: auto              # auto | qemu | firecracker (auto = take provider hint)
+  interval: 2
+  capture: auto          # auto | true | false (auto/true -> --enable-capture --auto-skip)
+  numa: all              # "all" = every NUMA node, or comma-separated "0,1"
+  disks: all             # block devices for I/O: "all" auto-discovers physical devices;
+                         # or comma-separated, e.g. "sda,nvme0n1" to monitor specific disks.
+  stress_file: /dev/shm/bench_core_monitor.lock
+  log_dir: null          # null = <report.output_dir>/vm_monitor
+  # False (default): two separate files -- vm_monitor's system-resource report
+  # (resource_report.xlsx) stands alone, and the replay obs workbook
+  # (<prefix>_obs.xlsx) carries trajectory/replay metrics only. Set true to copy
+  # VM_Stats/NUMA_Overview/DevKit_TopDown into the obs workbook instead.
+  merge_report: false
+  report_timeout: 300
+  # Skip the xlsx chart phase (forwards vm-monitor --no-charts). For huge runs
+  # (many sandboxes x long sampling) the openpyxl chart build (load_workbook +
+  # ~14 chart builders + full re-save) dominates export time and can exceed the
+  # courtesy wait in stop(); enabling still writes every sheet, just without
+  # charts. Default off (charts on); uncomment for oversub-scale runs.
+  # skip_charts: true
+  # Uncomment `skip:` and the `- <collector>` lines for the collectors to
+  # disable (each forwards a vm-monitor --no-X flag; that collector's sheet/SVG
+  # is then omitted). Default: all commented = all collectors on. Leave a line
+  # commented (or delete it) to keep that collector enabled. Unknown names are
+  # warned + ignored.
+  # skip:
+  #   - hugepage
+  #   - numa-cpu
+  #   - host-stats
+  #   - swap
+  #   - host-mem-detail
+  #   - pressure
+  #   - numa-memory
+  #   - vm-total
+  #   - pss
+  #   - disk
+  #   - ublk
+  #   - ublk-daemon
+  #   - hostproc
+  #   - devkit-mem
+  #   - devkit-topdown
+  # Host processes to monitor by name (forwards vm-monitor --host-proc). Each
+  # entry is `comm` or `comm:cmdline_substr` (one pid per spec, resolved
+  # lazily). CPU cores + PSS -> hostproc_cpu_raw.csv + HostProc sheet. Use a
+  # YAML list -- commas are NOT allowed inside a spec entry. Default unset = no
+  # host-proc tracking. Example (agentENV server daemon):
+  # host_procs:
+  #   - server:release/server

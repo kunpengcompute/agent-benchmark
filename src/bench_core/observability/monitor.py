@@ -1,0 +1,612 @@
+"""Host-level vm_monitor orchestration for run_benchmark.
+
+MonitorController wraps the ``vm-monitor`` CLI as a subprocess bracketed around
+the active-stress phase. Trigger = stress-file sync: vm_monitor idles waiting
+for a lock file, samples while it exists, exports on removal. The controller
+degrades to a no-op when the provider has no VMM (``vmm_type is None``), the
+binary is missing, or the lock dir is unwritable -- never compromising the bench.
+
+The stress marker is separate from the collector: with ``external_collector``
+set, a run spawns nothing but still publishes its lock, so an out-of-process
+owner (the oversub driver, one collector per sharded trial) can bracket the
+union of every shard's window.
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from .api_state import ApiStateSampler
+
+logger = logging.getLogger(__name__)
+
+_VM_MONITOR_BIN = "vm-monitor"
+
+# Valid ``monitor.skip`` tokens (hyphenated flag stems). These forward to the
+# vm-monitor CLI as ``--no-{stem}``. bench_core wraps vm-monitor as an opaque
+# subprocess, so this literal is the contract with
+# ``vm_monitor/cli.py COLLECTOR_FLAGS`` stems -- keep them in sync. An unknown
+# token is warned + dropped (never silently no-op, never crash the bench on a
+# typo). Runtime WARNING surfaces any drift between this set and the CLI.
+_VALID_SKIP_STEMS = frozenset(
+    {
+        "hugepage",
+        "numa-cpu",
+        "host-stats",
+        "swap",
+        "host-mem-detail",
+        "pressure",
+        "numa-memory",
+        "vm-total",
+        "disk",
+        "ublk",
+        "pss",
+        "rss",
+        "ublk-daemon",
+        "hostproc",
+        "devkit-mem",
+        "devkit-topdown",
+    }
+)
+
+
+@dataclass
+class LogRotationConfig:
+    """Log-capture rotation toggles (the ``monitor.log_rotation:`` YAML block).
+
+    Rotates devkit (top-down + memory in parallel) -> ksys -> ``perf stat`` ->
+    AMDuProfPcm, one collector group at a time, for the whole stress window.
+    Each turn writes a timestamped log under ``<output_dir>/log_capture/
+    {devkit/{topdown,memory},ksys,perf,uprof}/``. ``tools`` narrows the cycle
+    to the named tools. Forwards the vm-monitor ``--log-rotation`` flag
+    family; requires ``capture`` (auto/true) to run.
+    """
+
+    enabled: bool = False
+    interval_sec: int = 15  # per-slot collection duration (seconds); fallback for any tool not in intervals
+    # None -> vm_monitor's built-in event set (DEFAULT_ROTATION_PERF_EVENTS).
+    perf_events: list[str] | None = None
+    # Per-tool rotation intervals: {"devkit": sec, "ksys": sec, "perf": sec, "uprof": sec}.
+    # None -> every tool uses interval_sec. A partial dict falls back to
+    # interval_sec for the omitted tools. Forwarded as --rotation-intervals.
+    intervals: dict[str, int] | None = None
+    # Rotation membership: which tools rotate, e.g. ["devkit", "perf"]. None ->
+    # every tool (devkit/ksys/perf/uprof). Accepts a YAML list or comma string;
+    # unknown names are warned + dropped. Forwarded as --rotation-tools.
+    tools: list[str] | None = None
+
+    @classmethod
+    def from_raw(cls, raw) -> LogRotationConfig | None:
+        """Parse the ``log_rotation`` block; ``None`` when absent.
+
+        Accepts a dict (``enabled`` defaults to true when the block is present)
+        or the shorthand ``log_rotation: true``. A non-dict/non-true value is
+        warned + dropped (never crash the bench on a YAML typo). ``perf_events``
+        accepts a YAML list or a comma string. ``intervals`` accepts a dict
+        ``{devkit: sec, ksys: sec, perf: sec, uprof: sec}``; valid tools are devkit/ksys/perf/uprof,
+        unknown keys are warned + dropped. ``tools`` accepts a YAML list or comma
+        string and selects which tools rotate (None/empty = every tool).
+        """
+        if raw is None:
+            return None
+        if raw is True:
+            return cls(enabled=True)
+        if not isinstance(raw, dict):
+            logger.warning("monitor.log_rotation must be a mapping or true, got %r; ignoring", raw)
+            return None
+        events = raw.get("perf_events")
+        if events is None:
+            perf_events: list[str] | None = None
+        elif isinstance(events, str):
+            perf_events = [e.strip() for e in events.split(",") if e.strip()] or None
+        else:
+            perf_events = [str(e).strip() for e in events if str(e).strip()]
+        raw_intervals = raw.get("intervals")
+        intervals: dict[str, int] | None = None
+        if isinstance(raw_intervals, dict):
+            valid = {"devkit", "ksys", "perf", "uprof"}
+            parsed = {}
+            for tool, val in raw_intervals.items():
+                key = str(tool).strip()
+                if key not in valid:
+                    logger.warning(
+                        "monitor.log_rotation.intervals: unknown tool %r (valid: %s), skipping", key, sorted(valid)
+                    )
+                    continue
+                try:
+                    parsed[key] = max(1, int(val))
+                except (TypeError, ValueError):
+                    logger.warning("monitor.log_rotation.intervals: %r is not an int for tool %r, skipping", val, key)
+            intervals = parsed or None
+        elif raw_intervals is not None:
+            logger.warning("monitor.log_rotation.intervals must be a mapping, got %r; ignoring", raw_intervals)
+        raw_tools = raw.get("tools")
+        tools: list[str] | None = None
+        if raw_tools is not None:
+            if isinstance(raw_tools, str):
+                raw_tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
+            elif not isinstance(raw_tools, list | tuple):
+                logger.warning("monitor.log_rotation.tools must be a list or comma string, got %r; ignoring", raw_tools)
+                raw_tools = []
+            valid = {"devkit", "ksys", "perf", "uprof"}
+            tools = []
+            for item in raw_tools:
+                key = str(item).strip()
+                if key not in valid:
+                    logger.warning(
+                        "monitor.log_rotation.tools: unknown tool %r (valid: %s), skipping", key, sorted(valid)
+                    )
+                    continue
+                if key not in tools:
+                    tools.append(key)
+            tools = tools or None
+        return cls(
+            enabled=bool(raw.get("enabled", True)),
+            interval_sec=int(raw.get("interval_sec", 15)),
+            perf_events=perf_events,
+            intervals=intervals,
+            tools=tools,
+        )
+
+
+@dataclass
+class MonitorConfig:
+    """Host-level monitor toggles (the ``monitor:`` YAML section)."""
+
+    enabled: str = "auto"  # auto | true | false   (auto = decide by provider.vmm_type)
+    vmm: str = "auto"  # auto | qemu | firecracker | cubesandbox  (auto = take provider hint)
+    interval: int = 2  # sampling interval (seconds)
+    capture: str = "auto"  # auto | true | false  (auto/true -> --enable-capture --auto-skip)
+    numa: str = "all"  # NUMA nodes: "all" = every node, or comma-separated "0,1"
+    disks: str = "all"  # block devices for I/O, comma-separated (sda,nvme0n1); "all" auto-discovers
+    stress_file: str = "/dev/shm/bench_core_monitor.lock"
+    log_dir: str | None = None  # None -> <report.output_dir>/vm_monitor
+    # True = another process owns the host collector (the oversub driver runs
+    # one vm-monitor for a whole sharded trial). This run spawns nothing but
+    # still publishes its stress marker, which the owner unions across shards.
+    external_collector: bool = False
+    # Control-plane fleet gauge (raw_data/api_state_raw.csv). "auto" samples it
+    # only when this process owns the collector; "true" samples it whenever
+    # this process's controller window is active (external collectors included)
+    # -- under sharding the driver owns the collector but holds no provider
+    # handle, so shard 0 keeps a window and polls the API for the fleet.
+    # "false" never samples it.
+    api_state: str = "auto"
+    # False = keep vm_monitor's system-resource report (resource_report.xlsx) as a
+    # standalone file; the replay obs workbook stays a trajectory-metrics-only file.
+    # True = copy VM_Stats/NUMA_Overview/DevKit_TopDown into the obs workbook.
+    merge_report: bool = False
+    report_timeout: int = 300  # vm_monitor exit/export budget (s): 2x = no-SIGTERM wait, 1x = post-SIGTERM grace
+    # Collectors/devkit sub-tools to skip, forwarded to vm-monitor as --no-X.
+    # Accepts a YAML list ("skip: [swap, hugepage]") or a comma string
+    # ("skip: swap, hugepage"). Tokens are hyphenated flag stems; unknown names
+    # are warned + dropped in _build_cmd. Default empty = all collectors on.
+    skip: list[str] | None = None
+    # Skip the xlsx chart phase in vm_monitor's export (forwards --no-charts).
+    # For huge runs (many VMs x long sampling) the openpyxl chart build (load +
+    # ~14 chart builders + full re-save) dominates export time and can exceed
+    # the courtesy wait in stop(); skipping still writes every sheet, just
+    # without charts. Default false (charts on); opt-in for oversub-scale runs.
+    skip_charts: bool = False
+    # Host processes to monitor by name, forwarded to vm-monitor as --host-proc.
+    # Accepts a YAML list ("host_procs: [server:release/server]") or a comma
+    # string ("host_procs: server:release/server,uvm-ublk-daemon"). Each entry is
+    # ``comm`` or ``comm:cmdline_substr``. Comma-string mode forbids a comma
+    # INSIDE a spec (the split would break it) -- use a YAML list then. None = no
+    # host-proc tracking (the hostproc collector is a no-op without specs).
+    host_procs: list[str] | None = None
+    # Log-capture rotation (the ``log_rotation:`` sub-block): devkit(top-down +
+    # memory in parallel) -> ksys -> perf stat -> AMDuProfPcm, one group at a
+    # time, for the stress window; per-turn timestamped logs land in
+    # ``<output_dir>/log_capture/``. None/absent = off (all-parallel capture).
+    # ``tools:`` selects which tools rotate (default all four).
+    log_rotation: LogRotationConfig | None = None
+
+    @classmethod
+    def from_raw(cls, raw: dict | None) -> MonitorConfig:
+        if not raw:
+            return cls()
+        raw_skip = raw.get("skip")
+        if raw_skip is None:
+            skip: list[str] | None = None
+        elif isinstance(raw_skip, str):
+            skip = [t.strip() for t in raw_skip.split(",") if t.strip()]
+        else:
+            skip = [str(t).strip() for t in raw_skip if str(t).strip()]
+        raw_host_procs = raw.get("host_procs")
+        if raw_host_procs is None:
+            host_procs: list[str] | None = None
+        elif isinstance(raw_host_procs, str):
+            host_procs = [t.strip() for t in raw_host_procs.split(",") if t.strip()]
+        else:
+            host_procs = [str(t).strip() for t in raw_host_procs if str(t).strip()]
+        # ponytail: .lower() normalizes YAML booleans too -- str(True)="True"
+        # but the toggle comparisons below want lowercase "true"/"auto"/"false",
+        # so an unquoted `enabled: true` would otherwise read as "True" and miss
+        # the `== "true"` check, silently disabling vm_monitor.
+        return cls(
+            enabled=str(raw.get("enabled", "auto")).lower(),
+            vmm=str(raw.get("vmm", "auto")).lower(),
+            interval=int(raw.get("interval", 2)),
+            capture=str(raw.get("capture", "auto")).lower(),
+            numa=str(raw.get("numa", "all")),
+            disks=str(raw.get("disks", "all")),
+            stress_file=str(raw.get("stress_file", "/dev/shm/bench_core_monitor.lock")),
+            log_dir=raw.get("log_dir"),
+            external_collector=bool(raw.get("external_collector", False)),
+            api_state=str(raw.get("api_state", "auto")).lower(),
+            merge_report=bool(raw.get("merge_report", False)),
+            report_timeout=int(raw.get("report_timeout", 300)),
+            skip=skip,
+            skip_charts=bool(raw.get("skip_charts", False)),
+            host_procs=host_procs,
+            log_rotation=LogRotationConfig.from_raw(raw.get("log_rotation")),
+        )
+
+
+class MonitorController:
+    """Spawns ``vm-monitor`` for the stress window; no-op when not applicable.
+
+    Three independent behaviours fall out of two flags:
+
+    - ``effective`` -- this run spawns the collector (``enabled`` + a VMM hint).
+    - ``external`` -- somebody else spawns it; this run only publishes the
+      stress marker so the owner can see this shard's window.
+    - ``gauge`` -- this run samples the provider's fleet state (only a process
+      holding a provider handle can).
+    """
+
+    def __init__(self, config, provider):
+        self._config = config
+        self._provider = provider
+        mc = config.monitor
+        self._vmm_resolved = mc.vmm if mc.vmm != "auto" else provider.vmm_type
+        self._capture_on = mc.capture in ("auto", "true")
+        self._external = bool(mc.external_collector)
+        self._effective = not self._external and (
+            mc.enabled == "true" or (mc.enabled == "auto" and self._vmm_resolved is not None)
+        )
+        self._gauge = (self._effective and mc.api_state != "false") or mc.api_state == "true"
+        self._log_dir = Path(mc.log_dir) if mc.log_dir else Path(config.output_dir) / "vm_monitor"
+        self._stress_file = Path(mc.stress_file)
+        self._report_timeout = mc.report_timeout
+        self._merge_report = mc.merge_report
+        self._interval = mc.interval
+        self._numa = mc.numa
+        self._disks = mc.disks
+        self.proc = None
+        self._stdout_fh = None
+        self._stderr_fh = None
+        self._begin_ts: float | None = None
+        self._end_ts: float | None = None
+        self.report_xlsx: Path | None = None
+        self._started = False
+        self._detached = False  # stop() set this: vm_monitor left running to finish async
+        self._cmd = self._build_cmd()
+        # Control-plane fleet gauge, bracketed exactly like the stress lock:
+        # raw_report as-of joins raw_data/api_state_raw.csv onto the host samples.
+        self._api_state = ApiStateSampler(provider, self._log_dir / "raw_data" / "api_state_raw.csv", self._interval)
+
+    def _build_cmd(self) -> list[str]:
+        exe = shutil.which(_VM_MONITOR_BIN)
+        if exe is None:
+            return []
+        cmd = [
+            exe,
+            "--vmm",
+            self._vmm_resolved,
+            "-i",
+            str(self._interval),
+            "--numa",
+            self._numa,
+            "--disks",
+            self._disks,
+            "--stress-file",
+            str(self._stress_file),
+            "--log-dir",
+            str(self._log_dir),
+        ]
+        if self._capture_on:
+            cmd += ["--enable-capture", "--auto-skip"]
+        # Forward monitor.skip as --no-X flags. Unknown tokens are warned + dropped
+        # (never silently no-op; never crash the bench on a YAML typo).
+        for token in self._config.monitor.skip or []:
+            if token in _VALID_SKIP_STEMS:
+                cmd += [f"--no-{token}"]
+            else:
+                logger.warning("Unknown collector name: %s, skip ignored", token)
+        # Forward monitor.host_procs as repeated --host-proc flags. Each spec is
+        # passed through verbatim (comm or comm:cmdline_substr); vm-monitor parses.
+        for spec in self._config.monitor.host_procs or []:
+            cmd += ["--host-proc", spec]
+        # Skip the xlsx chart phase (forwards --no-charts). Opt-in for huge runs
+        # where the openpyxl chart build dominates export time.
+        if self._config.monitor.skip_charts:
+            cmd += ["--no-charts"]
+        # Log-capture rotation (forwards --log-rotation + knobs), only meaningful
+        # with capture on. Rotation logs land in <output_dir>/log_capture/
+        # (sibling of vm_monitor/), not inside vm_monitor's own log dir.
+        lr = self._config.monitor.log_rotation
+        if lr is not None and lr.enabled:
+            if not self._capture_on:
+                logger.warning("monitor.log_rotation enabled but capture is off; rotation will not run")
+            else:
+                cmd += ["--log-rotation", "--rotation-interval", str(lr.interval_sec)]
+                if lr.intervals:
+                    cmd += [
+                        "--rotation-intervals",
+                        ",".join(
+                            f"{t}={lr.intervals[t]}" for t in ("devkit", "ksys", "perf", "uprof") if t in lr.intervals
+                        ),
+                    ]
+                if lr.tools:
+                    cmd += ["--rotation-tools", ",".join(lr.tools)]
+                if lr.perf_events:
+                    cmd += ["--rotation-perf-events", ",".join(lr.perf_events)]
+                cmd += ["--rotation-log-dir", str(Path(self._config.output_dir) / "log_capture")]
+        # Hard upper bound: vm_monitor exits after this even if the lock is never
+        # removed (SIGKILL/OOM on the kernel side cannot reap the subprocess).
+        hard_t = getattr(self._config, "test_duration", self._report_timeout) + 60
+        cmd += ["-t", str(hard_t)]
+        return cmd
+
+    def start(self) -> None:
+        # Stale-lock cleanup: a prior hard crash (SIGKILL/OOM) may have left the
+        # lock; a spawned vm_monitor would treat it as "stress active" and exit
+        # immediately, and an external owner would read it as already-in-stress.
+        if (self._external or self._effective) and not self._clear_stale_marker():
+            return
+        if self._external:
+            logger.info("vm_monitor: host collector is external; this run publishes stress markers only")
+            return
+        if not self._effective:
+            logger.warning("vm_monitor disabled: provider=%s vmm=%s", self._provider.name, self._vmm_resolved)
+            return
+        if not self._cmd:
+            logger.warning("vm_monitor disabled: %s binary not found on PATH", _VM_MONITOR_BIN)
+            return
+        # Lock-dir / log-dir write probe (e.g. /dev/shm denied in restricted envs).
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            self._stdout_fh = open(self._log_dir / "stdout.log", "w", buffering=1)
+            self._stderr_fh = open(self._log_dir / "stderr.log", "w", buffering=1)
+        except OSError as e:
+            logger.warning("vm_monitor disabled: cannot write log_dir %s: %s", self._log_dir, e)
+            return
+        try:
+            # start_new_session: if stop() later detaches (vm_monitor still
+            # exporting past the courtesy wait), it must survive bench/shell exit
+            # to finish the xlsx build + os.replace async. Own session = immune to
+            # group signals (SIGHUP/SIGTERM) sent to the bench's process group.
+            self.proc = subprocess.Popen(
+                self._cmd,
+                stdout=self._stdout_fh,
+                stderr=self._stderr_fh,
+                start_new_session=True,
+            )
+        except OSError as e:
+            logger.error("vm_monitor failed to spawn: %s", e)
+            self._close_handles()
+            return
+        atexit.register(self._emergency_kill)
+        self._started = True
+        time.sleep(0.5)  # brief init; vm_monitor idles waiting for the lock
+
+    def _clear_stale_marker(self) -> bool:
+        """Drop a lock left by a hard-killed prior run; False when it cannot."""
+        if not self._stress_file.exists():
+            return True
+        try:
+            self._stress_file.unlink()
+        except OSError as e:
+            logger.warning("vm_monitor disabled: cannot remove stale lock %s: %s", self._stress_file, e)
+            return False
+        logger.warning("Stress lock file found from previous run, removing stale lock %s", self._stress_file)
+        return True
+
+    def begin_stress(self) -> None:
+        # The marker is published even with no local collector: an external
+        # owner needs this run's window to bracket the union across shards.
+        if not (self._started or self._external):
+            return
+        if self._gauge:
+            self._api_state.start()
+        try:
+            self._stress_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stress_file.touch()
+        except OSError as e:
+            logger.warning("vm_monitor: cannot create stress lock %s: %s", self._stress_file, e)
+            return
+        self._begin_ts = time.time()
+
+    def end_stress(self) -> None:
+        self._api_state.stop()  # before the guard: stop even if begin failed midway
+        if not (self._started or self._external):
+            return
+        try:
+            self._stress_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("vm_monitor: cannot remove stress lock %s: %s", self._stress_file, e)
+        self._end_ts = time.time()
+
+    @property
+    def stress_window(self) -> float | None:
+        """Seconds between begin_stress and end_stress, or None if the bracket never ran."""
+        if self._begin_ts is not None and self._end_ts is not None:
+            return self._end_ts - self._begin_ts
+        return None
+
+    def _close_handles(self) -> None:
+        for attr in ("_stdout_fh", "_stderr_fh"):
+            fh = getattr(self, attr)
+            if fh is not None and not fh.closed:
+                try:
+                    fh.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            setattr(self, attr, None)
+
+    def stop(self) -> list[Path]:
+        """Wait briefly for vm_monitor to finish + write ``resource_report.xlsx``;
+        if it isn't done, **detach** -- never kill.
+
+        Killing is what loses the report. The xlsx is the LAST artifact
+        (``export_to_excel`` after CSV/SVG), and for a large run the openpyxl
+        build alone can exceed any fixed kill budget. SIGTERM cannot interrupt
+        it (the handler only flags the sampling loop, already done), so a kill
+        cliff escalates SIGTERM -> SIGKILL mid-build, leaving an orphan
+        ``.build.xlsx`` and no ``resource_report.xlsx``. The atomic
+        ``build -> os.replace`` only prevents a *corrupt* final file; a kill
+        *before* the rename produces no report at all.
+
+        So we do not kill. We block the bench only for a courtesy
+        ``report_timeout`` window hoping to collect the report inline (small
+        runs finish in seconds; ``merge_report`` still works). If vm_monitor
+        is still exporting past that, we detach: it keeps running in its own
+        session (``start_new_session`` at spawn) and finishes the build +
+        ``os.replace`` asynchronously, writing ``resource_report.xlsx`` on its
+        own. ``-t`` (sampling) + ``capture.wait``'s internal timeouts bound
+        collection; the export then runs to completion. ``_emergency_kill``
+        skips detached procs so a normal bench exit does not reap it.
+
+        This also unblocks the bench's own ``obs.xlsx`` (rendered right after
+        this returns instead of after a 15-min kill cliff); ``merge_source``
+        is None-graceful when the report isn't ready yet.
+        """
+        self._api_state.stop()  # idempotent; covers a stop() without end_stress()
+        if not self._started:
+            return []  # external collector: no subprocess, but the gauge stopped above
+        xlsx = self._log_dir / "resource_report.xlsx"
+        # Courtesy wait for a clean exit + synchronous report collection. This
+        # is NOT a kill cliff (there is no kill); it is only how long we block
+        # the bench hoping to collect the report inline.
+        exit_rc = self.proc.poll()
+        deadline = time.time() + self._report_timeout
+        while exit_rc is None and time.time() < deadline:
+            if xlsx.exists() and self.report_xlsx is None:
+                self.report_xlsx = xlsx
+            time.sleep(1)
+            exit_rc = self.proc.poll()
+        if exit_rc is not None:
+            # Process exited on its own -- collect the report if it produced one.
+            if not xlsx.exists():
+                logger.error("vm_monitor subprocess exited (code=%s) without report", exit_rc)
+            elif self.report_xlsx is None:
+                self.report_xlsx = xlsx
+            self._close_handles()
+            self._started = False
+            return [self.report_xlsx] if self.report_xlsx is not None else []
+        # Still running -- DETACH. Never kill: the xlsx is written last and a
+        # kill now (or at any cliff) lands mid-build and loses the report --
+        # the orphan ``.build.xlsx`` such a kill leaves is exactly the bug we
+        # are removing. vm_monitor finishes the build + os.replace async.
+        logger.warning(
+            "vm_monitor still exporting after %ds; detaching -- it will write %s "
+            "asynchronously (not killed: a kill mid-build loses the report)",
+            self._report_timeout,
+            xlsx,
+        )
+        self._detached = True
+        self._close_handles()  # bench releases its fds; vm_monitor keeps inherited copies
+        self._started = False
+        return [self.report_xlsx] if self.report_xlsx is not None else []
+
+    def abandon(self) -> None:
+        """Stop a collector that never saw stress: nothing to export, so no wait.
+
+        ``stop()`` blocks up to ``report_timeout`` hoping for a report. That is
+        right after a real window (the xlsx is written last and must not be
+        killed mid-build), but wrong for a collector still idling for a lock
+        that will never appear -- the stress-file protocol has no idle timeout,
+        so it would wait forever while the bench waits ``report_timeout`` and
+        then detaches it. Nothing has been sampled yet, so terminating loses no
+        artifact.
+        """
+        self._api_state.stop()
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        self._close_handles()
+        self._started = False
+
+    def wait_for_host_resources(self, timeout: int = 30) -> Path | None:
+        """Briefly wait for ``host_resources.xlsx`` (the fast, CSV-only artifact
+        written FIRST in vm_monitor's export phase), then detach -- never block
+        for the slow ``resource_report.xlsx``.
+
+        On a Ctrl+C / SIGTERM teardown the happy-path ``stop()`` never ran, so
+        nothing was waiting for vm_monitor's export. But ``end_stress`` already
+        removed the lock, so vm_monitor exits monitoring, flushes the raw CSVs
+        in its ``finally``, and writes host_resources first (seconds -- it reads
+        only the line-flushed CSVs, not the in-memory chart stack). A short wait
+        here catches it; vm_monitor keeps the slow SVG/xlsx as a detached orphan
+        that ``_emergency_kill`` won't reap (no SIGTERM mid-export). No-op when
+        the monitor never started or ``stop()`` already ran (``_started`` False).
+        """
+        if not self._started:
+            return None
+        hr = self._log_dir / "host_resources.xlsx"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if hr.exists():
+                break
+            if self.proc is not None and self.proc.poll() is not None:
+                break  # vm_monitor exited (crash or done) -- one last check below
+            time.sleep(1)
+        found = hr if hr.exists() else None
+        if found is None:
+            logger.warning(
+                "host_resources.xlsx not produced within %ds; raw CSVs are still on "
+                "disk -- run `vm-monitor raw-report %s` to regenerate",
+                timeout,
+                self._log_dir,
+            )
+        # Detach so vm_monitor finishes the slow SVG/xlsx as an orphan;
+        # _emergency_kill skips detached procs (no SIGTERM mid-export).
+        self._detached = True
+        self._close_handles()
+        self._started = False
+        return found
+
+    def merge_source(self) -> Path | None:
+        """Return the host report to merge into the obs workbook, or ``None``.
+
+        The obs renderer ingests host sheets (VM_Stats/NUMA_Overview/DevKit_TopDown)
+        during its single write pass, so this controller no longer touches the obs
+        file -- a previous load/save round-trip there dropped every chart and PNG.
+        Returns the report path when ``merge_report`` is set and a report exists;
+        any failure (incl. openpyxl OOM on large workbooks) -> None; raw artifacts
+        always remain in <log_dir>/.
+        """
+        if self.report_xlsx is None or not self._merge_report:
+            return None
+        if not Path(self.report_xlsx).exists():
+            logger.warning("vm_monitor merge skipped: report missing (%s)", self.report_xlsx)
+            return None
+        return self.report_xlsx
+
+    def _emergency_kill(self) -> None:
+        """atexit backstop. Does NOT run on SIGKILL/OOM -- documented limitation;
+        vm_monitor's own -t timer is the hard back-stop in those cases. Skipped
+        when stop() detached vm_monitor: reaping it on bench exit would lose the
+        report it is still asynchronously writing."""
+        if self._detached:
+            return  # detached: let it finish + os.replace; do not reap
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        self._close_handles()

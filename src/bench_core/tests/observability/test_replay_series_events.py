@@ -1,0 +1,394 @@
+"""Phase 2: structured retry/admission/trajectory events written to the series."""
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+
+import pytest
+
+from bench_core.admission import Admission, QpsRateLimiter, RunningSlotScheduler, ShutdownInterrupted
+from bench_core.config import KernelConfig
+from bench_core.observability.lifecycle_series import LifecycleSeriesWriter
+from bench_core.payload.replay_payload import ReplayStep, Trajectory
+from bench_core.schemas import BenchSandbox
+from bench_core.task_runner.replay import ReplayBaseRunner, ReplayConfig
+from bench_core.workflow_registry import RunContext
+from env_provider import CommandResult, SandboxInstance
+from env_provider.tests.lifecycle_fake import FakeLifecycleProvider
+
+
+def _series_events(tmp_path: Path) -> list[dict]:
+    return [json.loads(l) for l in (tmp_path / "s.jsonl").read_text().splitlines()]
+
+
+class TestRetryEvents:
+    def _runner(self, tmp_path, *, retries=2, qps=100.0, stop=None):
+        cfg = KernelConfig(
+            workflow_type="replay",
+            workflow_config=ReplayConfig(
+                replay_mode="lifecycle",
+                replay_lifecycle_retries=retries,
+                replay_ready_probe=False,
+            ),
+        )
+        provider = FakeLifecycleProvider(count=1)
+        provider.create_all()
+        state = BenchSandbox.from_instance(provider._instances[0], "replay")
+        stop = stop or threading.Event()
+        series = LifecycleSeriesWriter(tmp_path / "s.jsonl")
+        adm = Admission(
+            slots=RunningSlotScheduler(maximum=1, stop_event=stop),
+            qps=QpsRateLimiter(qps=qps, inflight_cap=4, stop_event=stop),
+        )
+        runner = ReplayBaseRunner(
+            RunContext(state=state, config=cfg, stop_event=stop, provider=provider, series=series, admission=adm)
+        )
+        return runner, series, provider, state
+
+    def test_retry_queued_and_recovered_on_transient_then_success(self, tmp_path):
+        class _Flaky(FakeLifecycleProvider):
+            def __init__(self):
+                super().__init__(count=1)
+                self._n = 0
+
+            def resume(self, inst):
+                self._n += 1
+                if self._n == 1:
+                    raise RuntimeError("503 gateway timeout")
+                super().resume(inst)
+
+        runner, series, provider, state = self._runner(tmp_path)
+        flaky = _Flaky()
+        runner.provider = flaky  # inject flaky
+        runner._lifecycle_call_with_retry("resume", lambda: flaky.resume(state))
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"].startswith("retry_")]
+        types = [e["event"] for e in events]
+        assert "retry_queued" in types
+        assert "retry_recovered" in types
+        queued = next(e for e in events if e["event"] == "retry_queued")
+        assert queued["operation"] == "resume"
+        assert queued["attempt"] == 1
+        assert queued["error_type"] == "RuntimeError"
+        assert "503" in queued["error"]
+        # ReplayMetrics accumulator advanced
+        assert state.replay_metrics.retry_queued_count == 1
+        recovered = next(e for e in events if e["event"] == "retry_recovered")
+        assert recovered["attempt"] == 2  # recovered on the 2nd (1-indexed) attempt
+
+    def test_retry_exhausted_on_non_transient(self, tmp_path):
+        class _Hard(FakeLifecycleProvider):
+            def resume(self, inst):
+                raise RuntimeError("permanent boom")
+
+        runner, series, provider, state = self._runner(tmp_path)
+        hard = _Hard()
+        runner.provider = hard
+        with pytest.raises(RuntimeError, match="permanent boom"):
+            runner._lifecycle_call_with_retry("resume", lambda: hard.resume(state))
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"] == "retry_exhausted"]
+        assert len(events) == 1
+        assert events[0]["retryable"] is False
+
+    def test_shutdown_mid_retry_emits_no_retry_exhausted(self, tmp_path):
+        """Negative: ShutdownInterrupted (BaseException) raised mid-retry bypasses
+        ``except Exception`` -> no retry_exhausted. Post-decoupling, rate pacing
+        is ONCE pre-loop (not per-attempt), so a mid-loop shutdown surfaces from
+        the call body. Attempt 1 is transient (-> retry_queued); attempt 2 raises
+        ShutdownInterrupted, which must propagate unchanged."""
+
+        class _TransientThenShutdown(FakeLifecycleProvider):
+            def __init__(self):
+                super().__init__(count=1)
+                self._n = 0
+
+            def resume(self, inst):
+                self._n += 1
+                if self._n == 1:
+                    raise RuntimeError("503 gateway timeout")
+                raise ShutdownInterrupted("shutdown on attempt 2")
+
+        stop = threading.Event()
+        runner, series, provider, state = self._runner(tmp_path, stop=stop)
+        tns = _TransientThenShutdown()
+        runner.provider = tns
+        with pytest.raises(ShutdownInterrupted):
+            runner._lifecycle_call_with_retry("resume", lambda: tns.resume(state))
+        series.close()
+        events = _series_events(tmp_path)
+        assert [e for e in events if e["event"] == "retry_exhausted"] == []
+        # attempt 1 WAS transient -> retry_queued emitted (proves we entered the
+        # retry loop before the shutdown, i.e. the shutdown is genuinely mid-retry).
+        assert len([e for e in events if e["event"] == "retry_queued"]) == 1
+
+    def test_first_attempt_success_emits_no_retry_event(self, tmp_path):
+        runner, series, provider, state = self._runner(tmp_path)
+        runner._lifecycle_call_with_retry("resume", lambda: provider.resume(state))
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"].startswith("retry_")]
+        assert events == []
+
+
+class TestAdmissionEvents:
+    def _runner(self, tmp_path, *, mode="lifecycle", admission=True):
+        cfg = KernelConfig(
+            workflow_type="replay", workflow_config=ReplayConfig(replay_mode=mode, replay_ready_probe=False)
+        )
+        provider = FakeLifecycleProvider(count=1)
+        provider.create_all()
+        state = BenchSandbox.from_instance(provider._instances[0], "replay")
+        stop = threading.Event()
+        series = LifecycleSeriesWriter(tmp_path / "s.jsonl")
+        adm = None
+        if admission:
+            adm = Admission(
+                slots=RunningSlotScheduler(maximum=1, stop_event=stop),
+                qps=QpsRateLimiter(qps=1000.0, inflight_cap=4, stop_event=stop),
+            )
+        runner = ReplayBaseRunner(
+            RunContext(state=state, config=cfg, stop_event=stop, provider=provider, series=series, admission=adm)
+        )
+        return runner, series, provider, state
+
+    def test_slot_acquire_and_release_emitted(self, tmp_path):
+        runner, series, provider, state = self._runner(tmp_path)
+        step = ReplayStep(index=0, action_type="shell", action="echo hi", delay_time_sec=0.0)
+        runner._run_slice(step, trajectory_id="t1")
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"] in ("slot_acquire", "slot_release")]
+        assert [e["event"] for e in events] == ["slot_acquire", "slot_release"]
+        acq = events[0]
+        assert acq["sandbox_index"] == state.index
+        assert "lease_id" in acq and "queue_wait_sec" in acq and "active_after" in acq
+
+    def test_no_admission_events_in_exec_only(self, tmp_path):
+        runner, series, provider, state = self._runner(tmp_path, mode="exec_only", admission=False)
+        step = ReplayStep(index=0, action_type="shell", action="echo hi", delay_time_sec=0.0)
+        runner._run_slice(step)
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"].startswith("slot_")]
+        assert events == []
+
+    def test_step_event_carries_compact_action(self, tmp_path):
+        """The series ``step`` event carries a single-line, truncated ``action``
+        so replay_result.json can show which command ran without joining back to
+        the trajectory ``*.replay.json`` source. str_replace_editor actions can
+        carry whole-file content (tens of KB) -- verify short actions pass through
+        verbatim (newlines flattened) and long ones are capped at
+        ``ACTION_SERIES_LIMIT`` with a truncation marker.
+        """
+        from bench_core.task_runner.replay import ACTION_SERIES_LIMIT
+
+        runner, series, provider, state = self._runner(tmp_path)
+
+        short = ReplayStep(index=0, action_type="shell", action="echo hi\nsecond line", delay_time_sec=0.0)
+        runner._run_slice(short, trajectory_id="t1")
+
+        long_action = "x" * (ACTION_SERIES_LIMIT + 50)
+        big = ReplayStep(index=1, action_type="str_replace_editor", action=long_action, delay_time_sec=0.0)
+        runner._run_slice(big, trajectory_id="t1")
+        series.close()
+
+        steps = [e for e in _series_events(tmp_path) if e["event"] == "step"]
+        assert len(steps) == 2
+
+        # Short action: newlines flattened to literal \n, otherwise verbatim.
+        assert steps[0]["action"] == "echo hi\\nsecond line"
+        assert len(steps[0]["action"]) < ACTION_SERIES_LIMIT
+
+        # Long action: capped at the limit + truncation marker; not the full body.
+        assert len(steps[1]["action"]) == ACTION_SERIES_LIMIT + len("…<truncated>")
+        assert steps[1]["action"].endswith("…<truncated>")
+        assert "x" * ACTION_SERIES_LIMIT in steps[1]["action"]
+
+
+class TestStepOutput:
+    """Series ``step`` events carry the command's run result (stdout/stderr):
+    short output passes through verbatim, long output is TAIL-capped (marker
+    prefix -- the error tail is what a debugger reads), and control characters
+    are slimmed so neither the JSONL nor an Excel cell chokes on them. The
+    producer-side cost is bounded by ``STEP_OUTPUT_LIMIT`` regardless of the
+    real output size (truncate-before-scan); these tests pin the shape."""
+
+    def _runner(self, tmp_path):
+        runner, series, provider, state = TestAdmissionEvents()._runner(tmp_path, mode="exec_only", admission=False)
+        return runner, series, provider, state
+
+    def _exec(self, runner, provider, action, *, stdout="", stderr="", exit_code=0):
+        provider._exec_results[action] = CommandResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
+        runner._run_slice(
+            ReplayStep(index=0, action_type="shell", action=action, delay_time_sec=0.0), trajectory_id="t1"
+        )
+
+    def test_short_output_passes_through_verbatim(self, tmp_path):
+        from bench_core.task_runner.replay import STEP_OUTPUT_LIMIT
+
+        runner, series, provider, state = self._runner(tmp_path)
+        self._exec(runner, provider, "ls /a", stdout="file1\nfile2\n")
+        series.close()
+        ev = [e for e in _series_events(tmp_path) if e["event"] == "step"][0]
+        assert ev["stdout"] == "file1\nfile2\n"
+        assert ev["stderr"] == ""
+        assert len(ev["stdout"]) < STEP_OUTPUT_LIMIT
+
+    def test_long_output_tail_truncated_keeps_failure_tail(self, tmp_path):
+        from bench_core.task_runner.replay import STEP_OUTPUT_LIMIT
+
+        runner, series, provider, state = self._runner(tmp_path)
+        # len(stderr) > limit: only the LAST limit chars survive, marker prefix.
+        tail = "END-OF-TRACEBACK"
+        err = "x" * STEP_OUTPUT_LIMIT + tail
+        self._exec(runner, provider, "boom", stdout="spam\n", stderr=err, exit_code=1)
+        series.close()
+        ev = [e for e in _series_events(tmp_path) if e["event"] == "step"][0]
+        assert ev["stderr"].startswith("<truncated>…")
+        assert ev["stderr"].endswith(tail)  # the error story is in the tail
+        assert len(ev["stderr"]) == STEP_OUTPUT_LIMIT + len("<truncated>…")
+        # the head is dropped: the retained span is exactly the tail chunk
+        # (limit - len(tail) x's pushed out of the front).
+        assert ev["stderr"].count("x") == STEP_OUTPUT_LIMIT - len(tail)
+        assert ev["stdout"] == "spam\n"  # short other stream untouched
+
+    def test_control_chars_slimmed_not_crash(self, tmp_path):
+        runner, series, provider, state = self._runner(tmp_path)
+        self._exec(runner, provider, "ansi", stdout="\x1b[31mred\x00\x1b[0m\n")
+        series.close()
+        ev = [e for e in _series_events(tmp_path) if e["event"] == "step"][0]
+        assert "\x1b" not in ev["stdout"] and "\x00" not in ev["stdout"]
+        # ESC -> space; NUL dropped outright; newline kept.
+        assert ev["stdout"] == " [31mred [0m\n"
+
+
+class TestTrajectoryEvents:
+    def test_create_and_kill_events_emitted(self, tmp_path):
+        class _Provider(FakeLifecycleProvider):
+            def __init__(self):
+                super().__init__(count=0)
+                self.killed = []
+
+            def kill_one(self, inst):
+                self.killed.append(inst.index)
+                super().kill_one(inst)
+
+        cfg = KernelConfig(
+            workflow_type="replay",
+            total_count=1,
+            workflow_config=ReplayConfig(
+                replay_mode="exec_ephemeral",
+                replay_running_concurrency=1,
+                replay_control_plane_qps=100.0,
+                replay_ready_probe=False,
+            ),
+        )
+        provider = _Provider()
+        stop = threading.Event()
+        state = BenchSandbox.from_instance(SandboxInstance(id="shell", index=1), "replay")
+        state.ready = True
+        state.is_alive = True
+        series = LifecycleSeriesWriter(tmp_path / "s.jsonl")
+        runner = ReplayBaseRunner(
+            RunContext(state=state, config=cfg, stop_event=stop, provider=provider, series=series, admission=None)
+        )
+        traj = Trajectory(
+            path=Path("tr-1"),
+            instance_id="tr-1",
+            environment="env",
+            steps=(ReplayStep(index=0, action="echo hi", delay_time_sec=0.0, action_type="shell"),),
+        )
+        runner._run_trajectory(traj)
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"] in ("trajectory_create", "trajectory_kill")]
+        assert [e["event"] for e in events] == ["trajectory_create", "trajectory_kill"]
+        assert events[0]["trajectory_id"] == "tr-1"
+        assert "create_sec" in events[0] and events[0]["success"] is True
+        assert "kill_sec" in events[1]
+        assert provider.killed == [1]  # kill_one ran with the sandbox index
+
+    def test_create_failure_emits_event_with_success_false(self, tmp_path):
+        class _FailCreate(FakeLifecycleProvider):
+            def __init__(self):
+                super().__init__(count=0)
+
+            def create_one(self, index, *, template=None, metadata=None):
+                raise RuntimeError("create boom")
+
+        cfg = KernelConfig(
+            workflow_type="replay",
+            total_count=1,
+            workflow_config=ReplayConfig(
+                replay_mode="exec_ephemeral",
+                replay_running_concurrency=1,
+                replay_control_plane_qps=100.0,
+                replay_ready_probe=False,
+            ),
+        )
+        provider = _FailCreate()
+        stop = threading.Event()
+        state = BenchSandbox.from_instance(SandboxInstance(id="shell", index=1), "replay")
+        state.ready = True
+        state.is_alive = True
+        series = LifecycleSeriesWriter(tmp_path / "s.jsonl")
+        runner = ReplayBaseRunner(
+            RunContext(state=state, config=cfg, stop_event=stop, provider=provider, series=series, admission=None)
+        )
+        traj = Trajectory(
+            path=Path("tr-1"),
+            instance_id="tr-1",
+            environment="env",
+            steps=(ReplayStep(index=0, action="echo hi", delay_time_sec=0.0, action_type="shell"),),
+        )
+        runner._run_trajectory(traj)
+        series.close()
+        events = [e for e in _series_events(tmp_path) if e["event"] == "trajectory_create"]
+        assert len(events) == 1
+        assert events[0]["success"] is False
+        assert events[0]["error_type"] == "RuntimeError"
+        assert "create boom" in events[0]["error"]
+        # No kill event since create failed and we returned early
+        kill_events = [e for e in _series_events(tmp_path) if e["event"] == "trajectory_kill"]
+        assert kill_events == []
+
+    def test_kill_failure_emits_event_with_success_false(self, tmp_path):
+        class _FailKill(FakeLifecycleProvider):
+            def __init__(self):
+                super().__init__(count=0)
+
+            def kill_one(self, inst):
+                raise RuntimeError("kill boom")
+
+        cfg = KernelConfig(
+            workflow_type="replay",
+            total_count=1,
+            workflow_config=ReplayConfig(
+                replay_mode="exec_ephemeral",
+                replay_running_concurrency=1,
+                replay_control_plane_qps=100.0,
+                replay_ready_probe=False,
+            ),
+        )
+        provider = _FailKill()
+        stop = threading.Event()
+        state = BenchSandbox.from_instance(SandboxInstance(id="shell", index=1), "replay")
+        state.ready = True
+        state.is_alive = True
+        series = LifecycleSeriesWriter(tmp_path / "s.jsonl")
+        runner = ReplayBaseRunner(
+            RunContext(state=state, config=cfg, stop_event=stop, provider=provider, series=series, admission=None)
+        )
+        traj = Trajectory(
+            path=Path("tr-1"),
+            instance_id="tr-1",
+            environment="env",
+            steps=(ReplayStep(index=0, action="echo hi", delay_time_sec=0.0, action_type="shell"),),
+        )
+        runner._run_trajectory(traj)
+        series.close()
+        create_events = [e for e in _series_events(tmp_path) if e["event"] == "trajectory_create"]
+        assert len(create_events) == 1 and create_events[0]["success"] is True
+        kill_events = [e for e in _series_events(tmp_path) if e["event"] == "trajectory_kill"]
+        assert len(kill_events) == 1
+        assert kill_events[0]["success"] is False
+        assert kill_events[0]["error_type"] == "RuntimeError"
+        assert "kill boom" in kill_events[0]["error"]

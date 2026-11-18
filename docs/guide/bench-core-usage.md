@@ -1,0 +1,644 @@
+# bench-core Usage Guide (src kernel)
+
+[**中文版**](bench-core-usage-zh.md)
+
+> New here? The repo [README](../../README.md) has the one-command quick start (fake → docker →
+> aenv); this guide picks up from there.
+>
+> The host-agnostic stress-test kernel. It drives e2b / docker / aenv / aenv-go / cubesandbox / fake
+> backends through the `EnvironmentProvider` abstraction. It coexists with — and shares no code
+> with — the frozen legacy `e2b_bench/` and `docker_bench/`. Adding a backend means one new
+> `env_provider` submodule; the kernel and the contract stay untouched.
+
+## Overview
+
+`bench_core` decouples the stress flow from the sandbox implementation: the kernel issues
+every command through a single `exec()` primitive, and a sandbox backend (e2b / docker /
+aenv / aenv-go / cubesandbox / future kata …) only has to run that command inside a sandbox and return the
+result. Swapping a backend is therefore just `--provider` — **the same stress profile runs the
+same load curve on any backend**.
+
+- `src/bench_core/` — the kernel: `run_benchmark` spine, stats / round-robin / task
+  runners, `KernelConfig`. It never statically imports a backend SDK.
+- `src/env_provider/` — the contract (`EnvironmentProvider` ABC + `SandboxInstance`) and
+  the e2b / docker / aenv / aenv-go / cubesandbox / fake provider impls (opt-in submodules; the contract
+  itself stays SDK-free).
+- `config/common/` — backend-agnostic workflow configs. Each carries the backend blocks its
+  providers need (`e2b:` + `docker:` for browser/coding/document; `aenv:`/`aenv_go:`/`cubesandbox:` too for
+  replay); `--provider` selects which block is read.
+
+---
+
+## Quick start
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+python -m pip install -e .
+
+# 1) kernel smoke — no backend SDK, a few seconds
+bench-core --provider fake --config config/common/browser.yaml --create-only -n 1
+
+# 2) a real backend: keep the fleet tiny for a first run (AgentENV is the main path)
+bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --test-duration 600
+bench-core --provider docker --config config/common/docker-browser.yaml --create-only -n 2   # or: local daemon
+```
+
+For a first connectivity-only check, temporarily set `replay.delay_scale` to `0.02` (think time
+compressed 50x, so `success` shows up within tens of seconds); restore `1.0` before collecting
+real numbers. At scale 1.0 the trajectories carry their recorded think time (in the bundled 55,
+the shortest needs ~3.5 min and the median ~20 min); a window shorter than one trajectory keeps
+executing steps but reports `success = 0` — that is "not finished", not "did not start".
+
+Step 2 needs its prerequisites met first, and the shipped YAMLs do **not** satisfy them out of the
+box:
+
+- **aenv** — the `aenv:` block must point at your server (`template` = image/disk name,
+  `env.E2B_API_URL` / `E2B_SANDBOX_URL`, pasted `E2B_ACCESS_TOKEN` / `E2B_API_KEY`).
+- **aenv-go** — same `aenv:` server, but driven by a resident Go worker instead of the e2b SDK.
+  Build the worker first ([go-client/README.md](../../go-client/README.md)),
+  then `--provider aenv-go` reuses the same YAML (`aenv_go:` keys fall back to `aenv:`).
+- **replay** — the pool and its template manifest are pre-wired to the bundled 55
+  (`artifacts/traces/replays` + `artifacts/traces/image-map.json`, §8.3), so a fresh checkout runs.
+- **docker** — `docker.image` must exist locally (the shipped names are placeholders, §7).
+
+The `-n` cap matters: the shipped replay profiles declare a full 384-sandbox fleet, so without it
+a "short run" would try to provision 384 backends.
+
+§2.1 shows the block layout; the
+aenv walkthrough — edit order, which monitoring to skip, ratios, long `test_duration` — is in
+[oversub-bench-usage.md](oversub-bench-usage.md) §1.1.
+
+For a ratio sweep instead of a single run, use the driver (add `--dry-run` to see what it would do):
+
+```bash
+oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.yaml
+```
+
+---
+
+## 1. Install
+
+After an editable install both `bench-core` and `python -m bench_core` work with **no
+`PYTHONPATH=src`**:
+
+> Requires **Python 3.11+** (CI runs 3.13; see `pyproject.toml` `requires-python`).
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -e .
+```
+
+`pip install -e .` pulls the core deps declared in `pyproject.toml` (`e2b`, `psutil`, `paramiko`,
+`flask`, `PyYAML`, `pandas`, `openpyxl`, …) — `requirements.txt` is not needed for the kernel.
+`e2b` is a **core** dependency (both `--provider e2b` and `--provider aenv` ride it), pinned to
+`2.46.0` on purpose: the AENV server speaks the E2B-compatible API of 2.46.x, and 2.47+ changed the
+`Sandbox.create` request shape (AENV answers `405`, every create fails, `total=0`). Never float it
+past the pin. The e2b cloud is unaffected.
+
+The remaining backend SDKs are opt-in — install only the one you use (`fake` needs none):
+
+```bash
+pip install docker                    # --provider docker
+pip install -e ".[cubesandbox]"       # --provider cubesandbox
+```
+
+**aenv-go** uses no SDK — same AENV server, resident Go worker client (protocol v2, line-
+delimited JSON over stdin/stdout). Build the worker first (stdlib-only Go, needs Go 1.22+):
+
+```bash
+bash go-client/build.sh               # produces go-client/bin/agent-benchmark-go
+```
+
+Override the path with `AGENT_BENCHMARK_GO_BIN` or the `aenv_go:` block's `go_client_bin`
+(missing keys fall back to `aenv:`, §2.1 / [go-client/README.md](../../go-client/README.md)).
+A missing binary is a **hard error, no e2b fallback** — the point of aenv-go is a client A/B
+against the e2b SDK.
+
+> Verify in one command (no SDK): `bench-core --provider fake --config config/common/browser.yaml --create-only -n 1`
+> — if it runs, the kernel + CLI + config parse are all ready.
+
+---
+
+## 2. Config
+
+### 2.1 File structure
+
+Each YAML in `config/common/` is one workflow and carries the backend blocks its providers need
+(browser/coding/document: `e2b:` + `docker:`; replay: `e2b:` + `docker:` + `aenv:` + `cubesandbox:`):
+
+```yaml
+workflow_type: browser        # browser | coding | document | replay
+
+e2b:                          # --provider e2b reads this block
+  template: "openclaw-browser-v1"
+  numa_bind: 2
+  sandbox_ids_file: "sandboxs.txt"
+  env: { ... }                # placeholder creds auto-fallback to ~/.e2b/config.json
+
+docker:                       # --provider docker reads this block
+  image: "ubuntu-openclaw-chromium:24.04-arm64"
+  container_prefix: "oc-bench"
+  cpu_limit: 2.0
+  memory_limit: "2g"
+
+# === shared stress sections (every backend reads -> KernelConfig) ===
+sandbox:      { total_count: 100, ... }
+create_batch: { size: 20, interval: 3 }
+task_batch:   { size: 10, interval: 5 }
+browser:      { urls: [...], warmup_urls: [...], ... }
+test:         { duration: 160, benchmark_mode: "round_robin", ... }
+report:       { output_dir: "results/browser", filename_prefix: "browser_bench" }
+```
+
+`KernelConfig.from_raw` is the **single reader** of the shared sections
+(`workflow_type` + `sandbox` / `create_batch` / `task_batch` / `browser` / `coding` /
+`document` / `replay` / `test` / `report` / `monitor`); each backend's own `Config.from_raw`
+reads only its block. `--provider` picks the block, so **the same stress profile runs on
+any backend**.
+
+### 2.2 Workflow configs
+
+| Config | workflow | Notes |
+|--------|----------|-------|
+| `browser.yaml` | browser | round-robin tab-switch, 100 sandboxes |
+| `coding-ts.yaml` | coding | TypeScript (vuejs/core), `npx tsx` verify, `verify_repeat: 3` |
+| `coding-go.yaml` | coding | Go (gohugoio/hugo), `go run` verify, `verify_repeat: 1` |
+| `coding-python.yaml` | coding | Python (django/django), `python3` verify, `verify_repeat: 1` |
+| `docker-browser.yaml` | browser | docker-only small profile (10 containers, single URL) |
+| `pdf_bench.yaml` | document | PDF scene replay against an in-image seed |
+| `xlsx_bench.yaml` | document | XLSX scene replay against an in-image seed |
+| `replay.yaml` | replay | aenv lifecycle 1:1 baseline (see §8) |
+| `replay-exec-only.yaml` | replay | exec_only baseline (e2b/docker/fake) |
+| `replay-ephemeral.yaml` | replay | exec_ephemeral profile (`EphemeralCapable` provider) |
+
+### 2.3 Why the coding configs are so thin
+
+All three coding configs **omit `source_files`** — `KernelConfig.__post_init__` auto-fills
+the canonical replacement pairs from `CODING_LANGUAGE_DEFAULT_SOURCE_FILES[language]`
+(6 pairs per language, drawn from real SWE-bench instances): ts → vuejs/core, go →
+gohugoio/hugo, python → django/django. The pairs live in
+`src/bench_core/payload/coding_payload.py`; a config only declares `language` +
+`verify_cmd` + `verify_repeat`.
+
+### 2.4 Credentials: placeholder auto-fallback
+
+`your_e2b_access_token_here` / `your_e2b_api_key_here` in a YAML are placeholders. The e2b
+provider treats them as unset and falls back to `~/.e2b/config.json` (the E2B CLI config,
+reading `teamApiKey` / `accessToken`), so **copy the template as-is — don't put real keys
+in YAML**. Point `E2B_CONFIG` at another path to override.
+
+### 2.5 Readiness is provider-transparent
+
+Readiness (waiting for a sandbox to be usable after creation) is a **workflow concern, not
+a backend knob** — driven by `src/env_provider/_ready.py` (`ReadyChecker`), with every manager
+(e2b / docker / aenv / cubesandbox) running the same logic:
+
+- browser → port scan for `18789` (openclaw-gateway) + `11436` (llama-server)
+- coding → `uname -a` returns non-empty
+- document → `document-bench-validate` exits 0 (a completed non-zero exit is an immediate
+  image failure, not retried)
+- replay → reuses the coding probe
+
+Constants `READY_MAX_WAIT = 300`, `READY_INTERVAL = 5`. **No `port_check` / timing knobs
+appear in any `config/common/*.yaml`** — they are kernel constants. (The legacy
+`config/docker/docker_bench.yaml` still ships a `port_check:` block, but the kernel's
+docker `Config.from_raw` never reads it.)
+
+---
+
+## 3. CLI
+
+```text
+bench-core --config <yaml> --provider {fake,e2b,docker,aenv,cubesandbox} [mode/params]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--config` | YAML config path |
+| `--provider` | `fake` (no SDK) / `e2b` / `docker` / `aenv` / `cubesandbox` |
+| `-n, --total-count` | override sandbox count |
+| `--workflow-type` | `browser` / `coding` / `document` / `replay` |
+| `-bm, --benchmark-mode` | `fixed` / `round_robin` |
+| `--round-count` / `--round-size` / `--test-duration` / `--benchmark-percent` | override benchmark params |
+| `--create-only` | create + ready-check + persist IDs, then exit (keep running) |
+| `--detect` | reuse existing sandboxes (no create); no cleanup at end |
+| `--warmup-only` | create/detect + warmup, then exit (keep running) |
+| `--cleanup` | list + kill all existing sandboxes, then exit |
+| `-o, --output-dir` | override report output dir |
+| `--report-format` | `txt` (default) / `xlsx` / `both` (xlsx adds an openpyxl workbook) |
+| `--vm-monitor` | `auto` (default, by provider `vmm_type`) / `true` / `false` |
+| `--no-vm-monitor` | short-circuit vm_monitor off (overrides `--vm-monitor` and YAML) |
+| `--log-level` | `debug` (also surfaces per-step stderr for non-zero exits) / `info` (default) / `warning` |
+
+> `bench-core: command not found`? See §7. Equivalent: `python -m bench_core …`.
+
+---
+
+## 4. Workflow: the phase ladder
+
+Validate tier-by-tier — create → reuse+warmup → short benchmark → cleanup — so a failure
+locates the phase immediately. `--create-only` and `--detect` both leave sandboxes running,
+so finish with `--cleanup`.
+
+### Tier 0 — fake (zero deps, validates the kernel)
+
+No SDK, no daemon, seconds. Validates the full `run_benchmark` spine + report generation:
+
+```bash
+bench-core --provider fake --config config/common/browser.yaml   --test-duration 10 -n 3
+bench-core --provider fake --config config/common/coding-ts.yaml --test-duration 10 -n 3
+```
+
+### Tier 1 — docker (local daemon, real backend)
+
+Prerequisite: Docker daemon reachable; image built and its openclaw-gateway (18789) +
+llama-server (11436) listen (browser readiness scans these ports).
+
+```bash
+# 1) create 2 containers, ready-check, persist IDs
+bench-core --provider docker --config config/common/browser.yaml --create-only -n 2
+
+# 2) detect existing containers + warmup (docker detect keys on prefix oc-bench-*)
+bench-core --provider docker --config config/common/browser.yaml --detect --warmup-only
+
+# 3) detect + 30s short benchmark + report (detect mode does not kill at the end)
+bench-core --provider docker --config config/common/browser.yaml --detect --test-duration 30
+
+# 4) cleanup
+bench-core --provider docker --config config/common/browser.yaml --cleanup
+```
+
+> To validate **only the provider wiring** (not the 300s port wait), temporarily point a
+> coding config's `docker.image` at the chromium image and run its `--create-only`:
+> coding readiness is `uname -a`, which a browser image satisfies instantly. This checks
+> create/list/exec_probe/cleanup without depending on the openclaw services.
+
+### Tier 2 — e2b (cloud firecracker, real backend)
+
+Prerequisite: `~/.e2b/config.json` has credentials; e2b dev server (`E2B_API_URL`)
+reachable; templates built (`openclaw-browser-v1` / `openclaw-coding-{ts,go,python}-v1`).
+
+```bash
+# 1) create + persist IDs to sandboxs_ts.txt
+bench-core --provider e2b --config config/common/coding-ts.yaml --create-only -n 2
+
+# 2) detect from the ID file + warmup
+bench-core --provider e2b --config config/common/coding-ts.yaml --detect --warmup-only
+
+# 3) detect + 30s short benchmark + report
+bench-core --provider e2b --config config/common/coding-ts.yaml --detect --test-duration 30
+
+# 4) cleanup
+bench-core --provider e2b --config config/common/coding-ts.yaml --cleanup
+```
+
+browser / coding-go / coding-python are the same with a different `--config`; each declares
+its own `sandbox_ids_file` (`sandboxs.txt` / `sandboxs_ts.txt` / `sandboxs_go.txt` /
+`sandboxs_python.txt`).
+
+### Phase cheat sheet
+
+| Command | Verifies | Sandbox fate |
+|---------|----------|--------------|
+| `--create-only` | create + ready + ID persistence | kept |
+| `--detect --warmup-only` | detect + attach + warmup | kept |
+| `--detect --test-duration N` | full spine + report | kept (detect doesn't cleanup) |
+| `--cleanup` | list + teardown | removed |
+
+---
+
+## 5. Report
+
+Every run is stamped into its own subdirectory so outputs never overwrite a previous run:
+`<output_dir>/<filename_prefix>_<run_stamp>/` (run_stamp = `%Y%m%d-%H%M%S`). Defaults:
+`output_dir = "results/kernel"`, `filename_prefix = "bench"` (both set in the `report:`
+YAML section; `-o` overrides `output_dir`). Inside that subdir:
+
+| File | When |
+|------|------|
+| `<prefix>.log` | always (JSON-lines for the lifecycle replay mode) |
+| `<prefix>_<timestamp>.txt` | always — the text report |
+| `<prefix>_obs.xlsx` | replay workflow + `--report-format xlsx|both` |
+| `<prefix>_lifecycle_series.jsonl` | all replay modes (exec_only / lifecycle / exec_ephemeral) |
+| `replay_result.json` (per trajectory, with per-step `stdout`/`stderr`) + `trajectories/index.json` | when a series file exists |
+| `vm_monitor/` | auto-enabled for providers with a `vmm_type` (e2b/aenv → firecracker, cubesandbox → containerd-shim-cube-rs) |
+
+`--create-only` emits a **creation-timing report**: a `[Sandbox Status]` block
+(`Total` / `Ready` / `Create Failed` / `Ready Check Failed`) plus percentile sections for
+`Sandbox.create`, `Ready Check Wait`, and `Total Startup` (Min/Max/Avg + P50/P95/P99). A
+full run emits a performance report (task stats + snapshots); the `Create Failed` /
+`Ready Check Failed` counters pinpoint whether the failure is at create, ready, or task
+phase.
+
+---
+
+## 6. Python API
+
+```python
+from bench_core.bench import run_benchmark, load_config
+from bench_core.config import KernelConfig
+from env_provider.fake import FakeProvider
+
+# 1) load from YAML (KernelConfig reads shared sections; raw is passed through to the backend)
+config, raw = load_config("config/common/browser.yaml")
+
+# 2) build a provider (e2b/docker/aenv build_provider also take (config, raw))
+provider = FakeProvider(count=config.total_count)
+
+# 3) run
+result = run_benchmark(config, provider)
+print(result["report"])            # report text
+print(result["filepath"])          # report file path (None on create-only/warmup-only)
+print(result["admission_snapshot"])  # replay admission snapshot (None outside lifecycle)
+```
+
+Signatures:
+- `load_config(path) -> tuple[KernelConfig, dict]` — opens the YAML, calls
+  `KernelConfig.from_raw(raw)`, returns `(config, raw_dict)`.
+- `run_benchmark(config, provider) -> dict` — returns `{"report", "filepath",
+  "admission_snapshot"}` on the full path; early-exit paths (`--create-only`,
+  `--warmup-only`, `--cleanup`) return only `{"report", "filepath"}`; returns `{}` if no
+  sandbox reaches ready.
+
+---
+
+## 7. Troubleshooting
+
+**`bench-core: command not found`**
+The script installs under the active interpreter's `Scripts/` (e.g. conda's
+`C:\Users\<user>\miniconda3\Scripts\bench-core.exe`), which is only on `PATH` when that
+env is active. Activate it, or use `python -m bench_core …` (no `PATH` needed). The command
+is `bench-core` (hyphen), not `bench_core`.
+
+**Ready-check timeout (Ready Check Failed)**
+- browser: openclaw-gateway (18789) + llama-server (11436) didn't come up inside the
+  sandbox → check the image/template.
+- coding/document: the sandbox didn't start properly → check the image/template + sandbox
+  logs. For document, a completed non-zero `document-bench-validate` means the image itself
+  is broken (not retried).
+
+**e2b credential failure**
+Confirm `~/.e2b/config.json` exists with `teamApiKey` / `accessToken`, or set `E2B_CONFIG`
+to another path. Keep the YAML placeholders (auto-fallback works) — don't write real keys
+into YAML.
+
+**docker coding image missing**
+The `ubuntu-openclaw-coding-{ts,go,python}:24.04-arm64` images in coding configs are
+placeholders — build them first (with the language toolchain + project repo) before running
+`--provider docker` coding. The browser image is ready-made.
+
+---
+
+## 8. Replay workflow
+
+`workflow_type: replay` replays recorded SWE-bench agent trajectories (ordered shell +
+`str_replace_editor` actions, each with a per-step `delay_time`) verbatim through
+`provider.exec()`. The same profile runs on aenv / aenv-go (lifecycle pause/resume / ephemeral),
+cubesandbox, or e2b/docker (exec_only). `aenv-go` inherits all capabilities (lifecycle /
+ephemeral / snapshot) from `aenv`, so `--provider aenv-go` switches the same replay to the
+Go-worker client. `config/common/replay.yaml` is the aenv lifecycle **1:1 (no-oversubscription) baseline**.
+
+### 8.1 The three modes
+
+The modes differ by **sandbox lifecycle**, not by "whether a rate limiter is attached":
+
+| mode | sandbox lifecycle | per step | concurrency / oversubscription | when to use |
+|------|-------------------|----------|-------------------------------|-------------|
+| `exec_only` | pre-created, **long-lived**; no create/kill across the run | exec only | none | pure exec-replay cost baseline; backends without lifecycle/ephemeral capability (e2b/docker/fake) |
+| `lifecycle` | pre-created, **long-lived**; not killed across the run | resume → exec → pause (step granularity) | full-scale: `k×N` sandboxes all pause/resume **concurrently** (`running_concurrency = total_count`; a running-slot cap applies only when set below `total_count`) | pause/resume snapshot overhead + concurrent-resume load; needs `LifecycleCapable` (aenv) |
+| `exec_ephemeral` | **ephemeral**; create_one → … → kill_one per trajectory | exec only (no pause/resume) | none (admission-free `k×N` concurrent; `launch_interval_sec` paces the per-round `create_one` burst) | frequent create/kill overhead; needs `EphemeralCapable` (aenv); `replay.multiplier` M runs exactly M trajectories per sandbox |
+
+**exec_only vs exec_ephemeral** — the difference is *not* "a rate limiter":
+
+- exec_only sandboxes are **long-lived**: the whole run reuses one pre-created fleet, only
+  exec, **no create/kill, no pause/resume**.
+- exec_ephemeral sandboxes are **ephemeral**: each trajectory does `create_one` → run →
+  `kill_one`; between rounds the sandbox is killed and recreated fresh.
+- `launch_interval_sec` is exec_ephemeral-only because **frequent per-trajectory creates need
+  pacing**; exec_only pre-creates once and reuses, so it has no launch pacing. "exec_ephemeral
+  adds a limiter" is just the surface symptom — the root difference is sandbox lifecycle
+  (long-lived reuse vs. ephemeral create/kill).
+
+**lifecycle vs exec_ephemeral** — the lifecycle models differ:
+
+- lifecycle = **long-lived pause/resume, full-scale**. Sandboxes are long-lived; the oversub
+  fleet is the whole `k×N` — `running_concurrency = total_count = k×N`, so ALL sandboxes
+  pause/resume **concurrently** at step granularity (one command = resume/exec/pause). A
+  running-slot cap (`running_concurrency < total_count`, the legacy snapshot-memory-reuse
+  model) is only applied when configured explicitly.
+- exec_ephemeral = **ephemeral no-lifecycle**: no pause/resume at all — "spin up once → run
+  the trajectory → kill; to reuse, spin up again" (the no-lifecycle oversub auth model).
+  It runs admission-free at `k×N` concurrent; bounding the fleet is supply-side (create/call
+  rate), not pause-to-free-memory.
+
+> `launch_interval_sec` (float seconds, per-sandbox create pacing) applies only to the
+> ephemeral `exec_ephemeral` mode. `create_batch.size` / `create_batch.interval` (integer
+> seconds) pace the initial fleet `create_all` for the long-lived modes (lifecycle **and**
+> exec_only); exec_ephemeral skips `create_all` entirely (each trajectory calls
+> `create_one` directly). Sub-second per-sandbox pacing is therefore only available in
+> exec_ephemeral mode.
+
+### 8.2 lifecycle memory oversubscription: ratio configuration
+
+With a fixed host, the baseline VM count = host memory / per-VM memory:
+
+- e.g. 1.5 TiB host, 4 GiB per VM → baseline = 1536 / 4 = **384** VMs.
+- `total_count` scales to `k × baseline` for oversubscription ratio `1:k`. Lifecycle runs the
+  **full** fleet: `running_concurrency` = `total_count` = `k × baseline`, so all `k×N` sandboxes
+  pause/resume **concurrently** (no running-slot cap — the ratio-k load is `k×N` simultaneous
+  resumes). A running-slot cap only applies when `running_concurrency < total_count` is set
+  explicitly (the legacy snapshot-memory-reuse knob, no longer used by the oversub driver).
+
+| ratio | `total_count` | `running_concurrency` | meaning |
+|-------|---------------|----------------------|---------|
+| 1:1 (baseline) | 384 | 384 | no oversubscription, 384 sandboxes all running |
+| 1:2 | 768 | 768 | 2× fleet, all 768 sandboxes pause/resume concurrently |
+| 1:3 | 1152 | 1152 | 3× fleet, all 1152 sandboxes pause/resume concurrently |
+
+`config/common/replay.yaml` is the 1:1 baseline. To test another ratio, change three values
+in YAML (or override `total_count` with `-n`, but `running_concurrency` and `round_size`
+live in YAML and must move with it):
+
+```yaml
+sandbox:
+  total_count: 768        # k × baseline
+replay:
+  running_concurrency: 768   # = total_count -> lifecycle full-scale (all k×N resume at once)
+test:
+  round_size: 768         # = total_count -> one group = all -> all concurrent
+```
+
+```bash
+bench-core --provider aenv --config config/common/replay.yaml -n 768
+```
+
+> To sweep several ratios and chart a degradation curve, don't hand-loop this — use
+> `oversub-bench` (§8.5), which rewrites exactly these two fields per trial and aggregates the
+> curve for you.
+
+### 8.3 Trajectory format and template_manifest
+
+- **Trajectory pool.** The shipped replay profiles already point at the bundled data —
+  `replay.trajectory_dir: artifacts/traces/replays` (55 trajectories) and
+  `replay.template_manifest: artifacts/traces/image-map.json` (one template name per trajectory).
+  Repoint both for your own pack; an empty pool replays zero steps. The oversub driver inherits
+  both from the sweep's `base_config`.
+- The loader (`src/bench_core/payload/replay_payload.py`) expects each trajectory JSON to be
+  `{instance_id, environment, trajectory: [{action, delay_time}, …]}` (`environment`
+  defaults to `"main"`, `instance_id` falls back to the filename stem), truncated at the
+  first terminal action (`submit` / `finish` / `done` — discarded with its `delay_time`).
+  Accepted suffixes: `.replay.json` / `.json` / `.traj`. Convert other formats (e.g. raw
+  sweagent) to `.replay.json` first.
+- `template_manifest` is a side JSON mapping `{trajectory-relative-path: template}` (paths
+  relative to `replay_trajectory_dir`, backslashes normalized). With multiple templates,
+  long-lived modes (exec_only / lifecycle) route by template affinity (orphan templates are
+  skipped with a count); the ephemeral `exec_ephemeral` mode passes `template=` into each
+  `create_one`. The manifest is the authoritative run set: a trajectory absent from it (or
+  mapped to a null/non-string value) is skipped with a warning -- it does not fall back to
+  the provider default. Omit the manifest entirely for the legacy single-template path
+  (every trajectory uses the provider block's `template`).
+
+### 8.4 Observability workbook (`*_obs.xlsx`)
+
+With `--report-format xlsx|both` (replay workflow), besides the text report and JSONL
+lifecycle series, bench-core emits `<run-dir>/<prefix>_obs.xlsx` — an 8-sheet observability
+workbook (openpyxl; `Overview` consolidates the former Admission & QPS / Throughput &
+overcommit / Retry scalar sheets into one grouped, color-coded dashboard). All duration
+columns are **seconds (s)**, matching the reference `step-detail.csv`; the embedded line
+charts in `Per-step timings` / `Lifecycle overhead` use milliseconds (ms) for readability
+(header-marked). Sheets that depend on the lifecycle series output headers only (no error)
+when the series is absent (e.g. a minimal install).
+
+| Sheet | row granularity | content |
+|-------|-----------------|---------|
+| Overview | scalar (consolidated, grouped/color-coded) | **single summary**: Run (workflow_type/replay_mode/total_count/running_concurrency/test_duration/wall_sec/total_steps/success/timed_out/failed (non-timeout)/overcommit_ratio) + Throughput (steps_per_sec/effective_parallelism/exec_wall_utilization/concurrency) + Admission & QPS (running-slot maximum/active/peak_active/granted/avg_queue_wait/waiting + QPS limiter qps/inflight_cap/in_flight/dispatched/avg_wait/max_wait + per-operation dispatch/wait sub-tables) + Retry (retry_count/time_lost_to_retry_sec/retries_per_slice_p95 + per-operation retry_queued) + **Lifecycle overhead %** (lifecycle mode; aggregate/mean/p95 ratios) + **Per-step timing** sub-table (exec/think/pause/resume pooled percentiles). See "Overview fields" below for the Lifecycle overhead % and Per-step timing fields. Column A labels are bold/filled; groups separated by banner rows |
+| Per-step timings | pooled percentiles | fleet `latency` (= pure exec time) n/min/max/avg/p50/p95/p99, bucketed by `action_type`; embedded line chart (ms). Latency samples are **success-only** (failed/timed-out steps are counted but never enter the latency distributions — a synthesized-zero failure used to drag `avg_s` toward 0; same rule as the headline `Avg Latency` and the text report's `[Step-Level Timing]` table). **Naming note**: this sheet buckets *pure exec latency* by *action type* (shell/bash/…); the Overview **Per-step timing** section pools by *phase* (exec/think/pause/resume) — different lens, do not conflate |
+| Lifecycle overhead | pooled percentiles | `resume` / `pause` / `slice_total` / `slot_held` / `interaction` percentiles (**raw seconds**); embedded chart (ms). lifecycle mode only. **Note**: this sheet is absolute durations in seconds (chart in ms); the overhead **ratio (%)** is not here — it lives in the Overview `lifecycle_overhead_*_pct` scalars |
+| Trajectory summary | one row per trajectory | n_steps + segment sums (slice_total/exec/resume/pause/interaction_total/slot_contention_wait/resume_rate_pacing_wait/pause_rate_pacing_wait/running_slot_held) + avg_slice (seconds). Sorted by trajectory_id; `create_median_s` / `kill_median_s` / `stress_median_s` fill from the series events — real values in exec_ephemeral (which creates/kills per trajectory), 0.0 in the long-lived modes |
+| Step detail | one row per step event | 27 columns (see below); includes success and synthesized `slice_failed` rows; sorted by (trajectory, sandbox, step); frozen header + autofilter |
+| Concurrency states | one row per second | per-second dominant-state counts (pausing/paused/resuming/exec/active); chart |
+| Gantt | chart | per-sandbox phase timeline (resume/exec/pause), embedded PNG; auto-shrinks row height for large fleets |
+| Snapshot sizes | one row per pause | logical/disk/inherited/cumulative MiB + generations/files; chart. `SnapshotSizeCapable` (aenv) only |
+
+> With `monitor.merge_report: true`, up to three host sheets (`VM_Stats` /
+> `NUMA_Overview` / `DevKit_TopDown`) are appended after `Snapshot sizes` (copied from the
+> vm_monitor `resource_report.xlsx`). With the default `false`, the vm_monitor report stays
+> a separate file and the workbook carries only the 8 sheets above.
+
+#### Overview fields
+
+The Overview dashboard is grouped in order Run → Throughput → Admission & QPS → Retry → Lifecycle overhead % → Per-step timing (Column A bold/filled + banner-separated). The Lifecycle overhead % and Per-step timing groups appear in lifecycle mode only (absent in exec_only / exec_ephemeral or a fully-failed run).
+
+**① Lifecycle overhead %** (scalar kvs — the overhead **ratio**, not seconds):
+
+| field | what it is | what to read / why it matters |
+|-------|------------|------------------------------|
+| `lifecycle_overhead_aggregate_pct` | (resume+pause summed) / slice_total summed ×100 | overall lifecycle-overhead share; high = resume/pause dominate, exec share is small |
+| `lifecycle_overhead_mean_pct` | mean of per-slice ratios | typical per-step overhead rate; vs aggregate tells if a few long tails skew it |
+| `lifecycle_overhead_p95_pct` | p95 of per-slice ratios | tail-worst overhead rate; high p95 + low mean = a few extreme slices |
+
+> Near-zero slices (`< MIN_SLICE_SEC`, e.g. zero-placeholders on exception paths) are excluded so a tiny slice cannot explode the per-sample ratio. This ratio also appears in the text report's `[Lifecycle Overhead]` block and `run_summary.json`'s `lifecycle_overhead.pct_of_slice_total`. The `Lifecycle overhead` sheet's segment table is **raw seconds** (chart in ms) — ratio vs seconds are two lenses, don't conflate.
+
+**② Per-step timing** (sub-table — the four phases of each step, pooled percentiles; columns = `segment/n/min/max/avg/p50/p95/p99`):
+
+| field | what it is | what to read / why it matters |
+|-------|------------|------------------------------|
+| `exec` | derived = slice_total − resume − pause, pure command-execution wall | the "real work" time; a high exec share = good efficiency |
+| `think` | = `natural_delay_secs`, inter-step LLM/think delay | non-productive gap; high = large inter-step gaps or `delay_scale>0` |
+| `pause` | pause phase: API + rate-pacing + inflight | pause cost; rises under oversub / snapshot reuse |
+| `resume` | resume phase: API + ready_wait + inflight | resume cost; rises under oversub / snapshot reuse |
+
+> Naming disambiguation: the Overview **Per-step timing** section pools by **phase** (exec/think/pause/resume) across the **whole fleet**; the `Per-step timings` **sheet** buckets `latency` (= pure exec) by **action type** (`action_type`) — the former is "by phase", the latter "by action type".
+
+#### Step detail columns (27, seconds)
+
+Sub-segments nest under their parent so the sum invariant is verifiable in-sheet:
+`resume_sec == resume_inflight_wait_sec + resume_api_sec + resume_ready_wait_sec` (rate-pacing is PRE-lease, excluded),
+`pause_sec == pause_rate_pacing_wait_sec + pause_inflight_wait_sec + pause_api_sec` (rate-pacing is IN-lease, included),
+`interaction_total_sec == slice_total_sec + natural_delay_sec + capacity_wait_sec + resume_rate_pacing_wait_sec` (the inter-step think-delay lives in `natural_delay_sec`, counted once — not a separate delay term). `natural_delay_sec` itself is the think-delay actually slept by the runner before the slice (`step.delay_time_sec * replay_delay_scale`) plus the scheduler's residual `ready_at` park (`replay_pause_duration`), so it is nonzero whenever the trajectory has inter-step gaps and `delay_scale > 0`.
+
+| column | what it is | what to read / why it matters |
+|-------|------------|------------------------------|
+| `trajectory_id` | instance_id of the trajectory this step belongs to | primary key to filter/group by trajectory; answers "which trajectory" |
+| `sandbox_index` | index of the executing sandbox in the fleet (0..N-1), not the backend sandbox_id | locates "which sandbox ran it"; aligns with Gantt/concurrency rows |
+| `round_id` | round-robin round number; the fixed runner stamps a per-pass ordinal instead (multiplier passes of one trajectory stay separate run rows) | which concurrent group this step belongs to; spot inter-round degradation |
+| `step_index` | step index within the trajectory (0-based) | ordinal of this step in its trajectory; aligns to the original trajectory |
+| `action_type` | `shell` / `bash` / `str_replace_editor` / `submit` / `finish` / `done` | estimates latency by action class; matches `Per-step timings` buckets |
+| `action` | the recorded command text (single-line, <=512 chars via the series `_compact_action`); the full per-step body lives in `replay_result.json` | reading down a trajectory's rows = its executed command sequence |
+| `slice_failed` | runner-synthesized failed slice (exception/stop_on_error); when True the duration columns below are 0 | failure flag; filter failed steps to their `exit_code`; excluded from percentiles |
+| `resume_sec` | total resume time = inflight + api + ready_wait (rate-pacing excluded, pre-lease) | resume overhead; a major non-exec term under oversub/snapshot reuse |
+| `resume_rate_pacing_wait_sec` | QPS-limiter 1/qps rate-pacing time-wait (resume, PRE-lease: excluded from resume_sec / running_slot_held) | shaping pressure; nonzero = the QPS cap is binding |
+| `resume_api_sec` | pure resume API call time | the backend's intrinsic resume cost; strips waits to see the bare API |
+| `resume_ready_wait_sec` | post-resume readiness probe wait (lifecycle only; 0 in exec_only / exec_ephemeral) | readiness-probe cost; high = slow warm-up after resume |
+| `exec_sec` | pure `provider.exec()` wall time (= Per-step timings `latency`) | the "real work" time; the core efficiency metric |
+| `pause_sec` | total pause time = rate-pacing + inflight + api (rate-pacing included, in-lease) | pause cost; rises with snapshot reuse / lifecycle oversub |
+| `pause_rate_pacing_wait_sec` | QPS-limiter 1/qps rate-pacing time-wait (pause, IN-lease: included in pause_sec / running_slot_held) | shaping pressure (pause side); nonzero = the QPS cap is binding |
+| `pause_api_sec` | pure pause API call time | the backend's intrinsic pause cost; strips waits to see the bare API |
+| `slice_total_sec` | resume + exec + pause; 0 for failed slices (excluded from percentiles) | per-step active wall; denominator of the overhead ratio, numerator of `avg_slice` |
+| `interaction_total_sec` | full interaction budget = slice_total + natural_delay + capacity_wait + resume_rate_pacing (≥ slice_total; the think-delay is in `natural_delay_sec`, counted once) | broad wall incl. think/wait; the excess over slice_total = non-productive overhead |
+| `slot_contention_wait_sec` | derived composite = natural_delay + capacity_wait (FIFO running-slot contention; admission) | admission contention total; high = slot contention or large inter-step gaps |
+| `natural_delay_sec` | inter-step think-delay — `step.delay_time_sec * replay_delay_scale` slept by the runner before the slice, plus the scheduler's residual `ready_at` park (= `replay_pause_duration`); the inter-step gap pacing (component of slot_contention_wait_sec) | inter-step think/gap; the dominant non-productive term at 1:1, so interaction_total ≫ slice_total |
+| `capacity_wait_sec` | FIFO running-slot token contention -- the genuine queue wait (component of slot_contention_wait_sec) | genuine queueing; nonzero = not enough running slots (oversub signal) |
+| `rate_pacing_wait_sec` | per-step rate-pacing total = resume_rate_pacing_wait_sec + pause_rate_pacing_wait_sec (1/qps shaping, a RATE control; not the FIFO queue -- see capacity_wait_sec) | total shaping wait; distinguishes "shaping" from "queueing" vs capacity_wait |
+| `inflight_wait_sec` | per-step inflight-fuse block total = resume_inflight_wait_sec + pause_inflight_wait_sec (a CONCURRENCY control) | concurrency-fuse wait; nonzero = the inflight cap is binding |
+| `resume_inflight_wait_sec` | inflight-fuse block on resume (component of resume_sec) | resume-side concurrency block; splits the block source |
+| `pause_inflight_wait_sec` | inflight-fuse block on pause (component of pause_sec) | pause-side concurrency block; splits the block source |
+| `running_slot_held_sec` | total running-slot hold time (acquire → release) | slot occupancy duration; numerator of effective_parallelism, oversub granularity |
+| `exit_code` | `provider.exec()` exit code | success/failure/timeout verdict; pairs with `slice_failed`/`timed_out` |
+| `timed_out` | whether a timeout exit code was hit | timeout flag; filter timeouts to compute the timeout rate |
+
+#### Trajectory summary columns (21, seconds, sum-based)
+
+One row per trajectory (instance) for **cost attribution** — where this trajectory's total
+wall time went (pause vs. resume vs. exec vs. the wait components). Uses **sum, not percentiles**:
+per-instance per-step distributions are already in `Step detail` (filter by `trajectory_id`)
+and `Lifecycle overhead` (pooled); this sheet answers "total breakdown + wasteful wait".
+`n_steps` counts all step events (including `slice_failed` steps — they contribute 0 to
+sums but count as attempts, so `avg_slice` reflects per-attempt cost).
+
+| column | what it is | what to read / why it matters |
+|-------|------------|------------------------------|
+| `trajectory_id` | instance | per-trajectory cost-attribution key; compare overhead structure across trajectories |
+| `n_steps` | total steps replayed for this trajectory (including failed) | work volume; the denominator — pair with sums for unit cost |
+| `n_failed` | number of failed steps | this trajectory's failure count; high = unstable trajectory |
+| `n_timeout` | number of steps that hit a timeout exit code | timeout count; high = this trajectory is stuck on slow commands |
+| `success_rate` | success ratio (None when 0 steps attempted) | trajectory health; low = heavy failure on this trajectory |
+| `slice_total_sum_s` | total active wall time = resume + exec + pause (sum invariant) | this trajectory's active wall; denominator of overhead ratio, the cost baseline |
+| `exec_sum_s` | total pure command-execution time | "real work" total; exec share = this trajectory's efficiency |
+| `resume_sum_s` | total resume time | resume overhead; rises under oversub/snapshot reuse |
+| `pause_sum_s` | total pause time | pause overhead; rises with snapshot reuse / lifecycle |
+| `interaction_total_sum_s` | full interaction budget = slice_total + natural_delay + capacity_wait + resume_rate_pacing (≥ slice_total; the think-delay is in natural_delay, not a separate term) | broad wall incl. think/wait; minus slice_total = non-productive overhead |
+| `slot_contention_wait_sum_s` | total admission slot-contention wait (derived = natural_delay + capacity_wait) | admission contention total; high = slot contention or large inter-step gaps |
+| `natural_delay_sum_s` | total inter-step think-delay + residual park (component of slot_contention) | think/gap total; the dominant non-productive term at 1:1 |
+| `capacity_wait_sum_s` | total FIFO running-slot token contention (component of slot_contention) | genuine queueing total; nonzero = not enough running slots (oversub signal) |
+| `rate_pacing_wait_sum_s` | total rate-pacing = resume_rate_pacing + pause_rate_pacing (1/qps shaping) | total shaping wait; distinguishes "shaping" from "queueing" vs capacity |
+| `inflight_wait_sum_s` | total inflight-fuse block = resume_inflight + pause_inflight | concurrency-fuse total; nonzero = the inflight cap is binding |
+| `resume_rate_pacing_wait_sum_s` | total QPS-limiter 1/qps rate-pacing time-wait for resume (pre-lease) | resume-side shaping pressure; splits the shaping source |
+| `pause_rate_pacing_wait_sum_s` | total QPS-limiter 1/qps rate-pacing time-wait for pause (in-lease) | pause-side shaping pressure; splits the shaping source |
+| `resume_inflight_wait_sum_s` | total inflight-fuse block on resume (component of resume) | resume-side concurrency block; splits the block source |
+| `pause_inflight_wait_sum_s` | total inflight-fuse block on pause (component of pause) | pause-side concurrency block; splits the block source |
+| `running_slot_held_sum_s` | total running-slot hold time (slot occupancy / oversubscription granularity) | slot occupancy total; cross-check for effective_parallelism |
+| `avg_slice_s` | slice_total_sum / n_steps, typical per-step cost | per-attempt step cost; compare "expensiveness" across trajectories |
+
+At 1:1 (no oversubscription) with the QPS / inflight-fuse knobs unset, `capacity_wait`,
+`rate_pacing`, `inflight`, and the resume/pause rate-pacing/inflight splits are legitimately
+0 — they only turn nonzero under oversubscription + control-plane limiting. `natural_delay`
+(the think-delay) is nonzero whenever the trajectory has inter-step gaps and `delay_scale > 0`;
+it is the dominant non-productive term at 1:1, so `interaction_total` ≫ `slice_total` there.
+
+> Finer resume/pause sub-segments (api_sec / ready_wait / inflight_wait / rate_pacing_wait) per step live in
+> `Step detail`; per-second concurrency in `Concurrency states`; snapshot memory in
+> `Snapshot sizes`. Host-level system resources (CPU/memory/NUMA) are in the separate
+> vm_monitor `resource_report.xlsx` (`monitor.merge_report: false`) or merged into this
+> workbook's `VM_Stats` / `NUMA_Overview` / `DevKit_TopDown` sheets (`merge_report: true`).
+
+### 8.5 Oversubscription sweep + comparison (`oversub-bench` / `oversub-compare`)
+
+The full guide for sweeping a set of ratios (`oversub-bench`) and comparing the resulting sweeps
+(`oversub-compare`) lives in the standalone doc
+[oversub-bench-usage.md](oversub-bench-usage.md)([zh](oversub-bench-usage-zh.md)) — invocation,
+sweep-config keys, process sharding, the `run_summary.json` (kernel → driver contract), validity,
+outputs (incl. the `trajectory-detail.csv` columns), trial order / reuse / interruption,
+cross-architecture comparison, and troubleshooting. Sweep configs live in `config/oversub/*.yaml`
+(`template.yaml` is the annotated template).
