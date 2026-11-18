@@ -125,6 +125,8 @@ def _build_provider(name: str, config: KernelConfig, raw_config: dict[str, Any])
         from env_provider.aenv_go import build_provider
     elif name == "cubesandbox":
         from env_provider.cubesandbox import build_provider
+    elif name == "sandboxsched":
+        from env_provider.sandboxsched import build_provider
     else:
         raise ValueError(f"Unknown provider: {name}")
     return build_provider(config, raw_config)

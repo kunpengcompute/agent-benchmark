@@ -69,6 +69,7 @@ _PROVIDERS: dict[str, tuple[str, str]] = {
     "aenv": ("env_provider.aenv", "AenvProvider"),
     "aenv-go": ("env_provider.aenv_go", "AenvGoProvider"),
     "cubesandbox": ("env_provider.cubesandbox", "CubesandboxProvider"),
+    "sandboxsched": ("env_provider.sandboxsched", "SandboxSchedProvider"),
 }
 
 
