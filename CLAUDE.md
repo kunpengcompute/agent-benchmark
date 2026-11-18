@@ -99,7 +99,8 @@ ruff format --check .                # format check
 core stack (`psutil`, `paramiko`, `flask`, `PyYAML`, `pandas`, `openpyxl`, `e2b`,
 `aiohttp`); `e2b` is a core dependency pinned 2.46.0. Backend SDKs are otherwise
 optional: `pip install docker` and/or the cubesandbox SDK only when using that
-provider; `--provider fake` needs none.
+provider; the `sandboxsched` extra (`pip install -e '.[sandboxsched]'`) pulls the
+OpenSandbox SDK; `--provider fake` needs none.
 
 `pyproject.toml` sets `pythonpath = ["src"]` for pytest, so tests resolve
 `bench_core` / `env_provider` without an editable install. The `[project.scripts]`
@@ -165,7 +166,7 @@ contract + kernel untouched.
 
 **Provider impls**: `env_provider/e2b/` (`config.py` `setup_e2b_env` + placeholder-credential fallback to `~/.e2b/config.json`, `manager.py`, `schemas.py`), `env_provider/docker/`, `env_provider/aenv/` (`AenvProvider` subclasses `E2BProvider` and reuses the E2B `SandboxManager` handle table + SDK — AENV has no separate SDK, it is the E2B SDK pointed at an AENV server via `E2B_API_URL`; adds `pause`/`resume`, `snapshot_sizes`, `create_one`/`kill_one`), `env_provider/aenv_go/` (`AenvGoProvider` over a resident Go worker subprocess, `go-client/main.go`; a sync `GoBridge` multiplexes the worker's line protocol, no e2b SDK), `env_provider/cubesandbox/`, `env_provider/fake.py`.
 
-**Config layering**: one `config/common/*.yaml` per workflow carries the per-backend blocks it drives; `--provider` selects which block `Config.from_raw` reads. Browser/coding/document configs carry **both** `e2b:` and `docker:` blocks; replay configs carry `e2b:` / `docker:` / `aenv:` / `cubesandbox:` / `sandboxsched:` blocks. The kernel reads only the shared sections. Credential placeholders (`your_e2b_access_token_here` / `your_e2b_api_key_here`) are treated as unset → fall back to `~/.e2b/config.json`.
+**Config layering**: one `config/common/*.yaml` per workflow carries the per-backend blocks it drives; `--provider` selects which block `Config.from_raw` reads. Browser/coding/document configs carry **both** `e2b:` and `docker:` blocks; replay configs carry `e2b:` / `docker:` / `aenv:` / `aenv_go:` / `cubesandbox:` / `sandboxsched:` blocks. The kernel reads only the shared sections. Credential placeholders (`your_e2b_access_token_here` / `your_e2b_api_key_here`) are treated as unset → fall back to `~/.e2b/config.json`.
 
 ### Replay workflow (replay modes)
 
