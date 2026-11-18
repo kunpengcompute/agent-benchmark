@@ -117,6 +117,11 @@ UB_WATCH_PATH=/path/to/ub_watch
 # smap_bw (run via sudo for dmesg access)
 SMAP_BW_PATH=/path/to/smap_bw.py
 
+# AMD uProf binary (log-rotation slot; unset/invalid path warns and skips the slot.
+# Metrics: --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics, default memory,pipeline_util;
+# per-turn CSVs land in uprof/<stamp>/)
+UPROF_PATH=/opt/AMDuProf_5.3-521/bin/AMDuProfPcm
+
 # getfre + its YAML config
 GETFRE_PATH=/path/to/getfre
 GETFRE_CONFIG_PATH=/path/to/getfre_config.yaml
@@ -134,11 +139,13 @@ DEVKIT_CPU_RANGE=96-191
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
 | `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | optional; sudo |
+| `UPROF_PATH` | `uprof` (rotation mode) | log_capture/uprof logs | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
 - **`--auto-skip` / bench-core auto vm-monitor**: the tool is silently disabled, a `[WARN]` is printed, and the run continues. The missing tool's sheet is simply absent from `resource_report.xlsx` — never a hard failure.
 - **Interactive (no `--auto-skip`)**: vm_monitor prompts for each missing path, `skip` disables, valid paths are written back to `.env` via `python-dotenv`.
+- **`UPROF_PATH` is the exception**: never prompted in either mode — an unset/invalid path degrades to a `[WARN]` and the uprof rotation slot is skipped (the run continues).
 
 ### getfre config (`getfre_config.yaml`)
 
