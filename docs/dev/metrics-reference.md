@@ -394,7 +394,7 @@ SMAP (Secure Memory Access Protection) migration bandwidth:
 
 ### `Uprof` — AMDuProfPcm timeseries (log-rotation slot)
 
-One row per sample with the rotation turn's stamp in `turn`; the remaining columns come straight from the tool's per-turn CSV — topdown stages (`Frontend_Bound`, `Backend_Bound.Memory`, `Retiring`), `Total Mem Bw (GB/s)`, per-channel memory bandwidth, plus whatever else the selected metric set emits. All-numeric columns are coerced to numbers. No `-o` is passed for now: raw output lands at the tool's default (its cwd = the rotation log dir, `AMDuProfPcm-Timeseries_*` entries), and the `uprof/` file + nested layouts from earlier `-o` forms are scanned too.
+One row per sample with the rotation turn's stamp in `turn`; the remaining columns come straight from the tool's per-turn CSV — topdown stages (`Frontend_Bound`, `Backend_Bound.Memory`, `Retiring`), `Total Mem Bw (GB/s)`, per-channel memory bandwidth, plus whatever else the selected metric set emits. All-numeric columns are coerced to numbers. No `-o` is passed: raw output lands at the tool's default (its cwd = the rotation log dir), a finished turn stamps the entries it created with the rotation stamp (`<stamp>_<entry>`), failed turns' entries carry a `failed-` prefix (skipped), and the `uprof/` file + nested layouts from earlier `-o` forms are scanned too.
 
 ## 2.4 Embedded Excel charts
 
