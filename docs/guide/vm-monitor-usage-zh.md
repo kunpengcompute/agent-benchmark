@@ -119,7 +119,7 @@ SMAP_BW_PATH=/path/to/smap_bw.py
 
 # AMD uProf（仅 log-rotation 轮转使用；未配置或路径无效时 WARN 并跳过该槽，不阻塞运行。
 # 指标可用 --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics 覆盖，默认 memory,pipeline_util；
-# -O 指向 uprof/：工具每轮自动生成带时间戳的文件夹（AMDuProfPcm-Timeseries_*/report-timerseries.csv），由解析器读取进 Uprof sheet）
+# -O 指向 uprof/：工具每轮自动生成带时间戳的文件夹（AMDuProfPcm-Timeseries_*/report-timerseries.csv）——原始产物，不做解析）
 UPROF_PATH=/path/to/AMDuProfPcm
 
 # getfre 及其 YAML 配置

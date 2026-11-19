@@ -119,7 +119,7 @@ SMAP_BW_PATH=/path/to/smap_bw.py
 
 # AMD uProf binary (log-rotation slot; unset/invalid path warns and skips the slot.
 # Metrics: --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics, default memory,pipeline_util;
-# -O points at uprof/: the tool auto-generates timestamped folders per turn (AMDuProfPcm-Timeseries_*/report-timerseries.csv), parsed into the Uprof sheet)
+# -O points at uprof/: the tool auto-generates timestamped folders per turn (AMDuProfPcm-Timeseries_*/report-timerseries.csv) -- raw artifacts, not parsed into sheets)
 UPROF_PATH=/path/to/AMDuProfPcm
 
 # getfre + its YAML config
@@ -173,7 +173,7 @@ numa_nodes: [0, 1]              # omit to auto-discover
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
 | **smap_bw** | `sudo python3 $SMAP_BW_PATH --clear --duration <t> --timeout <t+10>` | `smap_bw.log` | SMAPBW_Summary, SMAPBW_Cycles |
 | **getfre** | threaded per-NUMA: `$GETFRE_PATH <total_cores> <core_id>` per core | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N} |
-| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -O <uprof dir> -d <interval>` | `log_capture/uprof/` (tool-managed) | Uprof (timeseries) |
+| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -O <uprof dir> -d <interval>` | `log_capture/uprof/` (tool-managed) | — (raw timeseries CSVs) |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`, or auto-computed from `--numa` via `/sys/devices/system/node/node{N}/cpulist`. If neither resolves, devkit_top_down is skipped (never launched with a wrong range).
 
@@ -253,8 +253,7 @@ logs_<timestamp>/
 `resource_report.xlsx` sheets (summary only): `Summary`, `NUMA_Overview`, `VM_Stats`, plus the
 profiler sheets written when their tool log exists — `DevKit_TopDown`, `DevKit_Memory`,
 `NUMA_Bandwidth`, `KSys`, `UBWatch_Latency`, `UBWatch_Bandwidth`, `SMAPBW_Summary`,
-`SMAPBW_Cycles`, `Getfre_Summary`, `Getfre_NUMA{N}`, `Uprof` (rotation mode, parsed
-from AMDuProfPcm's per-turn timeseries output).
+`SMAPBW_Cycles`, `Getfre_Summary`, `Getfre_NUMA{N}`.
 
 `host_resources.xlsx` sheets (per-sample timelines, derived from `raw_data/`): `Host resources`,
 `NUMA`, `Per-VM`, `Disk IO`, and `HostProc` (only with `--host-proc`). Column-level definitions:
