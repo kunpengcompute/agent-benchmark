@@ -8,7 +8,7 @@
 
 base_config: config/common/replay.yaml   # REQUIRED unless --config is passed
 
-provider: aenv                            # {aenv, e2b, docker, fake}
+provider: aenv-go                          # {aenv-go, aenv, e2b, docker, fake}
 # scenario: swe-bench                     # replay dataset under artifacts/traces/ (default swe-bench);
                                           # written into every trial's replay.scenario (trial.yaml
                                           # and its shard configs). Set it to sweep a different

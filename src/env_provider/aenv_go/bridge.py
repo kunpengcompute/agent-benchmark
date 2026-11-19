@@ -46,16 +46,29 @@ class GoTransportError(ConnectionError):
 
 
 def binary_path(binary: str | None = None) -> Path:
-    """Resolve the Go worker binary; raise (no E2B fallback) when absent."""
-    path = Path(binary or os.environ.get("AGENT_BENCHMARK_GO_BIN")
-                or Path(__file__).resolve().parents[3] / "go-client" / "bin" / "agent-benchmark-go")
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Go worker not found: {path}; run bash go-client/build.sh or set "
-            "AGENT_BENCHMARK_GO_BIN; no E2B fallback was used"
-        )
-    return path
+    """Resolve the Go worker binary; raise (no E2B fallback) when absent.
+
+    Order: explicit ``aenv_go.go_client_bin`` -> ``AGENT_BENCHMARK_GO_BIN`` ->
+    wheel package data (``env_provider/aenv_go/bin/``) -> checkout path
+    (``go-client/bin/``). ``pip install -e .`` builds the checkout path; a
+    non-editable wheel ships the binary as package data.
+    """
+    if binary:
+        candidates = [Path(binary)]
+    elif os.environ.get("AGENT_BENCHMARK_GO_BIN"):
+        candidates = [Path(os.environ["AGENT_BENCHMARK_GO_BIN"])]
+    else:
+        here = Path(__file__).resolve().parent
+        candidates = [here / "bin" / "agent-benchmark-go", here.parents[2] / "go-client" / "bin" / "agent-benchmark-go"]
+    for candidate in candidates:
+        path = candidate.expanduser().resolve()
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Go worker not found (looked at: {', '.join(str(c.expanduser()) for c in candidates)}); "
+        "run `pip install -e .` or `bash go-client/build.sh`, or set AGENT_BENCHMARK_GO_BIN; "
+        "no E2B fallback was used"
+    )
 
 
 def binary_metadata(binary: str | None = None) -> dict:
@@ -339,9 +352,20 @@ class GoCommands:
 
 
 class _CommandResult:
-    """Minimal result object: ``exit_code`` / ``stdout`` / ``stderr`` attrs."""
+    """Minimal result object: ``exit_code`` / ``stdout`` / ``stderr`` attrs.
 
-    def __init__(self, exit_code: int, stdout: str = "", stderr: str = "") -> None:
+    Also carries the worker's exit diagnostics when the end event had no
+    numeric code: ``exit_signal`` (signal name, e.g. "killed") and
+    ``exit_unknown``/``exit_status_raw`` for status strings the worker could
+    not classify (so an infra kill is never conflated with a business exit).
+    """
+
+    def __init__(self, exit_code: int, stdout: str = "", stderr: str = "",
+                 exit_signal: str = "", exit_unknown: bool = False,
+                 exit_status_raw: str = "", **_: Any) -> None:
         self.exit_code = int(exit_code)
         self.stdout = stdout or ""
         self.stderr = stderr or ""
+        self.exit_signal = exit_signal or ""
+        self.exit_unknown = bool(exit_unknown)
+        self.exit_status_raw = exit_status_raw or ""

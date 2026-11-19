@@ -137,6 +137,21 @@ Precedence: **CLI flag > sweep-config > built-in default**. `--sweep-config` car
 `--trial-timeout-sec`, `--output-root`, `--reuse`, `--stop-on-failure`, `--dry-run`,
 `--no-vm-monitor`, `--auto-compare`, `--bench-core-bin`).
 
+### 1.4 Default provider migration (aenv -> aenv-go)
+
+The built-in `provider` default is now `aenv-go`, and the shipped `config/oversub/*.yaml` sweeps
+follow. This is a behaviour change:
+
+- **Preflight**: before the first trial the driver resolves the Go worker
+  (`aenv_go.go_client_bin` -> `AGENT_BENCHMARK_GO_BIN` -> wheel package data -> checkout
+  `go-client/bin/`) and **exits immediately** with a fix-up hint when it is missing or not
+  executable, instead of failing every trial's create.
+- **Build**: `pip install -e .` builds the worker automatically (see the
+  [go-client README](../../go-client/README.md)); Docker/E2B-only or offline CI installs can skip it
+  with `AGENT_BENCHMARK_SKIP_GO_BUILD=1`.
+- **Keep the old behaviour**: pass `--provider aenv`, or set `provider: aenv` in the sweep-config.
+- `--dry-run` only prints commands and skips the binary preflight, so it works offline.
+
 ## 2. Writing a sweep-config
 
 `config/oversub/template.yaml` is the annotated template; `lifecycle-1to3.yaml` /
@@ -146,7 +161,7 @@ keys are **rejected** (a typo like `repeat:` vs `repeats:` fails loudly).
 | key | default | meaning |
 |-----|---------|---------|
 | `base_config` | — (required) | base replay stress profile; deep-copied per trial |
-| `provider` | `aenv` | `{aenv, e2b, docker, cubesandbox, fake}` |
+| `provider` | `aenv-go` | `{aenv-go, aenv, e2b, docker, cubesandbox, fake}`; build the Go worker first (see the [go-client README](../../go-client/README.md)) — a missing binary fails loudly, no fallback |
 | `running_concurrency` | base `replay.running_concurrency` | ratio basis N; lifecycle scales it to k×N per trial (full-scale fleet) |
 | `ratios` | `1,2,3` | k values (list or `"1,2,3"`); `total_count = k×N` |
 | `modes` | `exec_ephemeral,lifecycle` | replay modes to sweep (one curve each; default = exec_ephemeral pure-COW first, then lifecycle); a WARNING fires when the driver auto-applies the default |

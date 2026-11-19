@@ -472,3 +472,25 @@ def test_auto_compare_flag_defaults():
     assert _TRUE_DEFAULTS["auto_compare"] is True
     assert build_arg_parser().parse_args([]).auto_compare is None  # sentinel; main() resolves
     assert build_arg_parser().parse_args(["--no-auto-compare"]).auto_compare is False
+
+
+def test_provider_default_is_aenv_go():
+    from bench_core.oversub import _TRUE_DEFAULTS, build_arg_parser
+
+    assert _TRUE_DEFAULTS["provider"] == "aenv-go"
+    assert build_arg_parser().parse_args([]).provider is None  # sentinel; main() resolves
+
+
+def test_preflight_fails_fast_on_missing_go_worker(tmp_path, monkeypatch):
+    from bench_core.oversub_run import preflight_provider
+
+    monkeypatch.setenv("AGENT_BENCHMARK_GO_BIN", str(tmp_path / "missing"))
+    with pytest.raises(SystemExit, match="Go worker"):
+        preflight_provider("aenv-go", {})
+
+    worker = tmp_path / "agent-benchmark-go"
+    worker.write_text("#!/bin/sh\n")
+    worker.chmod(0o755)
+    monkeypatch.setenv("AGENT_BENCHMARK_GO_BIN", str(worker))
+    preflight_provider("aenv-go", {})  # resolves: no raise
+    preflight_provider("aenv", {})  # non-go providers are not checked
