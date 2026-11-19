@@ -145,6 +145,7 @@ DEFAULT_TRIAL_TIMEOUT_SEC = 21600
 # CLI flag > sweep-config > these.
 _TRUE_DEFAULTS: dict[str, object] = {
     "provider": "aenv",
+    "scenario": None,
     "running_concurrency": None,
     "ratios": "1,2,3",
     "modes": "exec_ephemeral,lifecycle",

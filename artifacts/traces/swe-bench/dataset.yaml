@@ -1,0 +1,6 @@
+# Dataset metadata for the swe-bench scenario. Consumed by bench-core
+# `--scenario swe-bench` (and the oversub driver's `scenario:` passthrough):
+# the kernel resolves replay.trajectory_dir / template_manifest / trajectory_glob
+# from here when a config omits them. A YAML-explicit replay.trajectory_dir wins
+# over the scenario entirely.
+glob: "*.replay.json"

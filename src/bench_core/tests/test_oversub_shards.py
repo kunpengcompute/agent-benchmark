@@ -371,3 +371,14 @@ def test_write_shard_configs_removes_a_stale_stress_marker(tmp_path):
         spec.stress_path.write_text("")
     write_shard_configs(_trial_cfg(), plan)
     assert all(not spec.stress_path.exists() for spec in plan.specs)
+
+
+def test_build_shard_command_passes_scenario_through(tmp_path):
+    plan = plan_shards(trial_dir=tmp_path, mode="exec_ephemeral", ratio=2, n=4, setting="auto")
+    cmd = build_shard_command(["bench-core"], plan.specs[0], provider="aenv", no_vm_monitor=False, scenario="webarena")
+    assert cmd[:7] == [
+        "bench-core", "--config", str(plan.specs[0].config_path), "--provider", "aenv", "--scenario", "webarena",
+    ]
+    # no scenario -> no flag (single-process path preserves historical argv)
+    bare = build_shard_command(["bench-core"], plan.specs[0], provider="aenv", no_vm_monitor=False)
+    assert "--scenario" not in bare

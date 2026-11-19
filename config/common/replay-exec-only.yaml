@@ -1,6 +1,7 @@
 # exec_only replay baseline — identical stress shape to replay.yaml (lifecycle)
 # but WITHOUT pause/resume. Same total_count / round_size / round_count /
-# action_timeout / trajectory pool / template_manifest; only mode differs.
+# action_timeout; only mode differs (trajectory pool + template map resolve from
+# --scenario, same as the other replay profiles).
 #
 # Purpose: the no-lifecycle baseline against which replay.yaml's lifecycle
 # pause/resume overhead is compared. Sandboxes are long-lived (created once,
@@ -101,9 +102,9 @@ task_batch:
 
 # Replay configuration (host-agnostic; the sandbox runs the recorded commands).
 replay:
-  # Point these at your dataset (host-specific; do not commit real paths).
-  trajectory_dir: "artifacts/traces/replays"  # bundled 55-trajectory pool
-  trajectory_glob: "*.replay.json"
+  # Trajectory pool + template map are resolved from --scenario (default
+  # swe-bench -> artifacts/traces/swe-bench/{replays,image-map.json,dataset.yaml}).
+  # Set replay.trajectory_dir explicitly to point at a custom pool instead.
   # Cap the pool to the first N trajectories PER TEMPLATE (natural sort within
   # each template). Set by the oversub driver to running_concurrency (N) so each
   # template's issue set stays fixed across ratios (per-issue execution count
@@ -115,11 +116,6 @@ replay:
   # ratio until k>=T). Per-template (not a global first-N) keeps every template
   # covered in a multi-template manifest. Omit / null = use the whole pool.
   # trajectory_limit: 20
-  # Side manifest mapping trajectory file (path relative to trajectory_dir) ->
-  # concrete backend template. Lives with the dataset (not the benchmark config).
-  # Omit -> single-template legacy (all trajectories use the provider block's
-  # default `template`).
-  template_manifest: "artifacts/traces/image-map.json"
   workdir: "/"                            # exec cwd (no shell wrap); "/" = run at root
   env: {}                                   # optional {PAGER: cat, ...} via exec env param
   action_timeout: 300                       # per-action exec timeout (same as lifecycle)

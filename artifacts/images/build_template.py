@@ -33,7 +33,7 @@ def detect_arch():
 
 
 def load_cases(arch, registry):
-    mapping = json.loads((ROOT / "artifacts/traces/image-map.json").read_text(
+    mapping = json.loads((ROOT / "artifacts/traces/swe-bench/image-map.json").read_text(
         encoding="utf-8"))
     if not isinstance(mapping, dict) or not mapping:
         raise ValueError("image-map.json must be a nonempty object")
@@ -53,7 +53,7 @@ def load_cases(arch, registry):
             raise ValueError(f"Empty or duplicate instance_id: {instance!r}")
         if not replay or Path(replay).name != replay or replay in replays:
             raise ValueError(f"Invalid or duplicate replay_file: {replay!r}")
-        if not (ROOT / "artifacts/traces/replays" / replay).is_file():
+        if not (ROOT / "artifacts/traces/swe-bench/replays" / replay).is_file():
             raise ValueError(f"Missing trajectory: {replay}")
         name = mapping.get(replay)
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):

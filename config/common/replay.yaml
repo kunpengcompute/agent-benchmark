@@ -129,14 +129,9 @@ task_batch:
 
 # Replay configuration (host-agnostic; the sandbox runs the recorded commands).
 replay:
-  # Point these at your dataset (host-specific; do not commit real paths).
-  trajectory_dir: "artifacts/traces/replays"  # bundled 55-trajectory pool
-  trajectory_glob: "*.replay.json"
-  # Side manifest mapping trajectory file (path relative to trajectory_dir) ->
-  # concrete backend template, e.g. {"foo.replay.json": "swb-foo"}. Lives with
-  # the dataset (not the benchmark config). Omit -> single-template legacy
-  # (all trajectories use the provider block's default `template`).
-  template_manifest: "artifacts/traces/image-map.json"
+  # Trajectory pool + template map are resolved from --scenario (default
+  # swe-bench -> artifacts/traces/swe-bench/{replays,image-map.json,dataset.yaml}).
+  # Set replay.trajectory_dir explicitly to point at a custom pool instead.
   workdir: "/"                            # exec cwd (no shell wrap); "/" = run at root
   env: {}                                   # optional {PAGER: cat, ...} via exec env param
   action_timeout: 300                      # per-action exec timeout (lifecycle timeouts below)

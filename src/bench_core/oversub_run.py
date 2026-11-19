@@ -125,6 +125,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="base replay.yaml (required unless sweep-config sets base_config)")
     p.add_argument("--provider", default=None, help="provider name (default aenv)")
     p.add_argument(
+        "--scenario",
+        default=None,
+        help="replay dataset scenario under artifacts/traces/ (default swe-bench); "
+        "passed through to bench-core --scenario so each trial resolves its "
+        "trajectory pool + template map from the scenario instead of the base YAML.",
+    )
+    p.add_argument(
         "--running-concurrency",
         type=int,
         default=None,
@@ -457,6 +464,8 @@ def _run_trial(
         )
 
     cmd = [*args.bench_core_bin, "--config", str(trial_yaml), "--provider", args.provider]
+    if args.scenario:
+        cmd.extend(["--scenario", args.scenario])
     if args.no_vm_monitor:
         cmd.append("--no-vm-monitor")
 
@@ -559,7 +568,9 @@ def _run_sharded_trial(
     """
     write_shard_configs(trial_cfg, plan, owns_collector=not args.no_vm_monitor)
     commands = [
-        build_shard_command(args.bench_core_bin, spec, provider=args.provider, no_vm_monitor=args.no_vm_monitor)
+        build_shard_command(
+            args.bench_core_bin, spec, provider=args.provider, no_vm_monitor=args.no_vm_monitor, scenario=args.scenario
+        )
         for spec in plan.specs
     ]
     if args.dry_run:
@@ -727,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     # Write resolved values back so _run_trial / _run_subprocess read them unchanged.
     args.config = base_config_path
     args.provider = resolve("provider")
+    args.scenario = resolve("scenario")
     args.ratios = ratios
     args.modes = modes
     args.repeats = repeats

@@ -13,8 +13,8 @@ Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / Ag
 
 仓库自带一套可直接用的负载：55 条 Agent 轨迹，以及它们对应的镜像与模板映射。
 
-- `artifacts/traces/replays/`：55 条轨迹（`.json` / `.traj`）。
-- `artifacts/traces/image-map.json`：每条轨迹对应的 template 名。
+- `artifacts/traces/swe-bench/replays/`：55 条轨迹（`.json` / `.traj`）。
+- `artifacts/traces/swe-bench/image-map.json`：每条轨迹对应的 template 名。
 - `artifacts/images/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
 
 **模板**就是把这些镜像灌进 AgentENV 后得到的一份快照。在 AgentENV 主机上装 Docker 和
@@ -69,10 +69,12 @@ bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --t
 这 55 条里最短一条约 3.5 分钟、中位约 20 分钟——窗口短于一条轨迹的时长时步骤照跑、但
 `success` 是 0：不是没跑起来，是没跑完。
 
-轨迹默认就读上一节那 55 条：`replay-ephemeral.yaml` 的 `replay.trajectory_dir` /
-`replay.template_manifest` 已指向 `artifacts/traces/replays` 与
-`artifacts/traces/image-map.json`，模板名与上一节构建出来的名字一一对应，无需改任何东西。
-换成自己的数据时改这两个键；`template_manifest` 不设则所有轨迹退回 `aenv.template`。
+轨迹默认就读上一节那 55 条：`--scenario swe-bench`（默认值）把 `replay.trajectory_dir` /
+`replay.template_manifest` 解析到 `artifacts/traces/swe-bench/{replays,image-map.json}`
+（glob 取自同目录的 `dataset.yaml`），模板名与上一节构建出来的名字一一对应，无需改任何东西。
+换成自己的数据时用 `--scenario <name>` 指向 `artifacts/traces/<name>/`（webArena / OSWorld
+将来各自一个场景目录，配置零 fork）；或显式改 `replay.trajectory_dir` / `replay.template_manifest`；
+`template_manifest` 不设则所有轨迹退回 `aenv.template`。
 
 手边没有 AgentENV 时，可以先用本地 docker 做同样的连通性验证：`pip install docker`，
 把 `config/common/docker-browser.yaml` 的 `docker.image` 换成本地已有镜像，再跑
