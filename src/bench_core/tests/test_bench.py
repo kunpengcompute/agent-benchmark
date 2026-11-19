@@ -239,6 +239,46 @@ def test_load_config_scenario_tolerates_null_replay_block(tmp_path):
     assert config.workflow_config.replay_trajectory_dir == "artifacts/traces/swe-bench/replays"
 
 
+def test_load_config_scenario_from_yaml_key(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: swe-bench\n  mode: lifecycle\n", encoding="utf-8")
+    config, _ = load_config(yml)
+    assert config.workflow_config.replay_trajectory_dir == "artifacts/traces/swe-bench/replays"
+    assert config.workflow_config.replay_template_manifest == "artifacts/traces/swe-bench/image-map.json"
+
+
+def test_load_config_cli_scenario_wins_over_yaml_key(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    # YAML names webarena but the CLI override is swe-bench: the CLI alone wins.
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: webarena\n  mode: lifecycle\n", encoding="utf-8")
+    config, _ = load_config(yml, scenario="swe-bench")
+    assert config.workflow_config.replay_trajectory_dir == "artifacts/traces/swe-bench/replays"
+
+
+def test_load_config_diy_custom_pool_and_map_untouched(tmp_path):
+    """The legacy DIY escape hatch stays: explicit trajectory_dir + template_manifest
+    bypass the scenario machinery entirely (no scenario key, no resolution, no warning)."""
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(
+        "workflow_type: replay\n"
+        "replay:\n"
+        "  trajectory_dir: /mnt/my-traces\n"
+        "  template_manifest: /mnt/my-traces/image-map.json\n"
+        "  mode: exec_only\n",
+        encoding="utf-8",
+    )
+    config, _ = load_config(yml)
+    assert config.workflow_config.replay_trajectory_dir == "/mnt/my-traces"
+    assert config.workflow_config.replay_template_manifest == "/mnt/my-traces/image-map.json"
+    assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
+
+
 class TestRunBenchmarkReplayRoundRobin:
     def test_replay_round_robin_completes_and_writes_report(self, tmp_path):
         config = KernelConfig(

@@ -42,7 +42,8 @@ def load_config(
 
     ``scenario`` selects the replay dataset under ``artifacts/traces/``; the
     trajectory pool + template map are derived from it when the YAML omits them
-    (see :func:`_apply_scenario_override`).
+    (see :func:`_apply_scenario_override`). Precedence: the CLI ``--scenario``
+    flag, else the ``replay.scenario`` YAML key, else ``swe-bench``.
     """
     import yaml
 
@@ -57,14 +58,31 @@ def load_config(
             f"(workflow_type={raw.get('workflow_type')!r})"
         )
     if raw.get("workflow_type") == "replay":
-        if scenario is not None and isinstance(raw.get("replay"), dict) and "trajectory_dir" in raw["replay"]:
-            logger.warning(
-                f"--scenario {scenario!r} ignored: the config sets replay.trajectory_dir "
-                "explicitly (an explicit pool wins over --scenario). Remove that key to use "
-                f"the artifacts/traces/{scenario}/ dataset."
-            )
-        _apply_scenario_override(raw, scenario or "swe-bench")
+        resolved = _resolve_scenario(raw, scenario)
+        replay_block = raw.get("replay")
+        if isinstance(replay_block, dict) and "trajectory_dir" in replay_block:
+            yaml_scenario = replay_block.get("scenario")
+            if scenario is not None or (isinstance(yaml_scenario, str) and yaml_scenario):
+                logger.warning(
+                    f"replay scenario {resolved!r} ignored: the config sets replay.trajectory_dir "
+                    "explicitly (an explicit pool wins over the scenario). Remove that key to use "
+                    f"the artifacts/traces/{resolved}/ dataset."
+                )
+        _apply_scenario_override(raw, resolved)
     return KernelConfig.from_raw(raw), raw
+
+
+def _resolve_scenario(raw: dict[str, Any], cli_scenario: str | None) -> str:
+    """Collapse the scenario sources to one value: CLI ``--scenario`` >
+    the ``replay.scenario`` YAML key > the ``swe-bench`` default."""
+    if cli_scenario is not None:
+        return cli_scenario
+    replay = raw.get("replay")
+    if isinstance(replay, dict):
+        yaml_scenario = replay.get("scenario")
+        if isinstance(yaml_scenario, str) and yaml_scenario:
+            return yaml_scenario
+    return "swe-bench"
 
 
 TRACES_ROOT = Path("artifacts") / "traces"
@@ -137,7 +155,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workflow-type", choices=["browser", "coding", "document", "replay"])
     parser.add_argument(
         "--scenario",
-        help="replay dataset scenario under artifacts/traces/ (default swe-bench). "
+        help="replay dataset scenario under artifacts/traces/ (default swe-bench; "
+        "alternatively set replay.scenario: in the config -- the CLI alone wins). "
         "Resolves replay.trajectory_dir / template_manifest / trajectory_glob when "
         "the YAML omits them (explicit replay.trajectory_dir wins over --scenario).",
     )

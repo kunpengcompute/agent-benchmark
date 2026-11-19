@@ -129,9 +129,18 @@ task_batch:
 
 # Replay configuration (host-agnostic; the sandbox runs the recorded commands).
 replay:
-  # Trajectory pool + template map are resolved from --scenario (default
-  # swe-bench -> artifacts/traces/swe-bench/{replays,image-map.json,dataset.yaml}).
-  # Set replay.trajectory_dir explicitly to point at a custom pool instead.
+  # Trajectory pool + template map are resolved from replay.scenario (or the
+  # --scenario CLI flag, which wins). Default swe-bench ->
+  # artifacts/traces/swe-bench/{replays,image-map.json,dataset.yaml}; a dataset
+  # is organized as one artifacts/traces/<scenario>/ dir (webArena / OSWorld
+  # each add their own, config untouched). Set replay.trajectory_dir explicitly
+  # to point at a custom pool instead (bypasses the scenario entirely).
+  scenario: swe-bench
+  # --- DIY alternative (legacy behavior, bypasses the scenario entirely):
+  # point the pool + template map at your own data instead of a scenario dir:
+  #   trajectory_dir: /srv/my-traces
+  #   template_manifest: /srv/my-traces/image-map.json
+  #   trajectory_glob: "*.json"            # omit -> *.replay.json
   workdir: "/"                            # exec cwd (no shell wrap); "/" = run at root
   env: {}                                   # optional {PAGER: cat, ...} via exec env param
   action_timeout: 300                      # per-action exec timeout (lifecycle timeouts below)

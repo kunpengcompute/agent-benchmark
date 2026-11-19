@@ -69,11 +69,13 @@ bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --t
 这 55 条里最短一条约 3.5 分钟、中位约 20 分钟——窗口短于一条轨迹的时长时步骤照跑、但
 `success` 是 0：不是没跑起来，是没跑完。
 
-轨迹默认就读上一节那 55 条：`--scenario swe-bench`（默认值）把 `replay.trajectory_dir` /
-`replay.template_manifest` 解析到 `artifacts/traces/swe-bench/{replays,image-map.json}`
-（glob 取自同目录的 `dataset.yaml`），模板名与上一节构建出来的名字一一对应，无需改任何东西。
-换成自己的数据时用 `--scenario <name>` 指向 `artifacts/traces/<name>/`（webArena / OSWorld
-将来各自一个场景目录，配置零 fork）；或显式改 `replay.trajectory_dir` / `replay.template_manifest`；
+轨迹默认就读上一节那 55 条：`replay.scenario: swe-bench`（默认值，也可用 `--scenario`
+CLI 覆盖，CLI 优先）把 `replay.trajectory_dir` / `replay.template_manifest` 解析到
+`artifacts/traces/swe-bench/{replays,image-map.json}`（glob 取自同目录的 `dataset.yaml`），
+模板名与上一节构建出来的名字一一对应，无需改任何东西。
+换成自己的数据时改 `replay.scenario: <name>` 指向 `artifacts/traces/<name>/`（webArena /
+OSWorld 将来各自一个场景目录，配置零 fork）；或显式改 `replay.trajectory_dir` /
+`replay.template_manifest`（DIY：显式 pool 完全绕过 scenario，行为与旧版一致）；
 `template_manifest` 不设则所有轨迹退回 `aenv.template`。
 
 手边没有 AgentENV 时，可以先用本地 docker 做同样的连通性验证：`pip install docker`，

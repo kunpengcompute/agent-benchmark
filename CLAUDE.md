@@ -23,10 +23,12 @@ Scenarios / providers (all behind the SDK-free `env_provider` contract):
 The replay workflow (`exec_only` / `lifecycle` / `exec_ephemeral`) replays recorded
 agent trajectories against a backend. The bundled 55-trajectory pool
 (`artifacts/traces/swe-bench/replays`) + `artifacts/traces/swe-bench/image-map.json`
-manifest are resolved by `--scenario swe-bench` (the default) into the replay
-pointer keys, so a replay config runs out of the box. Datasets are organized per
-scenario under `artifacts/traces/<scenario>/` (`replays/` + `image-map.json` +
-`dataset.yaml`); a YAML-explicit `replay.trajectory_dir` bypasses the scenario.
+manifest are resolved by `replay.scenario` (default `swe-bench`; the `--scenario`
+CLI flag wins) into the replay pointer keys, so a replay config runs out of the
+box. Datasets are organized per scenario under `artifacts/traces/<scenario>/`
+(`replays/` + `image-map.json` + `dataset.yaml`). The legacy DIY escape hatch is
+unchanged: a YAML-explicit `replay.trajectory_dir` (optionally also
+`replay.template_manifest`) bypasses the scenario machinery entirely.
 
 Host-level resource collection is provided by the bundled **`vm_monitor`**
 package (`src/vm_monitor/`, registered as the `vm-monitor` CLI by
