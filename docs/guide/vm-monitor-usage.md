@@ -119,7 +119,7 @@ SMAP_BW_PATH=/path/to/smap_bw.py
 
 # AMD uProf binary (log-rotation slot; unset/invalid path warns and skips the slot.
 # Metrics: --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics, default memory,pipeline_util;
-# per-turn data lands in uprof/<stamp>.csv)
+# no -o for now: output lands at the tool's default (AMDuProfPcm-Timeseries_* under the rotation log dir), scanned by the parser)
 UPROF_PATH=/opt/AMDuProf_5.3-521/bin/AMDuProfPcm
 
 # getfre + its YAML config
@@ -139,7 +139,7 @@ DEVKIT_CPU_RANGE=96-191
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
 | `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | optional; sudo |
-| `UPROF_PATH` | `uprof` (rotation mode) | log_capture/uprof/<turn>.csv | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
+| `UPROF_PATH` | `uprof` (rotation mode) | rotation log dir (default output) | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
@@ -173,7 +173,7 @@ numa_nodes: [0, 1]              # omit to auto-discover
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
 | **smap_bw** | `sudo python3 $SMAP_BW_PATH --clear --duration <t> --timeout <t+10>` | `smap_bw.log` | SMAPBW_Summary, SMAPBW_Cycles |
 | **getfre** | threaded per-NUMA: `$GETFRE_PATH <total_cores> <core_id>` per core | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N} |
-| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -o <turn>.csv -d <interval>` | `log_capture/uprof/<turn>.csv` | Uprof (timeseries) |
+| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -d <interval>` | rotation log dir (default output) | Uprof (timeseries) |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`, or auto-computed from `--numa` via `/sys/devices/system/node/node{N}/cpulist`. If neither resolves, devkit_top_down is skipped (never launched with a wrong range).
 
