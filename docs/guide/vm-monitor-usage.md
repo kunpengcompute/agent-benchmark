@@ -119,7 +119,7 @@ SMAP_BW_PATH=/path/to/smap_bw.py
 
 # AMD uProf binary (log-rotation slot; unset/invalid path warns and skips the slot.
 # Metrics: --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics, default memory,pipeline_util;
-# no -o for now: output lands at the tool's default (AMDuProfPcm-Timeseries_* under the rotation log dir), scanned by the parser)
+# no -o: counters stream to stdout, captured per-turn into uprof/<turn>.log -- parse_uprof reads them into the Uprof sheet)
 UPROF_PATH=/path/to/AMDuProfPcm
 
 # getfre + its YAML config
@@ -139,7 +139,7 @@ DEVKIT_CPU_RANGE=96-191
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
 | `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | optional; sudo |
-| `UPROF_PATH` | `uprof` (rotation mode) | rotation log dir (default output) | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
+| `UPROF_PATH` | `uprof` (rotation mode) | `log_capture/uprof/<turn>.log` | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
@@ -173,7 +173,7 @@ numa_nodes: [0, 1]              # omit to auto-discover
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
 | **smap_bw** | `sudo python3 $SMAP_BW_PATH --clear --duration <t> --timeout <t+10>` | `smap_bw.log` | SMAPBW_Summary, SMAPBW_Cycles |
 | **getfre** | threaded per-NUMA: `$GETFRE_PATH <total_cores> <core_id>` per core | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N} |
-| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -d <interval>` | rotation log dir (default output) | Uprof (timeseries) |
+| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -d <interval>` | `log_capture/uprof/<turn>.log` | Uprof (timeseries) |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`, or auto-computed from `--numa` via `/sys/devices/system/node/node{N}/cpulist`. If neither resolves, devkit_top_down is skipped (never launched with a wrong range).
 
@@ -253,7 +253,8 @@ logs_<timestamp>/
 `resource_report.xlsx` sheets (summary only): `Summary`, `NUMA_Overview`, `VM_Stats`, plus the
 profiler sheets written when their tool log exists — `DevKit_TopDown`, `DevKit_Memory`,
 `NUMA_Bandwidth`, `KSys`, `UBWatch_Latency`, `UBWatch_Bandwidth`, `SMAPBW_Summary`,
-`SMAPBW_Cycles`, `Getfre_Summary`, `Getfre_NUMA{N}`.
+`SMAPBW_Cycles`, `Getfre_Summary`, `Getfre_NUMA{N}`, `Uprof` (rotation mode, parsed
+from AMDuProfPcm's per-turn timeseries output).
 
 `host_resources.xlsx` sheets (per-sample timelines, derived from `raw_data/`): `Host resources`,
 `NUMA`, `Per-VM`, `Disk IO`, and `HostProc` (only with `--host-proc`). Column-level definitions:
