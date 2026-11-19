@@ -139,7 +139,7 @@ DEVKIT_CPU_RANGE=96-191
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
 | `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | optional; sudo |
-| `UPROF_PATH` | `uprof` (rotation mode) | log_capture/uprof logs | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
+| `UPROF_PATH` | `uprof` (rotation mode) | log_capture/uprof/<turn>/ | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
