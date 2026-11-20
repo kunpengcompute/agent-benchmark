@@ -280,11 +280,6 @@ Consolidates what were previously three separate sheets; there is **no** `NUMA_C
 timeline was moved to `host_resources.xlsx`, which is derived from the
 always-on `raw_data/*.csv` snapshots (section 2.7) — so it is smaller, faster
 to build, and rerunnable after the run with `vm-monitor raw-report <log_dir>`.
-**One deliberate exception: the `Uprof` sheet** (section 2.3) carries the full
-per-sample AMDuProfPcm timeseries — uprof output is a rotation-mode capture
-artifact (not part of the always-on `raw_data/` contract), the sheet only
-exists when the uprof slot actually ran, and per-turn timeseries data is the
-point of collecting it.
 
 | Timeline | Where it lives now |
 |---|---|
