@@ -3,20 +3,20 @@
 > 第一次用先看仓库 [README](../../README.md) 的「快速开始」(fake → docker → aenv 三档);
 > 本文覆盖其后的一切细节。
 >
-> 主机无关的压测内核,通过 `EnvironmentProvider` 抽象驱动 e2b / docker / aenv / aenv-go / cubesandbox / fake。
+> 主机无关的压测内核,通过 `EnvironmentProvider` 抽象驱动 e2b / docker / aenv / aenv-go / sandboxsched / cubesandbox / fake。
 > 与冻结的 legacy `e2b_bench/`、`docker_bench/` 并存,互不影响(共享零代码)。
 > 加一个后端 = 新增一个 `env_provider` 子模块,内核和契约都不用动。
 
 ## 概述
 
 `bench_core` 把压测流程从沙箱实现里解耦:内核只通过一个 `exec()` 原语下发命令,
-沙箱后端(e2b / docker / aenv / aenv-go / cubesandbox / 未来的 kata)只负责把命令送进沙箱并返回结果。
+沙箱后端(e2b / docker / aenv / aenv-go / sandboxsched / cubesandbox / 未来的 kata)只负责把命令送进沙箱并返回结果。
 因此切换后端只需 `--provider`,**同一份压测配置在任一后端上跑同一套压力曲线**。
 
 - `src/bench_core/` — 内核:`run_benchmark` 脊柱、stats/round_robin/task_runner、KernelConfig
-- `src/env_provider/` — 契约(`EnvironmentProvider` ABC + `SandboxInstance`)+ e2b/docker/aenv/aenv-go/cubesandbox/fake 实现
+- `src/env_provider/` — 契约(`EnvironmentProvider` ABC + `SandboxInstance`)+ e2b/docker/aenv/aenv-go/sandboxsched/cubesandbox/fake 实现
 - `config/common/` — 后端无关的工作流配置(每个文件带它涉及的后端块:browser/coding/document 是
-  `e2b:` + `docker:`;replay 另外还有 `aenv:` / `aenv_go:` / `cubesandbox:`),`--provider` 决定读哪块
+  `e2b:` + `docker:`;replay 另外还有 `aenv:` / `aenv_go:` / `sandboxsched:` / `cubesandbox:`),`--provider` 决定读哪块
 
 ---
 
@@ -86,6 +86,7 @@ AENV 服务端对齐的是 2.46.x 的 E2B-compatible API,而 2.47+ 改了 `Sandb
 
 ```bash
 pip install docker                    # --provider docker
+pip install -e ".[sandboxsched]"      # --provider sandboxsched
 pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
 
@@ -110,7 +111,7 @@ worker 路径可用 `AGENT_BENCHMARK_GO_BIN` 覆盖,或写在 `aenv_go:` 块的 
 ### 2.1 配置文件结构
 
 `config/common/` 下每个 YAML = 一个工作流,携带它涉及的后端块(browser/coding/document 是
-`e2b:` + `docker:`;replay 还有 `aenv:` + `aenv_go:` + `cubesandbox:`):
+`e2b:` + `docker:`;replay 还有 `aenv:` + `aenv_go:` + `sandboxsched:` + `cubesandbox:`):
 
 ```yaml
 workflow_type: browser        # browser | coding | document | replay
