@@ -28,9 +28,10 @@ sweep 文件里只有**扫描**旋钮。凭据、后端地址、镜像都在它�
 (`base_config: config/common/replay-ephemeral.yaml`)里,先改那个文件。跳过这一步就是"扫描起来了
 但每个 trial 都 invalid"的常见原因。
 
-**前置:轨迹池。** base profile 已默认指向仓库自带的 55 条 ——
-`replay.trajectory_dir: artifacts/traces/replays` 与
-`replay.template_manifest: artifacts/traces/image-map.json`。换成自己的轨迹包时改这两个键;
+**前置:轨迹池。** base profile 已默认指向仓库自带的 55 条 —— `replay.scenario: swe-bench`
+(默认)解析到 `artifacts/traces/swe-bench/{replays,image-map.json}`。换成自己的轨迹包时改
+`replay.scenario` / sweep 的 `scenario:`,或显式写 `replay.trajectory_dir` /
+`replay.template_manifest`;
 没有轨迹池时每个 trial 都回放 **0 个 step**、全部判 invalid(exec_ephemeral 还会先把机队建起来再空跑)。
 文件格式见 [bench-core-usage-zh.md §8.3](bench-core-usage-zh.md#83-轨迹格式与-template_manifest)。
 

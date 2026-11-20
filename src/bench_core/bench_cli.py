@@ -94,8 +94,10 @@ def _dataset_glob(scenario_dir: Path) -> str:
 
     default = "*.replay.json"
     try:
-        meta_doc = yaml.safe_load((scenario_dir / "dataset.yaml").read_text(encoding="utf-8")) or {}
+        meta_doc = yaml.safe_load((scenario_dir / "dataset.yaml").read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
+        return default
+    if not isinstance(meta_doc, dict):  # empty file, or a root node that is not a mapping
         return default
     dataset_glob = meta_doc.get("glob")
     return dataset_glob if isinstance(dataset_glob, str) and dataset_glob else default
@@ -233,8 +235,8 @@ def main() -> None:
 
     if args.config:
         config, raw = load_config(
-        args.config, workflow_type_override=args.workflow_type or None, scenario=args.scenario
-    )
+            args.config, workflow_type_override=args.workflow_type or None, scenario=args.scenario
+        )
     else:
         config, raw = KernelConfig(), {}
         if args.workflow_type:

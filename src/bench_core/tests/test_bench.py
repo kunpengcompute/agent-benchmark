@@ -239,6 +239,17 @@ def test_load_config_scenario_tolerates_null_replay_block(tmp_path):
     assert config.workflow_config.replay_trajectory_dir == "artifacts/traces/swe-bench/replays"
 
 
+def test_dataset_glob_falls_back_when_dataset_yaml_root_is_not_a_mapping(tmp_path):
+    from bench_core.bench_cli import _dataset_glob
+
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text("glob: '*.json'\n", encoding="utf-8")
+    assert _dataset_glob(tmp_path) == "*.json"
+    for bad_root in ("- not\n- a mapping\n", "", "42\n"):
+        dataset_yaml.write_text(bad_root, encoding="utf-8")
+        assert _dataset_glob(tmp_path) == "*.replay.json"
+
+
 def test_load_config_scenario_from_yaml_key(tmp_path):
     from bench_core.bench import load_config
 

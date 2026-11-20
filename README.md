@@ -78,6 +78,17 @@ OSWorld 将来各自一个场景目录，配置零 fork）；或显式改 `repla
 `replay.template_manifest`（DIY：显式 pool 完全绕过 scenario，行为与旧版一致）；
 `template_manifest` 不设则所有轨迹退回 `aenv.template`。
 
+从旧版本升级时注意：这两个内置目录已从 `artifacts/traces/` 迁到
+`artifacts/traces/swe-bench/`，旧配置里**显式写死**的路径不会跟着场景解析走，需要手动迁移
+（否则目录不存在 → 回放 0 条轨迹）：
+
+```diff
+ replay:
+-  trajectory_dir: artifacts/traces/replays
+-  template_manifest: artifacts/traces/image-map.json
++  scenario: swe-bench
+```
+
 手边没有 AgentENV 时，可以先用本地 docker 做同样的连通性验证：`pip install docker`，
 把 `config/common/docker-browser.yaml` 的 `docker.image` 换成本地已有镜像，再跑
 `bench-core --provider docker --config config/common/docker-browser.yaml --create-only -n 2`。

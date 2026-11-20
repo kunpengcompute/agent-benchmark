@@ -31,10 +31,11 @@ the **base profile** it points at (`base_config: config/common/replay-ephemeral.
 file you edit first. Skipping it is the usual "the sweep started but every trial is invalid" cause.
 
 **Prerequisite: the trajectory pool.** The shipped base profile already points at the bundled 55
-— `replay.trajectory_dir: artifacts/traces/replays` +
-`replay.template_manifest: artifacts/traces/image-map.json`. Repoint both for your own pack; without
-a pool every trial replays **zero steps** and comes back invalid (and, in `exec_ephemeral`, the
-fleet is created first and then runs nothing). The expected file shape is in
+— the default `replay.scenario: swe-bench` resolves them to
+`artifacts/traces/swe-bench/{replays,image-map.json}`. Change `replay.scenario` / the sweep's
+`scenario:` for your own pack, or write `replay.trajectory_dir` / `replay.template_manifest`
+explicitly; without a pool every trial replays **zero steps** and comes back invalid (and, in
+`exec_ephemeral`, the fleet is created first and then runs nothing). The expected file shape is in
 [bench-core-usage.md §8.3](bench-core-usage.md#83-trajectory-format-and-template_manifest).
 
 **1 — install** (`e2b` — which aenv rides — is a core dependency; there is no separate aenv
