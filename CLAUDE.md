@@ -26,9 +26,13 @@ agent trajectories against a backend. The bundled 55-trajectory pool
 manifest are resolved by `replay.scenario` (default `swe-bench`; the `--scenario`
 CLI flag wins) into the replay pointer keys, so a replay config runs out of the
 box. Datasets are organized per scenario under `artifacts/traces/<scenario>/`
-(`replays/` + `image-map.json` + `dataset.yaml`). The legacy DIY escape hatch is
-unchanged: a YAML-explicit `replay.trajectory_dir` (optionally also
-`replay.template_manifest`) bypasses the scenario machinery entirely.
+(`replays/` + `image-map.json` + `dataset.yaml`); the root is anchored at the repo
+root (not the CWD), the resolved pointers are absolute, and the applied scenario
+is written back to `replay.scenario` so trial.yaml, `run_summary.json` and the
+sweep report record the data axis (`--reuse` refuses to cross scenarios). The
+legacy DIY escape hatch is unchanged: a YAML-explicit `replay.trajectory_dir`
+(optionally also `replay.template_manifest`) bypasses the scenario machinery
+entirely.
 
 Host-level resource collection is provided by the bundled **`vm_monitor`**
 package (`src/vm_monitor/`, registered as the `vm-monitor` CLI by

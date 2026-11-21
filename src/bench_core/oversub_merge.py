@@ -271,6 +271,7 @@ def merge_run_summaries(
         "schema_version": first.get("schema_version", 2),
         "workflow_type": first.get("workflow_type"),
         "replay_mode": first.get("replay_mode"),
+        "scenario": first.get("scenario"),
         "provider": first.get("provider"),
         "started_at": span["started_at"],
         "completed_at": span["completed_at"],

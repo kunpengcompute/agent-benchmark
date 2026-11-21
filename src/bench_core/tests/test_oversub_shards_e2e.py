@@ -85,6 +85,7 @@ finished = time.time()
 summary = {
   "schema_version": 2, "workflow_type": "replay",
   "replay_mode": cfg["replay"]["mode"], "provider": "stub",
+  "scenario": (cfg.get("replay") or {}).get("scenario"),
   "started_at": "2026-10-30T10:00:00+08:00", "completed_at": "2026-10-30T10:18:00+08:00",
   "started_epoch": began, "completed_epoch": finished,
   "test_duration": cfg["test"]["duration"], "wall_sec": round(finished - began, 3),
@@ -205,10 +206,15 @@ def test_e2e_sharded_trial_merges_into_contract_artifacts(tmp_path):
     argv1 = json.loads((trial_dir / "shard-01" / "argv.json").read_text(encoding="utf-8"))
     assert "--no-vm-monitor" not in argv0
     assert "--no-vm-monitor" in argv1
+    # The dataset rides in the config, not argv, and is visible in the artifacts.
+    assert "--scenario" not in argv0 and "--scenario" not in argv1
+    trial_cfg = yaml.safe_load((trial_dir / "trial.yaml").read_text(encoding="utf-8"))
+    assert trial_cfg["replay"]["scenario"] == "swe-bench"
 
     # Merged summary: the schema-2 contract, with shard provenance attached.
     merged_path = trial_dir / "merged" / "rb_run_summary.json"
     merged = json.loads(merged_path.read_text(encoding="utf-8"))
+    assert merged["scenario"] == "swe-bench"
     assert merged["shard_count"] == 2
     assert merged["throughput"]["succeeded"] == 16  # M*k*N = 2*2*4
     assert merged["throughput"]["total"] == 16

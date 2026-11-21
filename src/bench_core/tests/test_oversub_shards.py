@@ -373,12 +373,10 @@ def test_write_shard_configs_removes_a_stale_stress_marker(tmp_path):
     assert all(not spec.stress_path.exists() for spec in plan.specs)
 
 
-def test_build_shard_command_passes_scenario_through(tmp_path):
+def test_build_shard_command_has_no_scenario_flag(tmp_path):
+    """The dataset travels in the config, not in argv: trial.yaml carries
+    replay.scenario and build_shard_config derives each shard's config from it."""
     plan = plan_shards(trial_dir=tmp_path, mode="exec_ephemeral", ratio=2, n=4, setting="auto")
-    cmd = build_shard_command(["bench-core"], plan.specs[0], provider="aenv", no_vm_monitor=False, scenario="webarena")
-    assert cmd[:7] == [
-        "bench-core", "--config", str(plan.specs[0].config_path), "--provider", "aenv", "--scenario", "webarena",
-    ]
-    # no scenario -> no flag (single-process path preserves historical argv)
-    bare = build_shard_command(["bench-core"], plan.specs[0], provider="aenv", no_vm_monitor=False)
-    assert "--scenario" not in bare
+    cmd = build_shard_command(["bench-core"], plan.specs[0], provider="aenv", no_vm_monitor=False)
+    assert cmd == ["bench-core", "--config", str(plan.specs[0].config_path), "--provider", "aenv"]
+    assert "--scenario" not in cmd

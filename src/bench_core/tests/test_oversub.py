@@ -109,6 +109,28 @@ def test_build_trial_config_overrides_and_preserves_base():
     assert base["replay"]["mode"] == "lifecycle"
 
 
+def test_build_trial_config_carries_scenario_into_the_config():
+    """The dataset is a trial input: trial.yaml (and every shard config derived
+    from it) carries replay.scenario, so no --scenario argv passthrough is needed
+    and the kernel records it in run_summary."""
+    cfg = build_trial_config(
+        _base_yaml(),
+        mode="exec_only",
+        ratio=2,
+        n=8,
+        test_duration=60,
+        trial_dir="out/t1",
+        prefix="replay_bench",
+        scenario="webarena",
+    )
+    assert cfg["replay"]["scenario"] == "webarena"
+    # No driver selection -> the base config's own value (or absence) stands.
+    untouched = build_trial_config(
+        _base_yaml(), mode="exec_only", ratio=2, n=8, test_duration=60, trial_dir="out/t1", prefix="replay_bench"
+    )
+    assert "scenario" not in untouched["replay"]
+
+
 def test_build_trial_config_lifecycle_running_concurrency_scales():
     """Lifecycle oversub runs the FULL fleet: rc == total_count == k*N so the
     kernel builds no running-slot cap and all k*N sandboxes pause/resume

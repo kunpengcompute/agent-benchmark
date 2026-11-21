@@ -131,6 +131,10 @@ def write_run_summary(
         "schema_version": SCHEMA_VERSION,
         "workflow_type": config.workflow_type,
         "replay_mode": rcfg.replay_mode,
+        # The data axis: which artifacts/traces/<scenario>/ dataset this run
+        # measured (None = explicit trajectory_dir). Consumers that join runs
+        # (compare_sweeps, --reuse) must not treat two datasets as one series.
+        "scenario": rcfg.replay_scenario,
         "provider": stats_collector.provider_label or None,
         "started_at": _iso(started_epoch) if started_epoch else None,
         "completed_at": _iso(completed_epoch),

@@ -323,7 +323,6 @@ def build_shard_command(
     *,
     provider: str,
     no_vm_monitor: bool,
-    scenario: str | None = None,
 ) -> list[str]:
     """One shard's bench-core argv; only shard 0 keeps its monitor flags.
 
@@ -335,13 +334,11 @@ def build_shard_command(
     control-plane gauge. A second collector on the same host would double-sample
     the same /proc counters and race on the tool lock dir.
 
-    ``scenario`` (the oversub driver's dataset selection) is passed through so
-    a sharded trial resolves the same trajectory pool as a single-process one --
-    the per-shard configs carry no trajectory pointer keys.
+    The dataset scenario needs no flag here: :func:`build_shard_config` derives
+    each shard's config from ``trial.yaml``, which already carries
+    ``replay.scenario``.
     """
     cmd = [*bench_core_bin, "--config", str(spec.config_path), "--provider", provider]
-    if scenario:
-        cmd.extend(["--scenario", scenario])
     if no_vm_monitor or spec.index > 0:
         cmd.append("--no-vm-monitor")
     return cmd
