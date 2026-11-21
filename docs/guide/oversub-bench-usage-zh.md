@@ -153,6 +153,11 @@ oversub-bench --config config/common/replay.yaml --provider aenv --ratios 1,2,3 
 | `bench_core_bin` | `[bench-core]` | kernel 子进程命令(测试指向 stub) |
 | `auto_compare` | `true` | sweep 结束后自动对本 sweep 目录跑单 series 的 `oversub-compare`,产物在 `<output_root>/comparison/`(分位数退化 + 同轨迹跨 ratio 表);`--no-auto-compare` 关闭 |
 
+> **`sandboxsched` 暂不支持 `lifecycle` 模式。** provider 会在内核启动时否决显式的
+> `replay.mode=lifecycle`(pause/resume 尚未在真实 OpenSandbox 服务上验证通过),
+> 所以 `--provider sandboxsched` 的 lifecycle trial 会快速失败——请用
+> `--modes exec_only,exec_ephemeral` 扫描。
+
 ### 每 trial 的 config 覆盖
 
 driver 深拷贝 `base_config` 只改写超卖字段,其余透传:

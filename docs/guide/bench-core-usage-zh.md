@@ -197,7 +197,7 @@ bench-core --config <yaml> --provider {fake,e2b,docker,aenv,cubesandbox} [模式
 | `--create-only` | 只创建+就绪检查+存 ID,然后退出(沙箱保留) |
 | `--detect` | 复用已有沙箱(不新建);结束时不清理 |
 | `--warmup-only` | 创建/检测 + 预热,然后退出(沙箱保留) |
-| `--cleanup` | 列出+销毁所有现有沙箱,然后退出 |
+| `--cleanup` | 列出+销毁所有现有沙箱,然后退出(sandboxsched 按归属标签限定作用域:仅销毁本配置 `sandbox_group` 内 bench-core 创建的沙箱;其他 group 或其他工具的沙箱不动) |
 | `-o, --output-dir` | 覆盖报告输出目录 |
 | `--report-format` | `txt`(默认)/ `xlsx` / `both`(xlsx 额外产出 openpyxl 工作簿) |
 | `--vm-monitor` | `auto`(默认,按 provider `vmm_type`)/ `true` / `false` |

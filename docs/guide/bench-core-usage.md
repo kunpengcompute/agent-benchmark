@@ -225,7 +225,7 @@ bench-core --config <yaml> --provider {fake,e2b,docker,aenv,cubesandbox} [mode/p
 | `--create-only` | create + ready-check + persist IDs, then exit (keep running) |
 | `--detect` | reuse existing sandboxes (no create); no cleanup at end |
 | `--warmup-only` | create/detect + warmup, then exit (keep running) |
-| `--cleanup` | list + kill all existing sandboxes, then exit |
+| `--cleanup` | list + kill all existing sandboxes, then exit (sandboxsched scopes this to its own tagged fleet: bench-core-created sandboxes in the config's `sandbox_group`; fleets under another group or tool are left alone) |
 | `-o, --output-dir` | override report output dir |
 | `--report-format` | `txt` (default) / `xlsx` / `both` (xlsx adds an openpyxl workbook) |
 | `--vm-monitor` | `auto` (default, by provider `vmm_type`) / `true` / `false` |

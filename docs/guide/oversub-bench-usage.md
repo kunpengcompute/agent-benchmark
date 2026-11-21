@@ -164,6 +164,11 @@ keys are **rejected** (a typo like `repeat:` vs `repeats:` fails loudly).
 | `bench_core_bin` | `[bench-core]` | kernel subprocess command (tests point at a stub) |
 | `auto_compare` | `true` | post-sweep, auto-run a single-series `oversub-compare` into `<output_root>/comparison/` (per-stat degradation + same-trajectory cross-ratio table); `--no-auto-compare` disables |
 
+> **`sandboxsched` does not support the `lifecycle` mode yet.** The provider vetoes an explicit
+> `replay.mode=lifecycle` at kernel startup (pause/resume is not validated against a live
+> OpenSandbox server), so lifecycle trials with `--provider sandboxsched` fail fast — sweep it
+> with `--modes exec_only,exec_ephemeral`.
+
 ### Per-trial config overrides
 
 The driver deep-copies `base_config` and rewrites only the oversub fields; everything else passes
