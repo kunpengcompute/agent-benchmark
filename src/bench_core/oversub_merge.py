@@ -27,6 +27,8 @@ _RUN_SCOPED_KEYS = (
     "success_rate",
     "success",
     "elapsed_sec",
+    "started_epoch",
+    "completed_epoch",
     "time_breakdown_sec",
     "create_error_type",
     "kill_error_type",

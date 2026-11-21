@@ -655,6 +655,8 @@ def test_trajectory_detail_has_rows(tmp_path):
 
     assert _dt.fromisoformat(r["started_at"]).timestamp() == 1700000000.0
     assert _dt.fromisoformat(r["completed_at"]).timestamp() == 1700000010.0
+    # Offset-bearing: parseable unambiguously across host timezones.
+    assert _dt.fromisoformat(r["started_at"]).utcoffset() is not None
     # The renamed rate-pacing short keys must surface end-to-end: present in the
     # index.json time_breakdown_sec (the canonical caliber) and emitted as their
     # own trajectory-detail CSV columns; no legacy *_queue_wait names remain.

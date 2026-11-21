@@ -396,6 +396,20 @@ def test_merge_trajectory_indexes_promotes_legacy_flat_entries():
     assert entry["runs"][0]["n_steps"] == 2
 
 
+def test_merge_trajectory_indexes_keeps_run_bounds():
+    # started/completed are run-scoped: runs[] passes through per shard, never
+    # leaks onto the merged entry, and the legacy flat promotion carries them.
+    cat0 = _catalog(0, run_over={"started_epoch": 100.0, "completed_epoch": 110.0})
+    cat1 = _catalog(0, run_over={"started_epoch": 200.0, "completed_epoch": 220.0})
+    entry = merge_trajectory_indexes([(0, cat0), (4, cat1)])["trajectories"][0]
+    assert [(r["started_epoch"], r["completed_epoch"]) for r in entry["runs"]] == [(100.0, 110.0), (200.0, 220.0)]
+    assert entry.get("started_epoch") is None and entry.get("completed_epoch") is None
+
+    legacy = _catalog(1, runs_shape=False, entry_over={"started_epoch": 300.0, "completed_epoch": 330.0})
+    promoted = merge_trajectory_indexes([(0, legacy)])["trajectories"][0]["runs"][0]
+    assert promoted["started_epoch"] == 300.0 and promoted["completed_epoch"] == 330.0
+
+
 def test_write_merged_artifacts_fixed_path_and_index_patching(tmp_path):
     summary = {"throughput": {"total": 1}, "paths": {"trajectory_index": None}}
     index = {"n_trajectories": 1, "trajectories": []}

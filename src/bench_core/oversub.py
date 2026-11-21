@@ -38,7 +38,6 @@ import logging
 import statistics
 import subprocess
 import time
-from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -59,7 +58,7 @@ from bench_core.oversub_shards import (
     write_merged_artifacts,
     write_shard_configs,
 )
-from bench_core.utils import format_duration, setup_logging
+from bench_core.utils import format_duration, iso_local_timestamp, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -731,13 +730,6 @@ def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
             w.writerow(r)
 
 
-def _iso_ts(epoch) -> str | None:
-    """Epoch seconds -> ISO-8601 local time (ms), matching run_summary's stamps."""
-    if epoch is None:
-        return None
-    return datetime.fromtimestamp(float(epoch)).astimezone().isoformat(timespec="milliseconds")
-
-
 def _trajectory_rows(trials: list[dict]) -> list[dict]:
     """One row per (trajectory, sandbox, round) per trial.
 
@@ -786,8 +778,8 @@ def _trajectory_rows(trials: list[dict]) -> list[dict]:
                     "resume_attempts": src.get("resume_attempts"),
                     "success_rate": src.get("success_rate"),
                     "elapsed_sec": src.get("elapsed_sec"),
-                    "started_at": _iso_ts(src.get("started_epoch")),
-                    "completed_at": _iso_ts(src.get("completed_epoch")),
+                    "started_at": iso_local_timestamp(src.get("started_epoch")),
+                    "completed_at": iso_local_timestamp(src.get("completed_epoch")),
                     "create_error_type": src.get("create_error_type"),
                     "kill_error_type": src.get("kill_error_type"),
                     # Trajectory-level (same for every run of this trajectory);

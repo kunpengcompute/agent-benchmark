@@ -148,10 +148,13 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
       The stress window is itself attributable via ``sums`` (exec / slice /
       inter-step delay / lifecycle waits).
     - ``started_epoch``/``completed_epoch`` are the run's wall-clock bounds
-      (``time.time()`` epochs): the episode from trajectory_create start to
-      trajectory_kill completion (ephemeral modes), or the first real
-      ``resume_start`` to the last real ``pause_end`` (long-lived modes, which
-      emit no per-trajectory create/kill). ``None`` when neither is stamped.
+      (``time.time()`` epochs): started is the trajectory_create START (event
+      timestamp minus ``create_sec``) or the first real ``resume_start``;
+      completed is the trajectory_kill timestamp or the last real
+      ``pause_end``. A run that never completed -- create succeeded but no
+      kill landed (driver killed / OOM, truncated series) -- gets
+      ``completed_epoch = None``, never the create stamp: create success is
+      not the run's end, and reporting it would contradict ``elapsed_sec``.
     - ``create_sec``/``kill_sec`` sum within the run (a single create/kill per
       run in normal flow); ``create_error``/``kill_error`` carry the short error
       STRING from a ``trajectory_create(success=False)``/``trajectory_kill(success=False)``
@@ -196,7 +199,8 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
                 "max_pe": 0.0,
                 "req_delay": 0.0,
                 "last_pe": 0.0,
-                # Create/kill event bounds (ephemeral modes), kept apart from
+                # Run start (create event, minus create_sec) and end (kill
+                # event) stamps (ephemeral modes), kept apart from
                 # min_rs/max_pe so the elapsed_sec formula stays exact.
                 "start_ts": float("inf"),
                 "end_ts": 0.0,
@@ -260,13 +264,12 @@ def trajectory_summaries(events: list[dict]) -> list[dict]:
                     acc["create_error_type"] = ev.get("error_type")
                     acc["create_error"] = ev.get("error")
                 # The event stamps create COMPLETION; subtract its duration to
-                # land on the run's true start.
+                # land on the run's true start. Deliberately NOT an end bound:
+                # a run whose kill never landed did not finish at create time.
                 if ts is not None:
                     start = float(ts) - float(v or 0.0)
                     if start < st["start_ts"]:
                         st["start_ts"] = start
-                    if float(ts) > st["end_ts"]:
-                        st["end_ts"] = float(ts)
             else:  # trajectory_kill
                 v = ev.get("kill_sec")
                 if v is not None:
