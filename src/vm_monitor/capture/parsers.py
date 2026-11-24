@@ -2,7 +2,7 @@
 Log Parser Module
 
 Parses output logs from various collection tools (devkit, ksys, ub_watch,
-smap_bw, getfre) and extracts structured metrics data.
+getfre) and extracts structured metrics data.
 """
 
 import glob
@@ -652,106 +652,6 @@ def parse_ub_watch(log_path: str) -> dict:
         return {"error": str(e)}
 
 
-def parse_smap_bw(log_path: str) -> dict:
-    """Parse smap_bw.log to extract SMAP migration bandwidth metrics
-
-    Returns:
-        {
-            'cycles': [{'cycle_no': int, 'total_pages': int, 'duration': float,
-                       'bandwidth_gb_s': float, 'directions': {(from, to): pages}}],
-            'summary': {'total_cycles': int, 'total_pages': int, 'avg_bandwidth_gb_s': float,
-                        'min_bandwidth_gb_s': float, 'max_bandwidth_gb_s': float},
-            'all_directions': set of (from_node, to_node) tuples for column headers
-        }
-    """
-    result = {"cycles": [], "summary": {}, "all_directions": set()}
-
-    if not os.path.exists(log_path):
-        return {"error": "File not found"}
-
-    try:
-        with open(log_path, encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        # Parse each complete cycle report block (including direction stats)
-        # Better approach: match cycle block boundary first (from header to bandwidth line)
-        # Then extract details from within the block - avoids greedy matching issues
-        cycle_boundary_pattern = re.compile(r"周期\s+(\d+)\s+迁移带宽报告(.*?)迁移带宽:\s+([\d.]+)\s+GB/s", re.DOTALL)
-
-        for match in cycle_boundary_pattern.finditer(content):
-            cycle_no = int(match.group(1))
-            cycle_body = match.group(2)
-            bandwidth = float(match.group(3))
-
-            # Extract details from cycle_body
-            pages_match = re.search(r"累计页数:\s+(\d+)", cycle_body)
-            total_pages = int(pages_match.group(1)) if pages_match else 0
-
-            duration_match = re.search(r"持续时长:\s+([\d.]+)\s+s", cycle_body)
-            duration = float(duration_match.group(1)) if duration_match else 0
-
-            # Extract directions from cycle_body
-            directions = {}
-            dir_pattern = re.compile(r"node\s+(\d+)\s+→\s+(\d+):\s+(\d+)\s+pages")
-            for dir_match in dir_pattern.finditer(cycle_body):
-                from_node = int(dir_match.group(1))
-                to_node = int(dir_match.group(2))
-                pages = int(dir_match.group(3))
-                directions[(from_node, to_node)] = pages
-                result["all_directions"].add((from_node, to_node))
-
-            result["cycles"].append(
-                {
-                    "cycle_no": cycle_no,
-                    "total_pages": total_pages,
-                    "duration": duration,
-                    "bandwidth_gb_s": bandwidth,
-                    "directions": directions,
-                }
-            )
-
-        # Parse global summary
-        # Pattern matches the smap_tool output block: 全局汇总
-        #   周期总数 (total cycles): N
-        #   总页数 (total pages): X
-        #   平均带宽 (avg bandwidth): Y GB/s
-        #   周期带宽范围 (cycle bandwidth range): min ~ max GB/s
-        summary_pattern = re.compile(
-            r"全局汇总.*?"
-            r"周期总数:\s+(\d+).*?"
-            r"总页数:\s+(\d+).*?"
-            r"平均带宽:\s+([\d.]+)\s+GB/s.*?"
-            r"周期带宽范围:\s+([\d.]+)\s+~\s+([\d.]+)\s+GB/s",
-            re.DOTALL,
-        )
-
-        summary_match = summary_pattern.search(content)
-        if summary_match:
-            result["summary"] = {
-                "total_cycles": int(summary_match.group(1)),
-                "total_pages": int(summary_match.group(2)),
-                "avg_bandwidth_gb_s": float(summary_match.group(3)),
-                "min_bandwidth_gb_s": float(summary_match.group(4)),
-                "max_bandwidth_gb_s": float(summary_match.group(5)),
-            }
-
-        # If we got cycles but no summary, calculate summary from cycles
-        if result["cycles"] and not result["summary"]:
-            bandwidths = [c["bandwidth_gb_s"] for c in result["cycles"]]
-            result["summary"] = {
-                "total_cycles": len(result["cycles"]),
-                "total_pages": sum(c["total_pages"] for c in result["cycles"]),
-                "avg_bandwidth_gb_s": sum(bandwidths) / len(bandwidths),
-                "min_bandwidth_gb_s": min(bandwidths),
-                "max_bandwidth_gb_s": max(bandwidths),
-            }
-
-        return result
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
 def parse_all_logs(log_dir: str, numa_nodes: list = None) -> dict:
     """Parse all log files in the directory
 
@@ -765,7 +665,6 @@ def parse_all_logs(log_dir: str, numa_nodes: list = None) -> dict:
             'devkit_mem': parsed result,
             'ksys': parsed result,
             'ub_watch': parsed result,
-            'smap_bw': parsed result,
             'getfre': {numa_id: parsed result}  # getfre results per NUMA
         }
     """
@@ -790,11 +689,6 @@ def parse_all_logs(log_dir: str, numa_nodes: list = None) -> dict:
     ub_path = os.path.join(log_dir, "ub_watch.log")
     if os.path.exists(ub_path):
         results["ub_watch"] = parse_ub_watch(ub_path)
-
-    # Parse smap_bw
-    smap_path = os.path.join(log_dir, "smap_bw.log")
-    if os.path.exists(smap_path):
-        results["smap_bw"] = parse_smap_bw(smap_path)
 
     # Parse getfre logs (per NUMA) — discover all getfre_NUMA*.log present
     getfre_results = {}

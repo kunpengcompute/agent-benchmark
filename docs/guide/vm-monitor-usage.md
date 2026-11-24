@@ -1,6 +1,6 @@
 # vm_monitor Usage Guide
 
-`vm_monitor` is the host-level resource monitoring tool for agent-benchmark. It samples VM/VMM processes plus host `/proc` & `/sys` counters, and optionally drives external performance-collection tools (devkit, ksys, ub_watch, smap_bw, getfre) in parallel. Output: always-on `raw_data/` CSV snapshots, dark-themed SVG time-curves, an aggregated `resource_report.xlsx`, and the per-sample-timeline `host_resources.xlsx` derived from the raw CSVs.
+`vm_monitor` is the host-level resource monitoring tool for agent-benchmark. It samples VM/VMM processes plus host `/proc` & `/sys` counters, and optionally drives external performance-collection tools (devkit, ksys, ub_watch, getfre) in parallel. Output: always-on `raw_data/` CSV snapshots, dark-themed SVG time-curves, an aggregated `resource_report.xlsx`, and the per-sample-timeline `host_resources.xlsx` derived from the raw CSVs.
 
 - Entry point: `vm-monitor` (`vm_monitor.cli:main`), registered by `pip install -e .`
 - Direct module form: `python3 -m vm_monitor.cli`
@@ -54,7 +54,7 @@ sudo vm-monitor -t 60 -i 2 --vmm qemu
 
 ### Mode 3 — Timer + parallel log collection (`--enable-capture`)
 
-Runs devkit/ksys/ub_watch/smap_bw/getfre as parallel subprocesses alongside the monitor:
+Runs devkit/ksys/ub_watch/getfre as parallel subprocesses alongside the monitor:
 
 ```bash
 sudo vm-monitor -t 300 -i 2 --vmm firecracker --enable-capture --auto-skip \
@@ -77,7 +77,7 @@ sudo vm-monitor -t 300 -i 2 --vmm firecracker --enable-capture --auto-skip \
 | `--numa` | `all` | NUMA nodes to focus: `all` or comma-separated `0,1` |
 | `--remote-numa` | `5` | Designated cross-socket "remote borrowing" node for free-mem watching; negative disables |
 | `--disks` | `all` | Block devices for I/O: `all` (auto-discover physical) or `sda,nvme0n1` |
-| `--enable-capture` | off | Run devkit/ksys/ub_watch/smap_bw/getfre in parallel |
+| `--enable-capture` | off | Run devkit/ksys/ub_watch/getfre in parallel |
 | `--auto-skip` | off | Silently disable missing capture tools (non-interactive) |
 | `--ksys-parse-timeout` | `600` | ksys parse-phase timeout (seconds) |
 | `--no-svg` | off | Skip SVG time-curve reports |
@@ -114,9 +114,6 @@ KSYS_CONFIG_PATH=/path/to/ksys_config.yaml
 # ub_watch
 UB_WATCH_PATH=/path/to/ub_watch
 
-# smap_bw (run via sudo for dmesg access)
-SMAP_BW_PATH=/path/to/smap_bw.py
-
 # getfre + its YAML config
 GETFRE_PATH=/path/to/getfre
 GETFRE_CONFIG_PATH=/path/to/getfre_config.yaml
@@ -133,7 +130,6 @@ DEVKIT_CPU_RANGE=96-191
 | `DEVKIT_CPU_RANGE` | `devkit_top_down` | top-down CPU scope | optional; auto from `--numa` |
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
-| `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | optional; sudo |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
@@ -164,7 +160,6 @@ numa_nodes: [0, 1]              # omit to auto-discover
 | **devkit_mem** | `$DEVKIT_PATH tuner memory -d <t> -i 3` | `devkit_mem.log` | DevKit_Memory, NUMA_Bandwidth |
 | **ksys** | `$KSYS_PATH collect -d <t> -i 3 -c $KSYS_CONFIG_PATH` | `ksys.log` | KSys (11 metrics) |
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
-| **smap_bw** | `sudo python3 $SMAP_BW_PATH --clear --duration <t> --timeout <t+10>` | `smap_bw.log` | SMAPBW_Summary, SMAPBW_Cycles |
 | **getfre** | threaded per-NUMA: `$GETFRE_PATH <total_cores> <core_id>` per core | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N} |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`, or auto-computed from `--numa` via `/sys/devices/system/node/node{N}/cpulist`. If neither resolves, devkit_top_down is skipped (never launched with a wrong range).
@@ -238,14 +233,13 @@ logs_<timestamp>/
 ├── devkit_mem.log
 ├── ksys.log
 ├── ub_watch.log
-├── smap_bw.log
 └── getfre_NUMA{N}.log
 ```
 
 `resource_report.xlsx` sheets (summary only): `Summary`, `NUMA_Overview`, `VM_Stats`, plus the
 profiler sheets written when their tool log exists — `DevKit_TopDown`, `DevKit_Memory`,
-`NUMA_Bandwidth`, `KSys`, `UBWatch_Latency`, `UBWatch_Bandwidth`, `SMAPBW_Summary`,
-`SMAPBW_Cycles`, `Getfre_Summary`, `Getfre_NUMA{N}`.
+`NUMA_Bandwidth`, `KSys`, `UBWatch_Latency`, `UBWatch_Bandwidth`,
+`Getfre_Summary`, `Getfre_NUMA{N}`.
 
 `host_resources.xlsx` sheets (per-sample timelines, derived from `raw_data/`): `Host resources`,
 `NUMA`, `Per-VM`, `Disk IO`, and `HostProc` (only with `--host-proc`). Column-level definitions:

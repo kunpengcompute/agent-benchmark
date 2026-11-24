@@ -529,56 +529,6 @@ def _build_ubwatch_sheets(writer, parsed_logs):
         pd.DataFrame(bw_data).to_excel(writer, sheet_name="UBWatch_Bandwidth", index=False)
 
 
-def _build_smapbw_sheets(writer, parsed_logs):
-    """Sheets 12-13: SMAP migration bandwidth summary + per-cycle detail."""
-    if "smap_bw" not in parsed_logs or "error" in parsed_logs["smap_bw"]:
-        return
-    smap = parsed_logs["smap_bw"]
-
-    # Summary sheet
-    summary = smap.get("summary", {})
-    if summary:
-        smap_summary = {
-            "Metric": [
-                "Total Cycles",
-                "Total Pages",
-                "Avg Bandwidth (GB/s)",
-                "Min Bandwidth (GB/s)",
-                "Max Bandwidth (GB/s)",
-            ],
-            "Value": [
-                summary.get("total_cycles", 0),
-                summary.get("total_pages", 0),
-                summary.get("avg_bandwidth_gb_s", 0),
-                summary.get("min_bandwidth_gb_s", 0),
-                summary.get("max_bandwidth_gb_s", 0),
-            ],
-        }
-        pd.DataFrame(smap_summary).to_excel(writer, sheet_name="SMAPBW_Summary", index=False)
-
-    # Per-cycle sheet with direction columns spread out
-    cycles = smap.get("cycles", [])
-    all_directions = smap.get("all_directions", set())
-    if cycles and all_directions:
-        # Sort directions for consistent column order
-        sorted_directions = sorted(all_directions)
-
-        # Build column data
-        cycle_data = {
-            "Cycle": [c["cycle_no"] for c in cycles],
-            "Pages": [c["total_pages"] for c in cycles],
-            "Duration (s)": [c["duration"] for c in cycles],
-            "Bandwidth (GB/s)": [c["bandwidth_gb_s"] for c in cycles],
-        }
-
-        # Add direction columns (e.g., "N0->N1_pages")
-        for from_node, to_node in sorted_directions:
-            col_name = f"N{from_node}->N{to_node}_pages"
-            cycle_data[col_name] = [c["directions"].get((from_node, to_node), 0) for c in cycles]
-
-        pd.DataFrame(cycle_data).to_excel(writer, sheet_name="SMAPBW_Cycles", index=False)
-
-
 def _build_getfre_sheets(writer, parsed_logs):
     """Sheets 14+: getfre core frequency summary + one per-NUMA per-core sheet."""
     if "getfre" not in parsed_logs:
@@ -851,7 +801,6 @@ def export_to_excel(
             _build_devkit_memory_sheets(writer, parsed_logs)
             _build_ksys_sheet(writer, parsed_logs)
             _build_ubwatch_sheets(writer, parsed_logs)
-            _build_smapbw_sheets(writer, parsed_logs)
             _build_getfre_sheets(writer, parsed_logs)
     except ImportError:
         print("[WARN] openpyxl not available, skipping Excel export")

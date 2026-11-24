@@ -4,7 +4,7 @@
 devkit (top-down + memory in parallel) -> ksys -> perf stat -> uprof rotation,
 one slot per ``rotation_interval``; each turn writes a timestamped log under
 ``<rotation_log_dir>/{devkit/{topdown,memory},ksys,perf,uprof}/``. ub_watch /
-smap_bw / getfre keep their all-parallel behavior.
+getfre keep their all-parallel behavior.
 """
 
 import io

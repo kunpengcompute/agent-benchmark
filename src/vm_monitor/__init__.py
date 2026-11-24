@@ -41,7 +41,6 @@ from .capture.parsers import (
     parse_devkit_top_down,
     parse_getfre,
     parse_ksys,
-    parse_smap_bw,
     parse_ub_watch,
 )
 
@@ -69,7 +68,6 @@ __all__ = [
     "parse_devkit_mem",
     "parse_getfre",
     "parse_ub_watch",
-    "parse_smap_bw",
     "parse_all_logs",
     # Exporters
     "export_to_excel",

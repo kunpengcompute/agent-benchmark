@@ -252,7 +252,7 @@ monitor:
   # one slot at a time for the whole stress window instead of all capture tools
   # running concurrently; each turn writes a timestamped log under
   # <output_dir>/log_capture/{devkit/{topdown,memory},ksys,perf}/. ub_watch /
-  # smap_bw / getfre keep their all-parallel behavior. Requires capture
+  # getfre keep their all-parallel behavior. Requires capture
   # (auto/true); keys off the stress-file lock lifecycle (appear = start,
   # disappear = stop after the in-flight slot), so a huge test_duration cannot
   # push rotation past real stress. perf_events takes a list or a comma string;

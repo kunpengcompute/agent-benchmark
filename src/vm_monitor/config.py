@@ -33,7 +33,6 @@ ENV_REQUIRED_KEYS = [
     "KSYS_PATH",
     "KSYS_CONFIG_PATH",
     "UB_WATCH_PATH",
-    "SMAP_BW_PATH",
     "GETFRE_PATH",
     "GETFRE_CONFIG_PATH",
 ]
@@ -140,7 +139,7 @@ def load_env_config() -> dict:
 
     Returns:
         dict with keys: devkit_path, ksys_path, ksys_config_path,
-        ub_watch_path, smap_bw_path, uprof_path, devkit_cpu_range,
+        ub_watch_path, uprof_path, devkit_cpu_range,
         getfre_path, getfre_config_path
     """
     config = {
@@ -148,7 +147,6 @@ def load_env_config() -> dict:
         "ksys_path": "",
         "ksys_config_path": "",
         "ub_watch_path": "",
-        "smap_bw_path": "",
         "uprof_path": "",
         "devkit_cpu_range": "",
         "getfre_path": "",
@@ -163,7 +161,6 @@ def load_env_config() -> dict:
     config["ksys_path"] = os.environ.get("KSYS_PATH", "")
     config["ksys_config_path"] = os.environ.get("KSYS_CONFIG_PATH", "")
     config["ub_watch_path"] = os.environ.get("UB_WATCH_PATH", "")
-    config["smap_bw_path"] = os.environ.get("SMAP_BW_PATH", "")
     config["uprof_path"] = os.environ.get("UPROF_PATH", "")
     config["devkit_cpu_range"] = os.environ.get("DEVKIT_CPU_RANGE", "")
     config["getfre_path"] = os.environ.get("GETFRE_PATH", "")
@@ -192,8 +189,6 @@ def save_env_config(config: dict):
             set_key(env_path, "KSYS_CONFIG_PATH", config["ksys_config_path"])
         if config.get("ub_watch_path"):
             set_key(env_path, "UB_WATCH_PATH", config["ub_watch_path"])
-        if config.get("smap_bw_path"):
-            set_key(env_path, "SMAP_BW_PATH", config["smap_bw_path"])
         if config.get("uprof_path"):
             set_key(env_path, "UPROF_PATH", config["uprof_path"])
         if config.get("devkit_cpu_range"):
@@ -227,7 +222,6 @@ def validate_and_prompt_missing(config: dict, non_interactive: bool = False) -> 
         "KSYS_PATH": "ksys_path",
         "KSYS_CONFIG_PATH": "ksys_config_path",
         "UB_WATCH_PATH": "ub_watch_path",
-        "SMAP_BW_PATH": "smap_bw_path",
         "GETFRE_PATH": "getfre_path",
         "GETFRE_CONFIG_PATH": "getfre_config_path",
     }
@@ -237,7 +231,6 @@ def validate_and_prompt_missing(config: dict, non_interactive: bool = False) -> 
         "KSYS_PATH": "ksys executable path",
         "KSYS_CONFIG_PATH": "ksys config.yaml path",
         "UB_WATCH_PATH": "ub_watch executable path",
-        "SMAP_BW_PATH": "smap_bw.py script path",
         "GETFRE_PATH": "getfre executable path",
         "GETFRE_CONFIG_PATH": "getfre_config.yaml path",
     }
