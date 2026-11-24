@@ -224,7 +224,7 @@ monitor:
   # rotate one slot at a time in canonical order
   #   devkit (top-down + memory in parallel) -> ksys -> perf stat -> uprof
   # each slot holding its interval for the whole stress window. ub_watch /
-  # smap_bw / getfre keep their all-parallel behavior. Every turn writes a
+  # getfre keep their all-parallel behavior. Every turn writes a
   # timestamped log under <output_dir>/log_capture/{devkit/{topdown,memory},ksys,
   # perf,uprof}/; the uprof turn passes -O pointing at uprof/: the tool
   # auto-generates timestamped folders per turn (AMDuProfPcm-Timeseries_*/
