@@ -121,6 +121,18 @@ def setup_logging(
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def iso_local_timestamp(epoch: float | None) -> str | None:
+    """Epoch seconds -> offset-bearing local ISO-8601 (ms); ``None`` passes through.
+
+    The ONE formatter for every ``*_at`` artifact stamp (``run_summary.json``,
+    ``trajectory-detail.csv``) so the two cannot drift. The string is for
+    humans; the raw ``*_epoch`` field is the machine join key with vm_monitor.
+    """
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(float(epoch)).astimezone().isoformat(timespec="milliseconds")
+
+
 def format_timestamp(ts: float) -> str:
     """Format a timestamp to HH:MM:SS."""
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
