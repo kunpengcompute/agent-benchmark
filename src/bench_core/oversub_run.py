@@ -407,9 +407,11 @@ def _run_trial(
             try:
                 s = parse_run_summary(prior)
                 scenario = _scenario_of(base_yaml, args)
-                if scenario is not None and s.get("scenario") != scenario:
+                if s.get("scenario") != scenario:
                     # Same trial dir, different dataset: a prior run must never
                     # be reused across scenarios (the result would mix datasets).
+                    # scenario=None means this run pins an explicit trajectory
+                    # pool, so it still has to differ from a prior scenario run.
                     logger.info(
                         "[%s/%s] %s ratio=%d repeat=%d: prior run used scenario %r, this run %r -- re-running",
                         index,

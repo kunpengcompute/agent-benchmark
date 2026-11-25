@@ -516,3 +516,41 @@ def test_e2e_reuse_skips_completed_sharded_trial(tmp_path):
     with open(out_root / "trial-summary.csv", newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert rows[-1]["reused"] == "True" and rows[-1]["valid"] == "True"
+
+
+def test_e2e_reuse_refuses_a_prior_run_from_another_dataset(tmp_path):
+    """Switching from the default scenario to an explicit trajectory pool is a
+    dataset change too: scenario=None must not serve the prior swe-bench run."""
+    stub = tmp_path / "stub.py"
+    stub.write_text(_SHARD_STUB, encoding="utf-8")
+    base = _base_yaml(tmp_path)
+    out_root = tmp_path / "sweep"
+    trial_args = ["--ratios", "2", "--modes", "exec_ephemeral", "--shards", "auto", "--test-duration", "60"]
+    assert main(_common_argv(tmp_path, base, out_root, stub) + trial_args) == 0
+    trial_dir = out_root / "exec_ephemeral" / "ratio-02" / "repeat-00"
+    merged = json.loads((trial_dir / "merged" / "rb_run_summary.json").read_text(encoding="utf-8"))
+    assert merged["scenario"] == "swe-bench"
+
+    marker = trial_dir / "shard-00" / "argv.json"
+    marker.write_text("SENTINEL", encoding="utf-8")
+    explicit = tmp_path / "explicit.yaml"
+    explicit.write_text(
+        yaml.safe_dump(
+            {
+                "workflow_type": "replay",
+                "sandbox": {"total_count": 4},
+                "replay": {
+                    "running_concurrency": 4,
+                    "mode": "exec_ephemeral",
+                    "trajectory_dir": "artifacts/explicit",
+                },
+                "test": {"duration": 60, "round_size": 4, "round_count": 1, "benchmark_mode": "fixed"},
+                "report": {"output_dir": "results/replay", "filename_prefix": "rb", "format": "both"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    assert main(_common_argv(tmp_path, explicit, out_root, stub) + trial_args + ["--reuse"]) == 0
+    # Different pool -> the prior summary is not reusable; the stub re-ran.
+    assert marker.read_text(encoding="utf-8") != "SENTINEL"
