@@ -15,21 +15,28 @@ Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / Ag
 
 - `artifacts/traces/replays/`：55 条轨迹（`.json` / `.traj`）。
 - `artifacts/traces/image-map.json`：每条轨迹对应的 template 名。
-- `artifacts/images/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
+- `artifacts/images/swe-bench/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
 
 **模板**就是把这些镜像灌进 AgentENV 后得到的一份快照。在 AgentENV 主机上装 Docker 和
 `aenv` CLI（先 `aenv auth` 配好服务地址与密钥），并保证目标 Registry 已启动、允许推送且
 AgentENV 能访问，然后：
 
 ```bash
-bash artifacts/images/download-images.sh              # 按本机架构下载对应的 55 个镜像
-python artifacts/images/build_template.py --dry-run   # 预览将执行的命令
-python artifacts/images/build_template.py             # 构建全部 55 个模板
+bash artifacts/images/swe-bench/download-images.sh              # 按本机架构下载对应的 55 个镜像
+python artifacts/images/swe-bench/build_template.py --dry-run   # 预览将执行的命令
+python artifacts/images/swe-bench/build_template.py             # 构建全部 55 个模板
 ```
 
 `build_template.py` 读本地当前架构的镜像，并校验与 `image-map.json` 一致。常用参数：
 `--template` 只建指定模板（可重复）、`--registry` 改推送前缀（默认
 `127.0.0.1:5000/swerebench`）、`--timeout` 单模板等待秒数（默认 1800）、`--list` 只列清单。
+
+OSWorld 镜像和模板：
+
+```bash
+bash artifacts/images/osworld/download-images.sh
+python3 artifacts/images/osworld/build-template.py --name osworld-amd64-latest
+```
 
 > 只有 AENV 路径需要模板；`fake` 与 `docker` 后端不需要，可以直接跳到下面的快速开始。
 

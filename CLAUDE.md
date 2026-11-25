@@ -265,7 +265,8 @@ config/oversub/              oversub sweep profiles + compare manifest
 config/tools/                getfre_config.yaml (getfre collector template)
 artifacts/traces/replays/    55 bundled trajectories (.replay.json)
 artifacts/traces/image-map.json   trajectory -> template manifest (default template_manifest)
-artifacts/images/            image manifest + download-images.sh + build_template.py
+artifacts/images/swe-bench/  image manifest + download-images.sh + build_template.py
+artifacts/images/osworld/    OSWorld download-images.sh + build-template.py
 docs/guide/                  bench-core, oversub-bench and vm-monitor usage guides (EN + zh)
 docs/dev/                    metrics-reference.md (kernel + vm_monitor metrics & formulas)
 agent_replay/                early replay impl, kept for reference (to be deprecated)
