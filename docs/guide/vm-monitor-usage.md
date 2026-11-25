@@ -114,6 +114,11 @@ KSYS_CONFIG_PATH=/path/to/ksys_config.yaml
 # ub_watch
 UB_WATCH_PATH=/path/to/ub_watch
 
+# AMD uProf binary (log-rotation slot; unset/invalid path warns and skips the slot.
+# Metrics: --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics, default memory,pipeline_util;
+# -O points at the per-turn uprof/<stamp>/ dir that also holds the stdout log (the tool auto-generates AMDuProfPcm-Timeseries_* subdirs inside it) -- raw artifacts, not parsed into sheets; per-turn dirs accumulate for the run (remove between runs if disk-constrained))
+UPROF_PATH=/path/to/AMDuProfPcm
+
 # getfre + its YAML config
 GETFRE_PATH=/path/to/getfre
 GETFRE_CONFIG_PATH=/path/to/getfre_config.yaml
@@ -130,11 +135,13 @@ DEVKIT_CPU_RANGE=96-191
 | `DEVKIT_CPU_RANGE` | `devkit_top_down` | top-down CPU scope | optional; auto from `--numa` |
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **both required** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | optional |
+| `UPROF_PATH` | `uprof` (rotation mode) | `log_capture/uprof/<stamp>/` (log + tool output) | optional; `--log-rotation` only; unset/invalid warns + skips the slot (never prompts) |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | optional; config auto-fills from host topology |
 
 Missing-path behavior:
 - **`--auto-skip` / bench-core auto vm-monitor**: the tool is silently disabled, a `[WARN]` is printed, and the run continues. The missing tool's sheet is simply absent from `resource_report.xlsx` — never a hard failure.
 - **Interactive (no `--auto-skip`)**: vm_monitor prompts for each missing path, `skip` disables, valid paths are written back to `.env` via `python-dotenv`.
+- **`UPROF_PATH` is the exception**: never prompted in either mode — an unset/invalid path degrades to a `[WARN]` and the uprof rotation slot is skipped (the run continues).
 
 ### getfre config (`getfre_config.yaml`)
 
@@ -161,6 +168,7 @@ numa_nodes: [0, 1]              # omit to auto-discover
 | **ksys** | `$KSYS_PATH collect -d <t> -i 3 -c $KSYS_CONFIG_PATH` | `ksys.log` | KSys (11 metrics) |
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
 | **getfre** | threaded per-NUMA: `$GETFRE_PATH <total_cores> <core_id>` per core | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N} |
+| **uprof** (rotation only) | `$UPROF_PATH -m <metrics> -a -A system,package -O <per-turn uprof/<stamp> dir> -d <interval>` | `log_capture/uprof/<stamp>/` (log + tool output) | — (raw timeseries CSVs) |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`, or auto-computed from `--numa` via `/sys/devices/system/node/node{N}/cpulist`. If neither resolves, devkit_top_down is skipped (never launched with a wrong range).
 

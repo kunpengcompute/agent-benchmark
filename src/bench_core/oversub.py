@@ -58,7 +58,7 @@ from bench_core.oversub_shards import (
     write_merged_artifacts,
     write_shard_configs,
 )
-from bench_core.utils import format_duration, setup_logging
+from bench_core.utils import format_duration, iso_local_timestamp, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -507,6 +507,10 @@ TRAJECTORY_COLUMNS = [
     "resume_attempts",
     "success_rate",
     "elapsed_sec",
+    # Wall-clock bounds of this run (ISO local, ms). Index.json keeps the raw
+    # epochs (started_epoch / completed_epoch) for machine joins.
+    "started_at",
+    "completed_at",
     *_TRAJECTORY_BREAKDOWN_COLUMNS,
     "create_error_type",
     "kill_error_type",
@@ -736,6 +740,9 @@ def _trajectory_rows(trials: list[dict]) -> list[dict]:
     ``time_breakdown_sec`` (that run's own sums) is surfaced as flat columns so
     a reader can attribute each run's ``elapsed_sec``; a ``groupby
     trajectory_id`` over the per-run rows yields the per-trajectory median.
+    ``started_at``/``completed_at`` carry each run's wall-clock bounds (from
+    the kernel's per-run ``started_epoch``/``completed_epoch``) so a reader can
+    see when a run actually occupied its slot.
 
     Backward compat: an older index.json without ``runs[]`` yields one row per
     trajectory from the top-level fields (a 1:1 pool>=N run), not a crash.
@@ -771,6 +778,8 @@ def _trajectory_rows(trials: list[dict]) -> list[dict]:
                     "resume_attempts": src.get("resume_attempts"),
                     "success_rate": src.get("success_rate"),
                     "elapsed_sec": src.get("elapsed_sec"),
+                    "started_at": iso_local_timestamp(src.get("started_epoch")),
+                    "completed_at": iso_local_timestamp(src.get("completed_epoch")),
                     "create_error_type": src.get("create_error_type"),
                     "kill_error_type": src.get("kill_error_type"),
                     # Trajectory-level (same for every run of this trajectory);
