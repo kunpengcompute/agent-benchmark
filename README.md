@@ -5,21 +5,35 @@ Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / Ag
 | 目录 | 内容 | 从哪看 |
 | --- | --- | --- |
 | `src/` | `bench-core` 内核（3 个受支持后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
-| `artifacts/` | 55 条轨迹、镜像清单、轨迹 → 模板映射 | [数据集与模板](#数据集与模板) |
+| `artifacts/` | 55 条代码任务 + 18 条 OSWorld 桌面任务、镜像清单、轨迹 → 模板映射 | [数据集与模板](#数据集与模板) |
 | `agent_replay/` | 早期回放实现，保留仅供参考，后续会 deprecate | — |
 | `docs/guide/` | 中英文使用指南 | [文档](#文档) |
 
 ## 数据集与模板
 
-仓库自带一套可直接用的负载：55 条 Agent 轨迹，以及它们对应的镜像与模板映射。
+仓库自带两组负载：SWE-bench 的 55 条代码任务轨迹，以及 OSWorld 的 18 条桌面任务轨迹，
+并提供对应的镜像下载脚本与模板映射。
 
-- `artifacts/traces/replays/`：55 条轨迹（`.json` / `.traj`）。
-- `artifacts/traces/image-map.json`：每条轨迹对应的 template 名。
+**SWE-bench 数据集**
+
+- `artifacts/traces/replays/`：55 条代码任务轨迹（`*.replay.json`）。
+- `artifacts/traces/image-map.json`：代码任务轨迹到模板名的映射。
 - `artifacts/images/swe-bench/manifest.csv`：55 组 ARM64 / x86_64 镜像地址。
+
+**OSWorld 数据集**
+
+- `artifacts/traces/osworld/replays-arm/`：ARM64 版的 18 条 OSWorld 轨迹（`*.replay.json`）。
+- `artifacts/traces/osworld/replays-x86/`：x86_64 版的同一组 18 条 OSWorld 轨迹（`*.replay.json`）。
+- `artifacts/traces/osworld/image-map.json`：两种架构共用的映射，18 条轨迹统一使用 `osworld` 模板。
+
+OSWorld 的 x86 与 ARM 版任务相同、每套均为 342 条命令，仅 6 条轨迹中的 23 处鼠标操作坐标不同，
+用于适配两套基础镜像因字体集合和桌面配置不同而产生的界面布局差异。
 
 **模板**就是把这些镜像灌进 AgentENV 后得到的一份快照。在 AgentENV 主机上装 Docker 和
 `aenv` CLI（先 `aenv auth` 配好服务地址与密钥），并保证目标 Registry 已启动、允许推送且
 AgentENV 能访问，然后：
+
+**SWE-bench（55 条代码任务）**
 
 ```bash
 bash artifacts/images/swe-bench/download-images.sh              # 按本机架构下载对应的 55 个镜像
@@ -31,11 +45,13 @@ python artifacts/images/swe-bench/build_template.py             # 构建全部 5
 `--template` 只建指定模板（可重复）、`--registry` 改推送前缀（默认
 `127.0.0.1:5000/swerebench`）、`--timeout` 单模板等待秒数（默认 1800）、`--list` 只列清单。
 
-OSWorld 镜像和模板：
+**OSWorld（18 条桌面任务）**
+
+下载与构建脚本均自动识别本机架构，选择对应的 ARM64 或 AMD64 镜像；默认模板名统一为 `osworld`：
 
 ```bash
 bash artifacts/images/osworld/download-images.sh
-python3 artifacts/images/osworld/build-template.py --name osworld-amd64-latest
+python3 artifacts/images/osworld/build-template.py
 ```
 
 > 只有 AENV 路径需要模板；`fake` 与 `docker` 后端不需要，可以直接跳到下面的快速开始。

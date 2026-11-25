@@ -91,7 +91,7 @@ def main():
                         help="Target AENV architecture; defaults to this host (amd64 is an alias for x86)")
     parser.add_argument("--registry", default="127.0.0.1:5000",
                         help="Writable registry/repository prefix reachable by AENV")
-    parser.add_argument("--name", help="Template name (default: osworld-<arm64|amd64>-offline-desktop)")
+    parser.add_argument("--name", help="Template name (default: osworld)")
     parser.add_argument("--cpu", type=positive_int, default=2,
                         help="Template CPU count (default: 2)")
     parser.add_argument("--memory", type=positive_int, default=4096,
@@ -109,7 +109,7 @@ def main():
         if arch == "amd64":
             arch = "x86"
         image_arch = "amd64" if arch == "x86" else "arm64"
-        name = args.name or f"osworld-{image_arch}-offline-desktop"
+        name = args.name or "osworld"
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("--name must contain only letters, digits, underscores and hyphens")
         registry = args.registry.rstrip("/")
