@@ -145,6 +145,7 @@ DEFAULT_TRIAL_TIMEOUT_SEC = 21600
 # CLI flag > sweep-config > these.
 _TRUE_DEFAULTS: dict[str, object] = {
     "provider": "aenv",
+    "scenario": None,
     "running_concurrency": None,
     "ratios": "1,2,3",
     "modes": "exec_ephemeral,lifecycle",
@@ -193,6 +194,7 @@ def build_trial_config(
     trial_dir: str,
     prefix: str,
     multiplier: int | None = None,
+    scenario: str | None = None,
 ) -> dict:
     """Deep-copy the base YAML and merge the per-trial oversub overrides.
 
@@ -202,7 +204,9 @@ def build_trial_config(
     (the ratio basis for the payload issue-set clamp + trial reporting);
     ``replay.trajectory_limit = N`` (fixes the issue set to the
     first N trajectories PER TEMPLATE across all ratios so only concurrency
-    varies); ``replay.mode``; ``test.round_size = ratio*N`` (so all k*N
+    varies); ``replay.mode``; ``replay.scenario`` (the driver's dataset
+    selection, so shard subprocesses inherit it from their config);
+    ``test.round_size = ratio*N`` (so all k*N
     sandboxes run concurrently in one group -- without this, k>=2 silently
     runs multiple sequential groups of N, corrupting the oversubscription
     dynamics); ``test.duration`` (the time ceiling); ``report.output_dir``;
@@ -237,6 +241,12 @@ def build_trial_config(
     # template covered in a multi-template manifest.
     cfg["replay"]["trajectory_limit"] = n
     cfg["replay"]["mode"] = mode
+    # The dataset is part of the trial's inputs, so it belongs in trial.yaml
+    # (and the shard configs derived from it) rather than in a per-subprocess
+    # CLI flag: the kernel then resolves the pool from the config alone, and the
+    # scenario is recorded in every artifact the trial writes.
+    if scenario is not None:
+        cfg["replay"]["scenario"] = scenario
     cfg.setdefault("test", {})
     cfg["test"]["round_size"] = target
     cfg["test"]["duration"] = test_duration
@@ -816,4 +826,3 @@ def __getattr__(name: str):
 
         return getattr(oversub_run, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

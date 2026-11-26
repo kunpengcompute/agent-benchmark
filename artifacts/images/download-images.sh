@@ -1,6 +1,6 @@
 #!/bin/bash
 # 根据本机架构，只拉取 55 条轨迹对应的 ARM64 或 x86_64 镜像。
-# 清单与 artifacts/traces/replays/、artifacts/traces/image-map.json 对应。
+# 清单与 artifacts/traces/swe-bench/replays/、artifacts/traces/swe-bench/image-map.json 对应。
 set -euo pipefail
 
 machine_arch="$(uname -m)"

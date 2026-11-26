@@ -22,9 +22,17 @@ Scenarios / providers (all behind the SDK-free `env_provider` contract):
 
 The replay workflow (`exec_only` / `lifecycle` / `exec_ephemeral`) replays recorded
 agent trajectories against a backend. The bundled 55-trajectory pool
-(`artifacts/traces/replays`) + `artifacts/traces/image-map.json` manifest are the
-default `replay.trajectory_dir` / `replay.template_manifest`, so a replay config
-runs out of the box.
+(`artifacts/traces/swe-bench/replays`) + `artifacts/traces/swe-bench/image-map.json`
+manifest are resolved by `replay.scenario` (default `swe-bench`; the `--scenario`
+CLI flag wins) into the replay pointer keys, so a replay config runs out of the
+box. Datasets are organized per scenario under `artifacts/traces/<scenario>/`
+(`replays/` + `image-map.json` + `dataset.yaml`); the root is anchored at the repo
+root (not the CWD), the resolved pointers are absolute, and the applied scenario
+is written back to `replay.scenario` so trial.yaml, `run_summary.json` and the
+sweep report record the data axis (`--reuse` refuses to cross scenarios). The
+legacy DIY escape hatch is unchanged: a YAML-explicit `replay.trajectory_dir`
+(optionally also `replay.template_manifest`) bypasses the scenario machinery
+entirely.
 
 Host-level resource collection is provided by the bundled **`vm_monitor`**
 package (`src/vm_monitor/`, registered as the `vm-monitor` CLI by
@@ -263,8 +271,9 @@ src/vm_monitor/              host-level resource collector (vm-monitor CLI: base
 config/common/               backend-agnostic workflow configs (one file per workflow)
 config/oversub/              oversub sweep profiles + compare manifest
 config/tools/                getfre_config.yaml (getfre collector template)
-artifacts/traces/replays/    55 bundled trajectories (.replay.json)
-artifacts/traces/image-map.json   trajectory -> template manifest (default template_manifest)
+artifacts/traces/swe-bench/replays/   55 bundled trajectories (.replay.json)
+artifacts/traces/swe-bench/image-map.json  trajectory -> template manifest (--scenario default)
+artifacts/traces/swe-bench/dataset.yaml    dataset metadata (glob:) for the swe-bench scenario
 artifacts/images/            image manifest + download-images.sh + build_template.py
 docs/guide/                  bench-core, oversub-bench and vm-monitor usage guides (EN + zh)
 docs/dev/                    metrics-reference.md (kernel + vm_monitor metrics & formulas)

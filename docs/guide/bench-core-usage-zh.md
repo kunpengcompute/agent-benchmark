@@ -47,7 +47,8 @@ bench-core --provider docker --config config/common/docker-browser.yaml --create
   [go-client/README.md](../../go-client/README.md) 构建 worker;
   构建后 `--provider aenv-go` 直接用同一份配置(`aenv_go:` 块缺键全部回落 `aenv:`)。
 - **replay** —— 轨迹池与模板清单已预置为仓库自带的 55 条
-  (`artifacts/traces/replays` + `artifacts/traces/image-map.json`,§8.3),开箱即可回放。
+  (`artifacts/traces/swe-bench/{replays,image-map.json}`,由 `replay.scenario` 默认
+  `swe-bench` 解析,§8.3),开箱即可回放。
 - **docker** —— `docker.image` 必须是本地已存在的镜像(仓库里的名字是占位,见 §7)。
 
 `-n` 这个上限是有意义的:仓库里的 replay 配置默认声明 384 个沙箱,不加 `-n` 的话一次"短跑"
@@ -414,10 +415,12 @@ bench-core --provider aenv --config config/common/replay.yaml -n 768
 
 ### 8.3 轨迹格式与 template_manifest
 
-- **轨迹池。** 仓库里的 replay 配置已默认指向自带数据:`replay.trajectory_dir` =
-  `artifacts/traces/replays`(55 条)、`replay.template_manifest` = `artifacts/traces/image-map.json`
-  (逐轨迹模板名)。换成自己的数据时改这两个键(池子为空 = 回放 0 步);oversub driver 从 sweep
-  配置的 `base_config` 继承这两个路径。
+- **轨迹池。** 仓库里的 replay 配置已默认指向自带数据:`replay.scenario`(默认 `swe-bench`)
+  把 `replay.trajectory_dir` 解析到 `artifacts/traces/swe-bench/replays`(55 条)、
+  `replay.template_manifest` 解析到 `artifacts/traces/swe-bench/image-map.json`(逐轨迹
+  模板名)。换成自己的数据时改 `replay.scenario` 指向 `artifacts/traces/<name>/`,或显式写
+  这两个键(池子为空 = 回放 0 步);oversub driver 从 sweep 配置的 `base_config` / `scenario`
+  继承这份解析。
 - bench-core 的 loader 期望每个轨迹 JSON 为
   `{instance_id, environment, trajectory:[{action, delay_time}, ...]}`,在首个
   `submit/finish/done` 处截断(见 `src/bench_core/payload/replay_payload.py`)。若你的轨迹是别的

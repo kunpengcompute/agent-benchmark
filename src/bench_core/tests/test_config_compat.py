@@ -151,7 +151,9 @@ EXPECTED = {
             report_format="both",
         ),
         view=dict(
-            replay_trajectory_dir="artifacts/traces/replays",
+            # trajectory pointers dropped from the YAML; from_raw is
+            # dataset-agnostic (bench_cli --scenario resolution fills them).
+            replay_trajectory_dir="trajectories",
             replay_trajectory_glob="*.replay.json",
             replay_workdir="/",
             replay_action_timeout=300,
