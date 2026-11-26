@@ -8,30 +8,60 @@ HTTP 客户端开销。Python 侧保留全部回放策略（轨迹解释、delay
 
 ## 构建和运行
 
-需要 Go 1.22+，Python 依赖安装步骤不变。Go 部分只有标准库依赖。在仓库根目录执行：
+`pip install -e .`（以及 `pip install .`）会通过 `setup.py` 的 `build_py` 钩子
+**自动构建 Go worker**，产物落在 `go-client/bin/agent-benchmark-go`——这就是
+aenv-go 作为 oversub 默认 provider 的开箱即用路径，无需手动步骤。
+
+工具链按以下顺序解析（前者优先）：
+
+1. 环境变量 `AGENT_BENCHMARK_GO`：显式指定 `go` 二进制路径
+2. `PATH` 上的 `go`，且 `go version` ≥ 1.22
+3. 缓存的引导工具链 `$XDG_CACHE_HOME/agent-benchmark/go/go1.22.12`（默认 `~/.cache`）：
+   按需从 golang.google.cn 或 mirrors.aliyun.com 下载官方 go1.22.12 包，**校验官网
+   sha256 后**才解压使用。系统 go 低于 1.22 时走这条路；不依赖 GOTOOLCHAIN 自动下载
+   （受限网络下 proxy.golang.org 不可达，国内 goproxy 镜像也不分发 toolchain）。
 
 ```bash
-bash go-client/build.sh
+pip install -e .                      # 构建 worker（首次可能需要下载工具链）
 
-# 默认客户端仍是 e2b SDK（--provider aenv）
+# 跳过 Go 构建（仅用 Docker/E2B、或离线 CI）：
+AGENT_BENCHMARK_SKIP_GO_BUILD=1 pip install -e .
+```
+
+构建失败（下载失败、编译错误）会**直接让安装失败**并提示 `AGENT_BENCHMARK_SKIP_GO_BUILD=1`
+和 `bash go-client/build.sh` 两条出路，不会静默留下不可用的默认 provider。
+
+`bash go-client/build.sh` 仍然保留，仅用于**手动重建**（例如改完 `go-client/` 后不想重装）：
+
+```bash
+bash go-client/build.sh   # 手动重建，等价于安装钩子里的 go build
+
+# oversub-bench 默认走 Go 客户端（provider 默认 aenv-go）；
+# bench-core 默认仍是 fake（无 SDK 冒烟路径），显式指定：
 bench-core --provider aenv --config config/common/replay.yaml
 
 # 相同配置，切换到 Go 客户端；请使用独立输出目录
 bench-core --provider aenv-go --config config/common/replay.yaml
 ```
 
-Go 二进制默认路径是仓库内 `go-client/bin/agent-benchmark-go`。也可以指定：
+provider 按以下顺序解析二进制路径（前者优先）：
+
+1. 配置文件 `aenv_go:` 块内的 `go_client_bin:`（不存在时回落 `aenv:` 块）
+2. 环境变量 `AGENT_BENCHMARK_GO_BIN`
+3. wheel 包内数据目录 `env_provider/aenv_go/bin/`（非 editable 安装时由构建钩子放入）
+4. 仓库内路径 `go-client/bin/agent-benchmark-go`（editable 安装 / 源码检出）
 
 ```bash
-# 配置文件 aenv_go: 块内（不存在时回落 aenv: 块）
+# 覆盖示例（二进制放在别处时）：
 go_client_bin: /absolute/path/agent-benchmark-go
-# 或环境变量
+# 或
 export AGENT_BENCHMARK_GO_BIN=/absolute/path/agent-benchmark-go
 ```
 
 Go 缺失、异常退出或协议不匹配时明确报错（`FileNotFoundError` / `GoTransportError`），
 **不自动回退 e2b**——静默降级会污染客户端对比基准。`--provider aenv` 入口及依赖不删除。
-Go 二进制不提交到仓库；在目标机本地构建，或用标准 Go 的 `GOOS`、`GOARCH` 交叉编译。
+Go 二进制不提交到仓库；由 `pip install` 的构建钩子在目标机本地构建，或用标准 Go 的
+`GOOS`、`GOARCH` 交叉编译后通过 `AGENT_BENCHMARK_GO_BIN` 指定。
 
 当前 worker 协议版本为 2。更新本分支后应重新构建 Go 程序；旧二进制会被协议检查拒绝。
 结构化错误类别区分超时、传输失败和 API 拒绝（`TimeoutError` / `GoTransportError` /

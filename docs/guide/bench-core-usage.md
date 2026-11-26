@@ -105,10 +105,12 @@ pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
 
 **aenv-go** uses no SDK — same AENV server, resident Go worker client (protocol v2, line-
-delimited JSON over stdin/stdout). Build the worker first (stdlib-only Go, needs Go 1.22+):
+delimited JSON over stdin/stdout). `pip install -e .` builds the worker automatically (setup.py
+`build_py` hook; stdlib-only Go, needs Go 1.22+, bootstrapped into the XDG cache when absent):
 
 ```bash
-bash go-client/build.sh               # produces go-client/bin/agent-benchmark-go
+pip install -e .                      # builds go-client/bin/agent-benchmark-go
+bash go-client/build.sh               # manual rebuild only
 ```
 
 Override the path with `AGENT_BENCHMARK_GO_BIN` or the `aenv_go:` block's `go_client_bin`

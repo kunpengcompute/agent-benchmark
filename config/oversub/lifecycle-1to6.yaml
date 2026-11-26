@@ -17,7 +17,7 @@
 
 base_config: config/common/replay.yaml
 
-provider: aenv
+provider: aenv-go
 
 # N is the ratio basis; per-trial running_concurrency = k*N for lifecycle
 # (full-scale: all k*N sandboxes pause/resume concurrently), N for exec modes.

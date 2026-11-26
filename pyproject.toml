@@ -45,6 +45,11 @@ vm-monitor = "vm_monitor.cli:main"
 where = ["src"]
 include = ["bench_core*", "env_provider*", "vm_monitor*"]
 
+# The Go worker built by setup.py's build_py hook ships as package data so a
+# non-editable wheel resolves it via binary_path()'s package-dir lookup.
+[tool.setuptools.package-data]
+"env_provider.aenv_go" = ["bin/*"]
+
 [tool.pytest.ini_options]
 minversion = "7.0"
 # src-layout: put src/ on sys.path so tests can ``import bench_core`` without an

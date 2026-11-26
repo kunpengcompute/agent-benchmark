@@ -13,7 +13,7 @@
 # round_size, round_count, duration, report output). Everything else passes through.
 base_config: config/common/replay.yaml
 
-provider: aenv
+provider: aenv-go
 
 # N is the ratio basis (384 for the aenv 1.5 TiB host); per-trial
 # running_concurrency = k*N for lifecycle (full-scale: all k*N sandboxes

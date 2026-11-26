@@ -10,3 +10,6 @@ __pycache__/
 *.py[cod]
 agent_replay/report/runs/
 .venv/
+/build/
+/dist/
+*.egg-info/

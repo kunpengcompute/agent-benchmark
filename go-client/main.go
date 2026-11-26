@@ -104,11 +104,64 @@ func protoInt(m object, key string, required bool, lo, hi int64) (int, error) {
 	return int(n), nil
 }
 
+// exitStatus is the parsed shape of an end-event status string.
+type exitStatus struct {
+	Code   int    // exit code; -1 when the status is not a clean "exit status N"
+	Signal string // signal name when the process died from a signal ("" otherwise)
+	Raw    string // the original status string, echoed back for diagnostics
+	Known  bool   // true when Code came from a numeric "exit status N"
+}
+
+// signalNumbers maps Go's os.Signal names (os.ProcessState.String() prints
+// "signal: killed") to POSIX numbers, so a signal death reports the familiar
+// 128+N shell convention instead of a bare -1.
+var signalNumbers = map[string]int{
+	"hangup":                   1,
+	"interrupt":                2,
+	"quit":                     3,
+	"illegal instruction":      4,
+	"trace/breakpoint trap":    5,
+	"aborted":                  6,
+	"bus error":                7,
+	"floating point exception": 8,
+	"killed":                   9,
+	"user defined signal 1":    10,
+	"segmentation fault":       11,
+	"user defined signal 2":    12,
+	"broken pipe":              13,
+	"alarm clock":              14,
+	"terminated":               15,
+}
+
+// parseExitStatus understands the shapes envd >= 0.5.15 puts on end events:
+// "exit status N" (os.Exit-style) and "signal: NAME" (killed by a signal).
+// Anything else keeps Code = -1 and Known = false so the caller can report an
+// unknown exit instead of silently pretending it was a signal death.
+func parseExitStatus(status string) exitStatus {
+	info := exitStatus{Code: -1, Raw: status}
+	if rest, ok := strings.CutPrefix(status, "exit status "); ok {
+		if n, err := strconv.Atoi(rest); err == nil {
+			info.Code, info.Known = n, true
+		}
+		return info
+	}
+	if rest, ok := strings.CutPrefix(status, "signal: "); ok {
+		info.Signal = strings.TrimSpace(rest)
+		if n, ok := signalNumbers[info.Signal]; ok {
+			info.Code = 128 + n
+		}
+	}
+	return info
+}
+
 type command struct {
 	mu             sync.Mutex
 	pid            int
 	stdout, stderr bytes.Buffer
 	code           int
+	signal         string // signal name when the process died from one
+	statusRaw      string // raw end-event status string ("" when absent)
+	exitUnknown    bool   // status string present but not a recognized shape
 	err            error
 	done           chan struct{}
 	cancel         context.CancelFunc
@@ -403,6 +456,23 @@ func (w *worker) start(ctx context.Context, p object) (any, error) {
 						}
 						ev["exitCode"] = alias
 					}
+					// envd >= 0.5.15 reports the end event as {"exited": true,
+					// "status": "exit status N"} (a Go ExitError string) with no
+					// numeric field; older envds emit exitCode/exit_code directly.
+					// Parse the status string so both shapes yield a code; signal
+					// deaths keep the signal name and use the 128+N convention,
+					// and unrecognized strings are flagged as unknown exits rather
+					// than being silently conflated with a signal death.
+					// (float64: protoInt only accepts JSON-number shapes.)
+					if _, ok := ev["exitCode"]; !ok {
+						if status := str(ev, "status"); status != "" {
+							info := parseExitStatus(status)
+							ev["exitCode"] = float64(info.Code)
+							c.signal = info.Signal
+							c.statusRaw = info.Raw
+							c.exitUnknown = !info.Known && info.Signal == ""
+						}
+					}
 					code, err := protoInt(ev, "exitCode", true, math.MinInt32, math.MaxInt32)
 					if err != nil {
 						return err
@@ -460,7 +530,15 @@ func (w *worker) handle(ctx context.Context, method string, p object) (any, erro
 		w.mu.Lock()
 		delete(w.commands, id)
 		w.mu.Unlock()
-		return object{"stdout": c.stdout.String(), "stderr": c.stderr.String(), "exit_code": c.code}, nil
+		result := object{"stdout": c.stdout.String(), "stderr": c.stderr.String(), "exit_code": c.code}
+		if c.signal != "" {
+			result["exit_signal"] = c.signal
+		}
+		if c.exitUnknown {
+			result["exit_unknown"] = true
+			result["exit_status_raw"] = c.statusRaw
+		}
+		return result, nil
 	}
 	resp, e := w.rpcRequest(ctx, c.sandbox, "SendSignal", object{"process": object{"pid": c.pid}, "signal": 9}, false)
 	if e != nil {
