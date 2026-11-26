@@ -58,7 +58,8 @@ box:
   Build the worker first ([go-client/README.md](../../go-client/README.md)),
   then `--provider aenv-go` reuses the same YAML (`aenv_go:` keys fall back to `aenv:`).
 - **replay** — the pool and its template manifest are pre-wired to the bundled 55
-  (`artifacts/traces/replays` + `artifacts/traces/image-map.json`, §8.3), so a fresh checkout runs.
+  (`artifacts/traces/swe-bench/{replays,image-map.json}`, resolved from the default
+  `replay.scenario: swe-bench`, §8.3), so a fresh checkout runs.
 - **docker** — `docker.image` must exist locally (the shipped names are placeholders, §7).
 
 The `-n` cap matters: the shipped replay profiles declare a full 384-sandbox fleet, so without it
@@ -480,11 +481,12 @@ bench-core --provider aenv --config config/common/replay.yaml -n 768
 
 ### 8.3 Trajectory format and template_manifest
 
-- **Trajectory pool.** The shipped replay profiles already point at the bundled data —
-  `replay.trajectory_dir: artifacts/traces/replays` (55 trajectories) and
-  `replay.template_manifest: artifacts/traces/image-map.json` (one template name per trajectory).
-  Repoint both for your own pack; an empty pool replays zero steps. The oversub driver inherits
-  both from the sweep's `base_config`.
+- **Trajectory pool.** The shipped replay profiles already point at the bundled data — the default
+  `replay.scenario: swe-bench` resolves `replay.trajectory_dir` to
+  `artifacts/traces/swe-bench/replays` (55 trajectories) and `replay.template_manifest` to
+  `artifacts/traces/swe-bench/image-map.json` (one template name per trajectory). Change
+  `replay.scenario` for your own pack, or write the two keys explicitly; an empty pool replays zero
+  steps. The oversub driver inherits the same resolution from the sweep's `base_config` / `scenario`.
 - The loader (`src/bench_core/payload/replay_payload.py`) expects each trajectory JSON to be
   `{instance_id, environment, trajectory: [{action, delay_time}, …]}` (`environment`
   defaults to `"main"`, `instance_id` falls back to the filename stem), truncated at the

@@ -109,6 +109,28 @@ def test_build_trial_config_overrides_and_preserves_base():
     assert base["replay"]["mode"] == "lifecycle"
 
 
+def test_build_trial_config_carries_scenario_into_the_config():
+    """The dataset is a trial input: trial.yaml (and every shard config derived
+    from it) carries replay.scenario, so no --scenario argv passthrough is needed
+    and the kernel records it in run_summary."""
+    cfg = build_trial_config(
+        _base_yaml(),
+        mode="exec_only",
+        ratio=2,
+        n=8,
+        test_duration=60,
+        trial_dir="out/t1",
+        prefix="replay_bench",
+        scenario="webarena",
+    )
+    assert cfg["replay"]["scenario"] == "webarena"
+    # No driver selection -> the base config's own value (or absence) stands.
+    untouched = build_trial_config(
+        _base_yaml(), mode="exec_only", ratio=2, n=8, test_duration=60, trial_dir="out/t1", prefix="replay_bench"
+    )
+    assert "scenario" not in untouched["replay"]
+
+
 def test_build_trial_config_lifecycle_running_concurrency_scales():
     """Lifecycle oversub runs the FULL fleet: rc == total_count == k*N so the
     kernel builds no running-slot cap and all k*N sandboxes pause/resume
@@ -595,6 +617,8 @@ def test_trajectory_detail_has_rows(tmp_path):
                 "n_timeout": 0,
                 "success_rate": 1.0,
                 "elapsed_sec": 1.5,
+                "started_epoch": 1700000000.0,
+                "completed_epoch": 1700000010.0,
                 "time_breakdown_sec": {
                     "slice_total": 1.2,
                     "exec": 0.6,
@@ -648,6 +672,13 @@ def test_trajectory_detail_has_rows(tmp_path):
     assert r["create_sec"] == "0.05"
     assert r["kill_sec"] == "0.05"
     assert r["running_slot_held_sec"] == "1.2"
+    # Per-run wall-clock bounds: index.json epochs surface as ISO local stamps.
+    from datetime import datetime as _dt
+
+    assert _dt.fromisoformat(r["started_at"]).timestamp() == 1700000000.0
+    assert _dt.fromisoformat(r["completed_at"]).timestamp() == 1700000010.0
+    # Offset-bearing: parseable unambiguously across host timezones.
+    assert _dt.fromisoformat(r["started_at"]).utcoffset() is not None
     # The renamed rate-pacing short keys must surface end-to-end: present in the
     # index.json time_breakdown_sec (the canonical caliber) and emitted as their
     # own trajectory-detail CSV columns; no legacy *_queue_wait names remain.

@@ -125,6 +125,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None, help="base replay.yaml (required unless sweep-config sets base_config)")
     p.add_argument("--provider", default=None, help="provider name (default aenv)")
     p.add_argument(
+        "--scenario",
+        default=None,
+        help="replay dataset scenario under artifacts/traces/ (default: the base "
+        "config's replay.scenario, else swe-bench); written into every trial's "
+        "replay.scenario so the pool resolves from the trial config alone and "
+        "the dataset is recorded in the trial's artifacts.",
+    )
+    p.add_argument(
         "--running-concurrency",
         type=int,
         default=None,
@@ -336,6 +344,15 @@ def _find_reusable_summary(trial_dir: Path, prefix: str) -> Path | None:
     return hits[-1] if hits else None
 
 
+def _scenario_of(base_yaml: dict, args: argparse.Namespace) -> str | None:
+    """The dataset scenario this trial will apply, or None when the base config
+    pins ``replay.trajectory_dir`` (the explicit pool bypasses the scenario)."""
+    replay = base_yaml.get("replay") or {}
+    if "trajectory_dir" in replay:
+        return None
+    return args.scenario or replay.get("scenario") or "swe-bench"
+
+
 def _run_trial(
     args: argparse.Namespace,
     base_yaml: dict,
@@ -389,7 +406,23 @@ def _run_trial(
         if prior:
             try:
                 s = parse_run_summary(prior)
-                if compute_valid(s, 0, n=n, failure_tolerance=args.failure_tolerance, multiplier=m, ratio=ratio):
+                scenario = _scenario_of(base_yaml, args)
+                if s.get("scenario") != scenario:
+                    # Same trial dir, different dataset: a prior run must never
+                    # be reused across scenarios (the result would mix datasets).
+                    # scenario=None means this run pins an explicit trajectory
+                    # pool, so it still has to differ from a prior scenario run.
+                    logger.info(
+                        "[%s/%s] %s ratio=%d repeat=%d: prior run used scenario %r, this run %r -- re-running",
+                        index,
+                        total,
+                        mode,
+                        ratio,
+                        repeat,
+                        s.get("scenario"),
+                        scenario,
+                    )
+                elif compute_valid(s, 0, n=n, failure_tolerance=args.failure_tolerance, multiplier=m, ratio=ratio):
                     logger.info(
                         "[%s/%s] %s ratio=%d repeat=%d: reused completed-valid trial -- skipped",
                         index,
@@ -433,6 +466,10 @@ def _run_trial(
         trial_dir=str(trial_dir),
         prefix=prefix,
         multiplier=m,
+        # The EFFECTIVE scenario (driver flag > base YAML key > swe-bench), so
+        # trial.yaml is self-describing even when the driver passed no flag;
+        # None when the base pins trajectory_dir (scenario not consulted).
+        scenario=_scenario_of(base_yaml, args),
     )
     trial_yaml = trial_dir / "trial.yaml"
     trial_yaml.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -456,6 +493,8 @@ def _run_trial(
             total=total,
         )
 
+    # No --scenario here: the trial YAML already carries replay.scenario, so the
+    # kernel resolves the dataset from the config alone.
     cmd = [*args.bench_core_bin, "--config", str(trial_yaml), "--provider", args.provider]
     if args.no_vm_monitor:
         cmd.append("--no-vm-monitor")
@@ -727,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
     # Write resolved values back so _run_trial / _run_subprocess read them unchanged.
     args.config = base_config_path
     args.provider = resolve("provider")
+    args.scenario = resolve("scenario")
     args.ratios = ratios
     args.modes = modes
     args.repeats = repeats
@@ -755,6 +795,10 @@ def main(argv: list[str] | None = None) -> int:
         "base_config": str(base_config_path),
         "sweep_config": str(args.sweep_config) if args.sweep_config else None,
         "provider": args.provider,
+        # Data axis: the dataset every trial resolves (None = base config pins
+        # trajectory_dir). Recorded so sweeps over different datasets are never
+        # read as one series.
+        "scenario": _scenario_of(base_yaml, args),
         "running_concurrency": n,
         "ratios": ratios,
         "modes": modes,

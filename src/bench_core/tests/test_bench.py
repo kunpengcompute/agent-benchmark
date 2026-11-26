@@ -6,12 +6,14 @@ and warmup-only. Plus the no-ready-sandboxes early exit.
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
 from bench_core.bench import run_benchmark
+from bench_core.bench_cli import TRACES_ROOT
 from bench_core.config import KernelConfig
 from bench_core.task_runner.browser import BrowserConfig
 from bench_core.task_runner.replay import ReplayConfig
@@ -19,6 +21,10 @@ from env_provider import CreationMetrics, SandboxStatus
 from env_provider.fake import FakeProvider
 
 REPLAY_FIXTURES = Path(__file__).parent / "fixtures" / "replay"
+# The scenario resolves to absolute paths (anchored at the repo root, not the
+# CWD), so the expected values are derived from the same anchor.
+SWE_BENCH_REPLAYS = (TRACES_ROOT / "swe-bench" / "replays").as_posix()
+SWE_BENCH_MAP = (TRACES_ROOT / "swe-bench" / "image-map.json").as_posix()
 
 
 class _NoReadyProvider(FakeProvider):
@@ -168,13 +174,193 @@ def test_load_config_replay_yaml():
 
     config, raw = load_config("config/common/replay.yaml")
     assert config.workflow_type == "replay"
-    assert config.workflow_config.replay_trajectory_dir == "artifacts/traces/replays"
+    # No explicit trajectory keys in replay.yaml anymore: they resolve from the
+    # default swe-bench scenario under artifacts/traces/.
+    assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
+    assert config.workflow_config.replay_template_manifest == SWE_BENCH_MAP
+    assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
     # mode is omitted so the shared config resolves to each provider's
     # default (lifecycle for aenv/aenv-go/cubesandbox, exec_only for
     # e2b/docker/fake/sandboxsched) -- a hardcoded default would make the
     # shared config fail at startup on providers without a validated
     # lifecycle (sandboxsched vetoes it).
     assert config.workflow_config.replay_mode is None
+
+
+def test_load_config_scenario_resolves_trajectory_keys(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    config, raw = load_config(yml, scenario="swe-bench")
+    assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
+    assert config.workflow_config.replay_template_manifest == SWE_BENCH_MAP
+    assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
+
+
+def test_load_config_explicit_trajectory_dir_wins_over_scenario(tmp_path):
+    from bench_core.bench import load_config
+
+    pool = tmp_path / "custom-pool"
+    pool.mkdir()
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(
+        f"workflow_type: replay\nreplay:\n  trajectory_dir: {pool.as_posix()}\n  mode: lifecycle\n",
+        encoding="utf-8",
+    )
+    # Scenario dir need not exist: the explicit pool is the escape hatch.
+    config, _ = load_config(yml, scenario="no-such-scenario")
+    assert config.workflow_config.replay_trajectory_dir == pool.as_posix()
+    assert config.workflow_config.replay_template_manifest is None
+
+
+def test_load_config_explicit_trajectory_dir_warns_when_scenario_given(tmp_path, caplog):
+    from bench_core.bench import load_config
+
+    pool = tmp_path / "custom-pool"
+    pool.mkdir()
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(
+        f"workflow_type: replay\nreplay:\n  trajectory_dir: {pool.as_posix()}\n  mode: lifecycle\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        load_config(yml, scenario="swe-bench")
+    assert "ignored" in caplog.text and "trajectory_dir" in caplog.text
+
+
+def test_load_config_scenario_missing_dataset_raises(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no dataset directory"):
+        load_config(yml, scenario="no-such-scenario")
+
+
+def test_load_config_records_applied_scenario(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    config, raw = load_config(yml)
+    # The applied scenario is written back into the replay block so it reaches
+    # run_summary / trial.yaml (the data axis must be recorded, not inferred).
+    assert config.workflow_config.replay_scenario == "swe-bench"
+    assert raw["replay"]["scenario"] == "swe-bench"
+
+
+def test_load_config_scenario_missing_dataset_files_raises(tmp_path, monkeypatch):
+    from bench_core import bench_cli
+    from bench_core.bench import load_config
+
+    traces = tmp_path / "traces"
+    (traces / "broken" / "replays").mkdir(parents=True)  # manifest missing
+    monkeypatch.setattr(bench_cli, "TRACES_ROOT", traces)
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="image-map.json"):
+        load_config(yml, scenario="broken")
+
+
+def test_load_config_scenario_rejects_path_traversal(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must match"):
+        load_config(yml, scenario="../etc")
+
+
+def test_load_config_implicit_default_scenario_absent_warns(tmp_path, monkeypatch, caplog):
+    """A run that never selected a dataset must not hard-fail on its absence
+    (pre-scenario behavior: no pool, zero steps). An explicit request still does."""
+    from bench_core import bench_cli
+    from bench_core.bench import load_config
+
+    monkeypatch.setattr(bench_cli, "TRACES_ROOT", tmp_path / "no-traces")
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: lifecycle\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        config, _ = load_config(yml)  # implicit swe-bench, dataset absent
+    assert "continuing without a scenario dataset" in caplog.text
+    assert config.workflow_config.replay_scenario is None
+    assert config.workflow_config.replay_trajectory_dir == "trajectories"
+
+
+def test_load_config_warns_when_explicit_pool_dir_is_missing(tmp_path, caplog):
+    """A stale/typo'd explicit pool must not silently replay 0 steps."""
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(
+        "workflow_type: replay\nreplay:\n  trajectory_dir: /nope/missing\n  mode: exec_only\n", encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING):
+        config, _ = load_config(yml)
+    assert "is not a directory" in caplog.text
+    assert config.workflow_config.replay_trajectory_dir == "/nope/missing"
+
+
+def test_load_config_scenario_tolerates_null_replay_block(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n", encoding="utf-8")  # null / empty block
+    config, _ = load_config(yml, scenario="swe-bench")
+    assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
+
+
+def test_dataset_glob_falls_back_when_dataset_yaml_root_is_not_a_mapping(tmp_path):
+    from bench_core.bench_cli import _dataset_glob
+
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text("glob: '*.json'\n", encoding="utf-8")
+    assert _dataset_glob(tmp_path) == "*.json"
+    for bad_root in ("- not\n- a mapping\n", "", "42\n"):
+        dataset_yaml.write_text(bad_root, encoding="utf-8")
+        assert _dataset_glob(tmp_path) == "*.replay.json"
+
+
+def test_load_config_scenario_from_yaml_key(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: swe-bench\n  mode: lifecycle\n", encoding="utf-8")
+    config, _ = load_config(yml)
+    assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
+    assert config.workflow_config.replay_template_manifest == SWE_BENCH_MAP
+
+
+def test_load_config_cli_scenario_wins_over_yaml_key(tmp_path):
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    # YAML names webarena but the CLI override is swe-bench: the CLI alone wins.
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: webarena\n  mode: lifecycle\n", encoding="utf-8")
+    config, _ = load_config(yml, scenario="swe-bench")
+    assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
+
+
+def test_load_config_diy_custom_pool_and_map_untouched(tmp_path):
+    """The legacy DIY escape hatch stays: explicit trajectory_dir + template_manifest
+    bypass the scenario machinery entirely (no scenario key, no resolution, no
+    scenario warning; the missing-dir warning is separate)."""
+    from bench_core.bench import load_config
+
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(
+        "workflow_type: replay\n"
+        "replay:\n"
+        "  trajectory_dir: /mnt/my-traces\n"
+        "  template_manifest: /mnt/my-traces/image-map.json\n"
+        "  mode: exec_only\n",
+        encoding="utf-8",
+    )
+    config, _ = load_config(yml)
+    assert config.workflow_config.replay_trajectory_dir == "/mnt/my-traces"
+    assert config.workflow_config.replay_template_manifest == "/mnt/my-traces/image-map.json"
+    assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
 
 
 class TestRunBenchmarkReplayRoundRobin:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,15 @@ from bench_core.task_runner.replay import ReplayConfig
 from bench_core.utils import setup_logging
 from env_provider import EnvironmentProvider
 
+logger = logging.getLogger(__name__)
 
-def load_config(path: str | Path, *, workflow_type_override: str | None = None) -> tuple[KernelConfig, dict[str, Any]]:
+
+def load_config(
+    path: str | Path,
+    *,
+    workflow_type_override: str | None = None,
+    scenario: str | None = None,
+) -> tuple[KernelConfig, dict[str, Any]]:
     """Load a :class:`KernelConfig` from a YAML file (unified schema).
 
     Reads the shared stress sections via :meth:`KernelConfig.from_raw`, so the
@@ -32,6 +40,11 @@ def load_config(path: str | Path, *, workflow_type_override: str | None = None) 
     post-hoc on the built config) so ``from_raw`` selects the right
     ``config_cls`` view; setting it on the built config later would leave the
     typed view bound to the YAML's workflow (RFC 0002 P2-1).
+
+    ``scenario`` selects the replay dataset under ``artifacts/traces/``; the
+    trajectory pool + template map are derived from it when the YAML omits them
+    (see :func:`_apply_scenario_override`). Precedence: the CLI ``--scenario``
+    flag, else the ``replay.scenario`` YAML key, else ``swe-bench``.
     """
     import yaml
 
@@ -40,7 +53,147 @@ def load_config(path: str | Path, *, workflow_type_override: str | None = None) 
 
     if workflow_type_override is not None:
         raw["workflow_type"] = workflow_type_override
+    if scenario is not None and raw.get("workflow_type") != "replay":
+        logger.warning(
+            f"--scenario {scenario!r} ignored: only the replay workflow has a trajectory pool "
+            f"(workflow_type={raw.get('workflow_type')!r})"
+        )
+    if raw.get("workflow_type") == "replay":
+        resolved, explicit = _resolve_scenario(raw, scenario)
+        replay_block = raw.get("replay")
+        if isinstance(replay_block, dict) and "trajectory_dir" in replay_block:
+            yaml_scenario = replay_block.get("scenario")
+            if scenario is not None or (isinstance(yaml_scenario, str) and yaml_scenario):
+                logger.warning(
+                    f"replay scenario {resolved!r} ignored: the config sets replay.trajectory_dir "
+                    "explicitly (an explicit pool wins over the scenario). Remove that key to use "
+                    f"the artifacts/traces/{resolved}/ dataset."
+                )
+        _apply_scenario_override(raw, resolved, explicit=explicit)
     return KernelConfig.from_raw(raw), raw
+
+
+def _resolve_scenario(raw: dict[str, Any], cli_scenario: str | None) -> tuple[str, bool]:
+    """Collapse the scenario sources to one value: CLI ``--scenario`` >
+    the ``replay.scenario`` YAML key > the ``swe-bench`` default.
+
+    Also reports whether someone asked for the scenario explicitly (CLI flag or
+    YAML key). An implicit default may degrade to a warning when the dataset is
+    absent -- a run that never selected a dataset must not fail on it.
+    """
+    if cli_scenario is not None:
+        return cli_scenario, True
+    replay = raw.get("replay")
+    if isinstance(replay, dict):
+        yaml_scenario = replay.get("scenario")
+        if isinstance(yaml_scenario, str) and yaml_scenario:
+            return yaml_scenario, True
+    return "swe-bench", False
+
+
+# artifacts/traces/ ships with the checkout. Anchor it to the repo root (this
+# file lives in src/bench_core/) so the dataset resolves identically from any
+# working directory; a pip-installed package carries no traces, and there the
+# explicit replay.trajectory_dir is the supported path.
+TRACES_ROOT = Path(__file__).resolve().parents[2] / "artifacts" / "traces"
+
+# A scenario names a dataset directory, nothing else: no separators, no ``..``,
+# no absolute paths (build_template.py applies the same rule to image tags).
+_SCENARIO_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _dataset_glob(scenario_dir: Path) -> str:
+    """``glob`` from ``artifacts/traces/<scenario>/dataset.yaml``; fallback default."""
+    import yaml
+
+    default = "*.replay.json"
+    try:
+        meta_doc = yaml.safe_load((scenario_dir / "dataset.yaml").read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return default
+    if not isinstance(meta_doc, dict):  # empty file, or a root node that is not a mapping
+        return default
+    dataset_glob = meta_doc.get("glob")
+    return dataset_glob if isinstance(dataset_glob, str) and dataset_glob else default
+
+
+def _scenario_dataset_problem(scenario: str) -> str | None:
+    """Why ``scenario`` cannot serve as a dataset, or None when it can.
+
+    Checked once here, at resolution time: the pool (``replays/``) and the
+    manifest (``image-map.json``) are what the loader needs, and failing now
+    (with the available scenarios) beats a later ``not readable at ...`` from
+    ``load_pool`` or -- worse -- a silently empty pool that replays 0 steps.
+    """
+    scenario_dir = TRACES_ROOT / scenario
+    if not scenario_dir.is_dir():
+        available = sorted(p.name for p in TRACES_ROOT.iterdir() if p.is_dir()) if TRACES_ROOT.is_dir() else []
+        return (
+            f"replay scenario {scenario!r} has no dataset directory under {TRACES_ROOT}/; "
+            f"available: {available}. Omit --scenario (default swe-bench) or set "
+            "replay.trajectory_dir in the config to override."
+        )
+    missing = [name for name in ("replays", "image-map.json") if not (scenario_dir / name).exists()]
+    if missing:
+        return (
+            f"replay scenario {scenario!r} is missing {', '.join(missing)} under {scenario_dir.as_posix()}/; "
+            "a dataset dir needs replays/ (trajectory pool) and image-map.json (trajectory -> template), "
+            "or set replay.trajectory_dir explicitly for a custom pool."
+        )
+    return None
+
+
+def _apply_scenario_override(raw: dict[str, Any], scenario: str, *, explicit: bool) -> None:
+    """Point the replay trajectory pool + template map at a dataset scenario.
+
+    ``artifacts/traces/<scenario>/`` owns the trajectory pool (``replays/``), the
+    authoritative trajectory->template map (``image-map.json``) and the dataset
+    metadata (``dataset.yaml``, ``glob:``). An explicit ``replay.trajectory_dir``
+    in the YAML wins over the scenario entirely (custom pool escape hatch);
+    otherwise every replay pointer key derives from the scenario, as absolute
+    paths so a config authored here stays valid from any working directory. The
+    resolved scenario is written back to ``replay.scenario`` so the trial YAML,
+    ``run_summary.json`` and the sweep report record which dataset was measured
+    (results from different datasets must never look like one series). Scenario
+    is a *data* axis, not a config axis: mode profiles (lifecycle / exec_only /
+    exec_ephemeral) stay shared across scenarios, only these dataset pointers
+    vary.
+    """
+    replay = raw.get("replay")
+    if not isinstance(replay, dict):  # absent or null `replay:` block -> empty pool override
+        replay = {}
+        raw["replay"] = replay
+    if "trajectory_dir" in replay:
+        # An explicit pool bypasses the scenario, but a renamed/mistyped dir
+        # (e.g. a config still pinned to the pre-scenario artifacts/traces/replays)
+        # silently replays 0 steps -- surface it without overriding the choice.
+        pool = Path(str(replay["trajectory_dir"]))
+        if not pool.is_dir():
+            logger.warning(
+                f"replay.trajectory_dir {str(pool)!r} is not a directory; the pool will be empty "
+                "(0 steps replayed). Point it at an existing pool, or drop the key to use a scenario."
+            )
+        return
+    if not _SCENARIO_NAME.match(scenario):
+        raise ValueError(
+            f"replay scenario {scenario!r} must match {_SCENARIO_NAME.pattern} "
+            "(it names a directory under artifacts/traces/, so no path separators)"
+        )
+    problem = _scenario_dataset_problem(scenario)
+    if problem is not None:
+        if explicit:
+            raise ValueError(problem)
+        # Implicit default with no bundled dataset (a pip install, or a CWD
+        # outside the checkout before the anchor above): keep the pre-scenario
+        # behavior -- no pool, zero steps -- instead of failing a run that never
+        # asked for a dataset.
+        logger.warning(f"{problem} -- continuing without a scenario dataset (every sandbox replays 0 steps)")
+        return
+    scenario_dir = TRACES_ROOT / scenario
+    replay.setdefault("trajectory_dir", (scenario_dir / "replays").as_posix())
+    replay.setdefault("template_manifest", (scenario_dir / "image-map.json").as_posix())
+    replay.setdefault("trajectory_glob", _dataset_glob(scenario_dir))
+    replay["scenario"] = scenario
 
 
 def _apply_monitor_override(config: KernelConfig, args) -> None:
@@ -64,6 +217,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-n", "--total-count", type=int)
     parser.add_argument("--workflow-type", choices=["browser", "coding", "document", "replay"])
+    parser.add_argument(
+        "--scenario",
+        help="replay dataset scenario under artifacts/traces/ (default swe-bench; "
+        "alternatively set replay.scenario: in the config -- the CLI alone wins). "
+        "Resolves replay.trajectory_dir / template_manifest / trajectory_glob when "
+        "the YAML omits them (explicit replay.trajectory_dir wins over --scenario).",
+    )
     parser.add_argument("-bm", "--benchmark-mode", choices=["fixed", "round_robin"])
     parser.add_argument("--round-count", type=int)
     parser.add_argument("--round-size", type=int)
@@ -138,7 +298,9 @@ def main() -> None:
     setup_logging(level=getattr(logging, args.log_level.upper()))
 
     if args.config:
-        config, raw = load_config(args.config, workflow_type_override=args.workflow_type or None)
+        config, raw = load_config(
+            args.config, workflow_type_override=args.workflow_type or None, scenario=args.scenario
+        )
     else:
         config, raw = KernelConfig(), {}
         if args.workflow_type:

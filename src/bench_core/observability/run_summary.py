@@ -12,24 +12,18 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from bench_core.observability.replay_obs import ReplayObservability
 from bench_core.task_runner.replay import ReplayConfig
-from bench_core.utils import _atomic_write_text
+from bench_core.utils import _atomic_write_text, iso_local_timestamp
 
 if TYPE_CHECKING:
     from bench_core.config import KernelConfig
     from bench_core.observability.stats_collector import StatsCollector
 
 SCHEMA_VERSION = 2
-
-
-def _iso(epoch: float) -> str:
-    """ISO-8601 with local tz, millisecond precision (matches the repo's time.time() convention)."""
-    return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="milliseconds")
 
 
 def write_run_summary(
@@ -131,9 +125,13 @@ def write_run_summary(
         "schema_version": SCHEMA_VERSION,
         "workflow_type": config.workflow_type,
         "replay_mode": rcfg.replay_mode,
+        # The data axis: which artifacts/traces/<scenario>/ dataset this run
+        # measured (None = explicit trajectory_dir). Consumers that join runs
+        # (compare_sweeps, --reuse) must not treat two datasets as one series.
+        "scenario": rcfg.replay_scenario,
         "provider": stats_collector.provider_label or None,
-        "started_at": _iso(started_epoch) if started_epoch else None,
-        "completed_at": _iso(completed_epoch),
+        "started_at": iso_local_timestamp(started_epoch),
+        "completed_at": iso_local_timestamp(completed_epoch),
         "started_epoch": started_epoch,
         "completed_epoch": completed_epoch,
         "test_duration": config.test_duration,

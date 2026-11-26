@@ -333,6 +333,10 @@ def build_shard_command(
     that holds a provider handle and therefore the one that can poll the
     control-plane gauge. A second collector on the same host would double-sample
     the same /proc counters and race on the tool lock dir.
+
+    The dataset scenario needs no flag here: :func:`build_shard_config` derives
+    each shard's config from ``trial.yaml``, which already carries
+    ``replay.scenario``.
     """
     cmd = [*bench_core_bin, "--config", str(spec.config_path), "--provider", provider]
     if no_vm_monitor or spec.index > 0:

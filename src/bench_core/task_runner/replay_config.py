@@ -27,6 +27,12 @@ class ReplayConfig(WorkflowConfigBase):
 
     replay_trajectory_dir: str = "trajectories"
     replay_trajectory_glob: str = "*.replay.json"
+    # Which dataset under artifacts/traces/ the pool was resolved from (the
+    # applied scenario -- never a defaulted one that was skipped). Recorded so a
+    # run summary / trial config states its data axis: two datasets must not be
+    # compared as one series, and --reuse must not cross them. None for an
+    # explicit-pool config, which bypasses scenario resolution.
+    replay_scenario: str | None = None
     # Cap the loaded pool to the first N trajectories PER TEMPLATE (natural sort
     # order within each template). None = use the whole pool. Set by the oversub
     # driver to ``running_concurrency`` (N) so each template's issue set stays
@@ -78,6 +84,7 @@ class ReplayConfig(WorkflowConfigBase):
         return cls(
             replay_trajectory_dir=r.get("trajectory_dir", "trajectories"),
             replay_trajectory_glob=r.get("trajectory_glob", "*.replay.json"),
+            replay_scenario=r.get("scenario"),
             replay_trajectory_limit=r.get("trajectory_limit"),
             replay_multiplier=r.get("multiplier"),
             replay_template_manifest=r.get("template_manifest"),

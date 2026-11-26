@@ -28,9 +28,10 @@ sweep 文件里只有**扫描**旋钮。凭据、后端地址、镜像都在它�
 (`base_config: config/common/replay-ephemeral.yaml`)里,先改那个文件。跳过这一步就是"扫描起来了
 但每个 trial 都 invalid"的常见原因。
 
-**前置:轨迹池。** base profile 已默认指向仓库自带的 55 条 ——
-`replay.trajectory_dir: artifacts/traces/replays` 与
-`replay.template_manifest: artifacts/traces/image-map.json`。换成自己的轨迹包时改这两个键;
+**前置:轨迹池。** base profile 已默认指向仓库自带的 55 条 —— `replay.scenario: swe-bench`
+(默认)解析到 `artifacts/traces/swe-bench/{replays,image-map.json}`。换成自己的轨迹包时改
+`replay.scenario` / sweep 的 `scenario:`,或显式写 `replay.trajectory_dir` /
+`replay.template_manifest`;
 没有轨迹池时每个 trial 都回放 **0 个 step**、全部判 invalid(exec_ephemeral 还会先把机队建起来再空跑)。
 文件格式见 [bench-core-usage-zh.md §8.3](bench-core-usage-zh.md#83-轨迹格式与-template_manifest)。
 
@@ -239,7 +240,7 @@ client-bound)。`shards` 把一个 trial 的 k×N slot 拆成 P 个 `bench-core`
 |-------|------|
 | `schema_version` | 契约版本(`2`);信息性字段——driver 直接读 throughput 字段、从不校验此值(用新 driver 重打分 schema-1 旧文件行为不变:同门槛、同字段) |
 | `replay_mode` / `provider` | 哪个 mode / 后端;区分曲线与后端 |
-| `started_at` / `completed_at`(+ `_epoch`) | 起止时间;epoch 用于与 vm_monitor 对齐 join |
+| `started_at` / `completed_at`(+ `_epoch`) | 起止时间;`*_at` 仅人读(本地偏移 ISO,可跨时区解析,但不要按字符串比较/排序),机器对齐请用 `_epoch` join vm_monitor |
 | `test_duration` / `wall_sec` | 配置上限 vs 实际墙钟;wall ≪ duration = 提前停/卡死 |
 | `total_count` / `running_concurrency` / `overcommit_ratio` | `total_count` = k×N;`running_concurrency` =实际并发数(lifecycle 全量为 k×N,exec mode 为 N);`overcommit_ratio` = total÷running(lifecycle 全量为 1.0,exec mode 为 k——扫描横轴 `ratio=k` 在 driver 列,见下) |
 | `throughput` | `total`(轨迹 attempt 数,schema 2:slot 跨 ephemeral create/kill 或 fixed multiplier 复用时按轨迹计数,不再按沙箱槽位)/ `succeeded`(跑完全部 step 的轨迹数)/ `failed`(= total − succeeded,恒 ≥ 0)/ `total_steps` / `steps_per_sec` / `tasks_per_sec`;非 M trial 的 valid 门槛读 `total`,M(multiplier)trial 读 `succeeded` |
@@ -272,7 +273,7 @@ client-bound)。`shards` 把一个 trial 的 k×N slot 拆成 P 个 `bench-core`
 |------|------|--------|
 | `trial-summary.csv` | 每 `(mode, ratio, repeat)` trial 一行 | `total, succeeded, failed, failure_rate, peak_active, wall_sec, tasks_per_sec, mean_stress_sec, stress_tasks_per_sec, steps_per_sec, lifecycle_overhead_pct, return_code, valid, target_count, test_duration` |
 | `ratio-summary.csv` | 每 `(mode, ratio)` 一行(跨 repeat 取中位) | `attempted, successful, median_wall_sec, median_tasks_per_sec, median_stress_sec, median_stress_tasks_per_sec, avg_cmd_exec_sec, median_cmd_exec_sec, cmd_exec_degradation_vs_1_1_pct, time_degradation_vs_1_1_pct, throughput_gain_vs_1_1_pct, stress_throughput_gain_vs_1_1_pct` |
-| `trajectory-detail.csv` | 每 trial 每条轨迹一行(取自 `trajectories/index.json`) | `trajectory_id, sandbox_index, n_steps, n_failed, success_rate, elapsed_sec` + 19 个 `*_sec` 分解列。该轨迹执行的命令序列(`action_series`)**不**在 CSV 里(多行单元格会把 Excel 每行撑得很高)——逐轨迹看 `replay_result.json` / `index.json`,或机器可读的 `benchmark-report.json` 的 `trajectory_details`。 |
+| `trajectory-detail.csv` | 每 trial 每条轨迹(每次 run)一行(取自 `trajectories/index.json`) | `trajectory_id, sandbox_index, n_steps, n_failed, success_rate, elapsed_sec, started_at, completed_at` + 19 个 `*_sec` 分解列。`started_at` / `completed_at` 是该次 run 的墙钟起止(本地 ISO,毫秒;对应 `index.json` 的 `started_epoch` / `completed_epoch`,可直接与 `vm_monitor` 采样时间对齐),`started_at` 已回推 create 耗时,即 create 开始时刻;`completed_at` 在该 run 未正常结束(无 kill 落盘,如驱动被杀/序列截断)时留空,不回退到 create 时刻。该轨迹执行的命令序列(`action_series`)**不**在 CSV 里(多行单元格会把 Excel 每行撑得很高)——逐轨迹看 `replay_result.json` / `index.json`,或机器可读的 `benchmark-report.json` 的 `trajectory_details`。 |
 | `benchmark-report.json` | 完整机器可读报告 | `configuration, trials, ratio_summary, trajectory_details`(每个 `trajectory_details` 行带 `action_series`) |
 
 每个 trial 还有自己的子目录 `<output_root>/<mode>/ratio-XX/repeat-XX/`。所有 trial(包括 P=1)

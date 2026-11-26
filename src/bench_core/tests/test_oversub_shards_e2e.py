@@ -85,6 +85,7 @@ finished = time.time()
 summary = {
   "schema_version": 2, "workflow_type": "replay",
   "replay_mode": cfg["replay"]["mode"], "provider": "stub",
+  "scenario": (cfg.get("replay") or {}).get("scenario"),
   "started_at": "2026-10-30T10:00:00+08:00", "completed_at": "2026-10-30T10:18:00+08:00",
   "started_epoch": began, "completed_epoch": finished,
   "test_duration": cfg["test"]["duration"], "wall_sec": round(finished - began, 3),
@@ -205,10 +206,15 @@ def test_e2e_sharded_trial_merges_into_contract_artifacts(tmp_path):
     argv1 = json.loads((trial_dir / "shard-01" / "argv.json").read_text(encoding="utf-8"))
     assert "--no-vm-monitor" not in argv0
     assert "--no-vm-monitor" in argv1
+    # The dataset rides in the config, not argv, and is visible in the artifacts.
+    assert "--scenario" not in argv0 and "--scenario" not in argv1
+    trial_cfg = yaml.safe_load((trial_dir / "trial.yaml").read_text(encoding="utf-8"))
+    assert trial_cfg["replay"]["scenario"] == "swe-bench"
 
     # Merged summary: the schema-2 contract, with shard provenance attached.
     merged_path = trial_dir / "merged" / "rb_run_summary.json"
     merged = json.loads(merged_path.read_text(encoding="utf-8"))
+    assert merged["scenario"] == "swe-bench"
     assert merged["shard_count"] == 2
     assert merged["throughput"]["succeeded"] == 16  # M*k*N = 2*2*4
     assert merged["throughput"]["total"] == 16
@@ -510,3 +516,41 @@ def test_e2e_reuse_skips_completed_sharded_trial(tmp_path):
     with open(out_root / "trial-summary.csv", newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert rows[-1]["reused"] == "True" and rows[-1]["valid"] == "True"
+
+
+def test_e2e_reuse_refuses_a_prior_run_from_another_dataset(tmp_path):
+    """Switching from the default scenario to an explicit trajectory pool is a
+    dataset change too: scenario=None must not serve the prior swe-bench run."""
+    stub = tmp_path / "stub.py"
+    stub.write_text(_SHARD_STUB, encoding="utf-8")
+    base = _base_yaml(tmp_path)
+    out_root = tmp_path / "sweep"
+    trial_args = ["--ratios", "2", "--modes", "exec_ephemeral", "--shards", "auto", "--test-duration", "60"]
+    assert main(_common_argv(tmp_path, base, out_root, stub) + trial_args) == 0
+    trial_dir = out_root / "exec_ephemeral" / "ratio-02" / "repeat-00"
+    merged = json.loads((trial_dir / "merged" / "rb_run_summary.json").read_text(encoding="utf-8"))
+    assert merged["scenario"] == "swe-bench"
+
+    marker = trial_dir / "shard-00" / "argv.json"
+    marker.write_text("SENTINEL", encoding="utf-8")
+    explicit = tmp_path / "explicit.yaml"
+    explicit.write_text(
+        yaml.safe_dump(
+            {
+                "workflow_type": "replay",
+                "sandbox": {"total_count": 4},
+                "replay": {
+                    "running_concurrency": 4,
+                    "mode": "exec_ephemeral",
+                    "trajectory_dir": "artifacts/explicit",
+                },
+                "test": {"duration": 60, "round_size": 4, "round_count": 1, "benchmark_mode": "fixed"},
+                "report": {"output_dir": "results/replay", "filename_prefix": "rb", "format": "both"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    assert main(_common_argv(tmp_path, explicit, out_root, stub) + trial_args + ["--reuse"]) == 0
+    # Different pool -> the prior summary is not reusable; the stub re-ran.
+    assert marker.read_text(encoding="utf-8") != "SENTINEL"

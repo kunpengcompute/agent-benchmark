@@ -5,7 +5,7 @@ This document describes every metric produced by the **two active instrumentatio
 - **Part I — `bench_core` kernel** (`src/bench_core/`, `bench-core` CLI): the host-agnostic stress kernel. Sandbox **creation timing** + **workflow task metrics** (browser / coding / document).
 - **Part II — `vm_monitor`** (`vm_monitor/`, `vm-monitor` CLI): host-level VMM monitoring. Real-time Excel sheets + dark-themed SVG time-curve reports covering host CPU/memory, disk I/O, NUMA, swap, page-cache pressure, and (when enabled) external hardware profilers.
 
-The frozen legacy OpenStack **batch summary** (`batch_summary_*.xlsx`, produced by `batch_test_scheduler.py`) is intentionally **not** covered here — it aggregates cross-run and is retained only for existing OpenStack users. See `usage-guide.md` for that path.
+The frozen legacy OpenStack **batch summary** (`batch_summary_*.xlsx`, produced by `batch_test_scheduler.py`) is intentionally **not** covered here — it aggregates cross-run and is retained only for existing OpenStack users.
 
 ---
 
@@ -302,7 +302,7 @@ table is still written.
 
 ## 2.3 External hardware profiler sheets (`--enable-capture`)
 
-These sheets are written only when the corresponding tool log exists in `--log-dir` (tools run in parallel via `LogCapture` when `--enable-capture` is passed). Tool paths come from `.env` (`DEVKIT_PATH`, `KSYS_PATH`, `UB_WATCH_PATH`, `SMAP_BW_PATH`, `GETFRE_PATH`). See [Usage Guide – Log Collection Tools](usage-guide.md#log-collection-tools).
+These sheets are written only when the corresponding tool log exists in `--log-dir` (tools run in parallel via `LogCapture` when `--enable-capture` is passed). Tool paths come from `.env` (`DEVKIT_PATH`, `KSYS_PATH`, `UB_WATCH_PATH`, `SMAP_BW_PATH`, `GETFRE_PATH`). See [vm-monitor usage guide](../guide/vm-monitor-usage.md).
 
 ### `DevKit_TopDown` — columns `Metric` | `Value` | `Report Count`
 
@@ -998,5 +998,5 @@ timeline sheet's presence to tell them apart (absent sheet = not collected).
 
 ## Related documentation
 
-- [vm-monitor usage guide](../guide/vm-monitor-usage.md): `.env` paths + flags for devkit / ksys / ub_watch / smap_bw / getfre.
+- [vm-monitor usage guide](../guide/vm-monitor-usage.md): `.env` paths + flags for devkit / ksys / ub_watch / smap_bw / uprof / getfre.
 - [bench-core usage (中文)](../guide/bench-core-usage-zh.md): `bench-core` install → config → CLI → cleanup → troubleshooting.
