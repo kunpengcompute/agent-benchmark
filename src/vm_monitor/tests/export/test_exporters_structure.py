@@ -421,34 +421,6 @@ def _full_parsed_logs():
         ],
     }
 
-    # --- smap_bw ---
-    parsed["smap_bw"] = {
-        "cycles": [
-            {
-                "cycle_no": 1,
-                "total_pages": 1000,
-                "duration": 1.0,
-                "bandwidth_gb_s": 10.0,
-                "directions": {(0, 5): 600, (5, 0): 400},
-            },
-            {
-                "cycle_no": 2,
-                "total_pages": 2000,
-                "duration": 2.0,
-                "bandwidth_gb_s": 20.0,
-                "directions": {(0, 5): 1200, (5, 0): 800},
-            },
-        ],
-        "summary": {
-            "total_cycles": 2,
-            "total_pages": 3000,
-            "avg_bandwidth_gb_s": 15.0,
-            "min_bandwidth_gb_s": 10.0,
-            "max_bandwidth_gb_s": 20.0,
-        },
-        "all_directions": {(0, 5), (5, 0)},
-    }
-
     # --- getfre (2 NUMA nodes, each with 2 cores) ---
     # Carries the `timeline` {timestamp: {core_id: freq_mhz}} parse_getfre
     # returns; resource_report surfaces only the per-core summary sheet.
@@ -558,8 +530,6 @@ class TestExportStructure(unittest.TestCase):
                 "KSys",
                 "UBWatch_Latency",
                 "UBWatch_Bandwidth",
-                "SMAPBW_Summary",
-                "SMAPBW_Cycles",
                 "Getfre_Summary",
                 "Getfre_NUMA0",
                 "Getfre_NUMA1",
@@ -619,8 +589,6 @@ class TestExportStructure(unittest.TestCase):
                 "Max Read (MB/s)",
                 "Max Sum (MB/s)",
             ],
-            "SMAPBW_Summary": ["Metric", "Value"],
-            "SMAPBW_Cycles": ["Cycle", "Pages", "Duration (s)", "Bandwidth (GB/s)", "N0->N5_pages", "N5->N0_pages"],
             "Getfre_Summary": [
                 "NUMA",
                 "Avg Frequency (MHz)",
@@ -656,8 +624,6 @@ class TestExportStructure(unittest.TestCase):
             "KSys": 11,  # 3+3+1+4
             "UBWatch_Latency": 8,
             "UBWatch_Bandwidth": 2,
-            "SMAPBW_Summary": 5,
-            "SMAPBW_Cycles": 2,
             "Getfre_Summary": 2,
             "Getfre_NUMA0": 2,
             "Getfre_NUMA1": 1,

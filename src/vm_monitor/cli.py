@@ -216,7 +216,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Log capture options
     parser.add_argument(
-        "--enable-capture", action="store_true", help="Enable parallel log collection with devkit/ksys/ub_watch/smap_bw"
+        "--enable-capture", action="store_true", help="Enable parallel log collection with devkit/ksys/ub_watch/getfre"
     )
     parser.add_argument(
         "--auto-skip", action="store_true", help="Auto-skip missing log capture tools (for automated testing)"

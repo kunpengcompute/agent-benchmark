@@ -302,7 +302,7 @@ table is still written.
 
 ## 2.3 External hardware profiler sheets (`--enable-capture`)
 
-These sheets are written only when the corresponding tool log exists in `--log-dir` (tools run in parallel via `LogCapture` when `--enable-capture` is passed). Tool paths come from `.env` (`DEVKIT_PATH`, `KSYS_PATH`, `UB_WATCH_PATH`, `SMAP_BW_PATH`, `GETFRE_PATH`). See [vm-monitor usage guide](../guide/vm-monitor-usage.md).
+These sheets are written only when the corresponding tool log exists in `--log-dir` (tools run in parallel via `LogCapture` when `--enable-capture` is passed). Tool paths come from `.env` (`DEVKIT_PATH`, `KSYS_PATH`, `UB_WATCH_PATH`, `GETFRE_PATH`). See [vm-monitor usage guide](../guide/vm-monitor-usage.md).
 
 ### `DevKit_TopDown` — columns `Metric` | `Value` | `Report Count`
 
@@ -365,22 +365,6 @@ NUMA interconnect latency (8 rows):
 `Chip` | `Ports` | `Avg Write (MB/s)` | `Avg Read (MB/s)` | `Avg Sum (MB/s)` | `Max Write (MB/s)` | `Max Read (MB/s)` | `Max Sum (MB/s)`
 
 One row per chip+port group.
-
-### `SMAPBW_Summary` — columns `Metric` | `Value`
-
-SMAP (Secure Memory Access Protection) migration bandwidth:
-
-| Metric string | Meaning |
-|---------------|---------|
-| `Total Cycles` | Total migration cycles |
-| `Total Pages` | Total migrated pages |
-| `Avg Bandwidth (GB/s)` | Average migration bandwidth |
-| `Min Bandwidth (GB/s)` | Minimum bandwidth |
-| `Max Bandwidth (GB/s)` | Maximum bandwidth |
-
-### `SMAPBW_Cycles`
-
-`Cycle` | `Pages` | `Duration (s)` | `Bandwidth (GB/s)` plus dynamic `N{x}->N{y}_pages` direction columns (one per migration direction).
 
 ### `Getfre_Summary` — core frequency per NUMA
 
@@ -943,7 +927,7 @@ record loop) is always on; only the auxiliary resource collectors toggle.
 
 The devkit split is necessary because `devkit_path` is shared by both sub-tools
 — `.env` path control cannot run only one. The other external profilers
-(ksys / ub_watch / smap_bw / getfre) stay `.env`-path-controlled (a missing
+(ksys / ub_watch / getfre) stay `.env`-path-controlled (a missing
 path already skips them).
 
 `ublk`, `ublk_daemon`, and `disk` are independent histories. Disabling `disk`
@@ -998,5 +982,5 @@ timeline sheet's presence to tell them apart (absent sheet = not collected).
 
 ## Related documentation
 
-- [vm-monitor usage guide](../guide/vm-monitor-usage.md): `.env` paths + flags for devkit / ksys / ub_watch / smap_bw / uprof / getfre.
+- [vm-monitor usage guide](../guide/vm-monitor-usage.md): `.env` paths + flags for devkit / ksys / ub_watch / uprof / getfre.
 - [bench-core usage (中文)](../guide/bench-core-usage-zh.md): `bench-core` install → config → CLI → cleanup → troubleshooting.

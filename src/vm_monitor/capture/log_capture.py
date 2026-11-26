@@ -1,13 +1,13 @@
 """
 Parallel Log Collection Module
 
-Runs multiple log collection tools (devkit, ksys, ub_watch, smap_bw, getfre)
+Runs multiple log collection tools (devkit, ksys, ub_watch, getfre)
 in parallel subprocesses and threads, synchronized with QEMU monitoring duration.
 
 Log-rotation mode (``log_rotation=True``): devkit (top-down + memory in
 parallel) -> ksys -> ``perf stat`` -> AMDuProfPcm rotate one slot at a time
 for the whole stress window instead of running everything concurrently;
-ub_watch / smap_bw / getfre keep their all-parallel behavior. Each turn
+ub_watch / getfre keep their all-parallel behavior. Each turn
 writes a timestamped log under
 ``<rotation_log_dir>/{devkit/{topdown,memory},ksys,perf,uprof}/``.
 ``rotation_tools`` (``--rotation-tools`` / ``monitor.log_rotation.tools:``)
@@ -50,7 +50,7 @@ _ROTATION_RENAMED_REPORT = re.compile(r"^\d{8}-\d{6}_report\.json$")
 
 
 class LogCapture:
-    """Parallel log collection with devkit, ksys, ub_watch, smap_bw, uprof
+    """Parallel log collection with devkit, ksys, ub_watch, uprof
 
     Runs collection tools in background, synchronized with QEMU monitoring duration.
     All output is redirected to log files, not interfering with terminal display.
@@ -62,7 +62,6 @@ class LogCapture:
         "devkit_top_down": 60,
         "ub_watch": 60,
         "ksys": 600,  # ksys needs extra time for data parsing (can be minutes)
-        "smap_bw": 60,  # smap_bw follows duration + some buffer
     }
 
     def __init__(
@@ -97,7 +96,7 @@ class LogCapture:
                 -> ksys -> perf stat -> AMDuProfPcm rotate one slot per
                 rotation_interval instead of running all tools concurrently.
                 devkit/ksys leave the parallel set (they rotate);
-                ub_watch/smap_bw/getfre are unchanged. Each turn writes a
+                ub_watch/getfre are unchanged. Each turn writes a
                 timestamped log under rotation_log_dir.
             rotation_interval: per-slot collection duration in seconds (default 15).
                 Accepts an int (applies to every tool) or a dict mapping
@@ -271,32 +270,6 @@ class LogCapture:
 
         cmd = [self.config["ub_watch_path"], "-t", str(self.duration), "-i", "3"]
         return self._start_tool("ub_watch", cmd, "ub_watch.log", f"Started ub_watch (duration={self.duration}s)")
-
-    def _start_smap_bw(self) -> tuple:
-        """Start smap_bw SMAP migration bandwidth monitor
-
-        Returns:
-            (success: bool, error_msg: str or None)
-        """
-        if not self.config.get("smap_bw_path"):
-            return (False, "smap_bw_path not configured")
-
-        # smap_bw requires sudo for dmesg access
-        # Command: sudo python3 <script_path> --clear --duration <dur> --timeout <dur+10>
-        timeout = self.duration + 10  # Extra buffer for cleanup
-        cmd = [
-            "sudo",
-            "python3",
-            self.config["smap_bw_path"],
-            "--clear",
-            "--duration",
-            str(self.duration),
-            "--timeout",
-            str(timeout),
-        ]
-        return self._start_tool(
-            "smap_bw", cmd, "smap_bw.log", f"Started smap_bw (duration={self.duration}s, timeout={timeout}s)"
-        )
 
     def _start_getfre(self) -> tuple:
         """Start getfre core frequency collector
@@ -958,7 +931,7 @@ class LogCapture:
         success = []
         failed = []
         # Rotation mode moves devkit/ksys out of the parallel set (they rotate
-        # on the rotation thread instead); ub_watch/smap_bw/getfre are unchanged.
+        # on the rotation thread instead); ub_watch/getfre are unchanged.
         rotate = self.log_rotation
 
         # Start DevKit memory tuner
@@ -995,14 +968,6 @@ class LogCapture:
         elif err and "not configured" not in err:
             failed.append(("ub_watch", err))
             self.failed_startup.append("ub_watch")
-
-        # Start smap_bw
-        ok, err = self._start_smap_bw()
-        if ok:
-            success.append("smap_bw")
-        elif err and "not configured" not in err:
-            failed.append(("smap_bw", err))
-            self.failed_startup.append("smap_bw")
 
         # Start getfre core frequency collector
         ok, err = self._start_getfre()
@@ -1395,7 +1360,6 @@ class LogCapture:
             "devkit_top_down": os.path.join(self.log_dir, "devkit_top_down.log"),
             "ksys": os.path.join(self.log_dir, "ksys.log"),
             "ub_watch": os.path.join(self.log_dir, "ub_watch.log"),
-            "smap_bw": os.path.join(self.log_dir, "smap_bw.log"),
             **getfre_logs,  # Add getfre log files
         }
         if self.log_rotation:

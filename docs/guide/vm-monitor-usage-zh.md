@@ -1,6 +1,6 @@
 # vm_monitor 使用指南
 
-`vm_monitor` 是 agent-benchmark 的宿主机级资源监控工具。它采样 VM/VMM 进程及宿主机 `/proc`、`/sys` 计数器，并可选地并行驱动外部性能采集工具（devkit、ksys、ub_watch、smap_bw、getfre）。输出：常开的 `raw_data/` 原始 CSV、深色主题 SVG 时序曲线、汇总的 `resource_report.xlsx`，以及由原始 CSV 事后派生的逐采样时序 `host_resources.xlsx`。
+`vm_monitor` 是 agent-benchmark 的宿主机级资源监控工具。它采样 VM/VMM 进程及宿主机 `/proc`、`/sys` 计数器，并可选地并行驱动外部性能采集工具（devkit、ksys、ub_watch、getfre）。输出：常开的 `raw_data/` 原始 CSV、深色主题 SVG 时序曲线、汇总的 `resource_report.xlsx`，以及由原始 CSV 事后派生的逐采样时序 `host_resources.xlsx`。
 
 - 入口：`vm-monitor`（`vm_monitor.cli:main`），由 `pip install -e .` 注册
 - 模块直调：`python3 -m vm_monitor.cli`
@@ -54,7 +54,7 @@ sudo vm-monitor -t 60 -i 2 --vmm qemu
 
 ### 模式 3 —— 计时 + 并行日志采集（`--enable-capture`）
 
-将 devkit/ksys/ub_watch/smap_bw/getfre 作为并行子进程与监控一起运行：
+将 devkit/ksys/ub_watch/getfre 作为并行子进程与监控一起运行：
 
 ```bash
 sudo vm-monitor -t 300 -i 2 --vmm firecracker --enable-capture --auto-skip \
@@ -77,7 +77,7 @@ sudo vm-monitor -t 300 -i 2 --vmm firecracker --enable-capture --auto-skip \
 | `--numa` | `all` | 关注的 NUMA 节点：`all` 或 `0,1` |
 | `--remote-numa` | `5` | 跨 socket"远程借阅"节点，用于空闲内存监控；负值禁用 |
 | `--disks` | `all` | 监控 I/O 的块设备：`all`（自动发现物理设备）或 `sda,nvme0n1` |
-| `--enable-capture` | off | 并行运行 devkit/ksys/ub_watch/smap_bw/getfre |
+| `--enable-capture` | off | 并行运行 devkit/ksys/ub_watch/getfre |
 | `--auto-skip` | off | 静默禁用缺失的采集工具（非交互） |
 | `--ksys-parse-timeout` | `600` | ksys 解析阶段超时（秒） |
 | `--no-svg` | off | 跳过 SVG 时序曲线 |
@@ -114,9 +114,6 @@ KSYS_CONFIG_PATH=/path/to/ksys_config.yaml
 # ub_watch
 UB_WATCH_PATH=/path/to/ub_watch
 
-# smap_bw（经 sudo 运行以访问 dmesg）
-SMAP_BW_PATH=/path/to/smap_bw.py
-
 # AMD uProf（仅 log-rotation 轮转使用；未配置或路径无效时 WARN 并跳过该槽，不阻塞运行。
 # 指标可用 --rotation-uprof-metrics / monitor.log_rotation.uprof_metrics 覆盖，默认 memory,pipeline_util；
 # -O 指向每 turn 独立的 uprof/<stamp>/ 目录（stdout 日志与工具产物同目录，工具在其内自动生成 AMDuProfPcm-Timeseries_* 子目录）——原始产物，不做解析；每 turn 目录会随运行累积（磁盘紧张时请在两次运行之间清理））
@@ -138,7 +135,6 @@ DEVKIT_CPU_RANGE=96-191
 | `DEVKIT_CPU_RANGE` | `devkit_top_down` | top-down CPU 范围 | 可选；由 `--numa` 自动算 |
 | `KSYS_PATH` + `KSYS_CONFIG_PATH` | `ksys` | KSys sheet | **两者均必需** |
 | `UB_WATCH_PATH` | `ub_watch` | UBWatch sheets | 可选 |
-| `SMAP_BW_PATH` | `smap_bw` | SMAPBW sheets | 可选；sudo |
 | `UPROF_PATH` | `uprof`（轮转模式） | `log_capture/uprof/<stamp>/`（日志 + 工具产物） | 可选；仅 `--log-rotation`，未配置或路径无效时 WARN 并跳过该槽（不提示、不阻塞） |
 | `GETFRE_PATH` + `GETFRE_CONFIG_PATH` | `getfre` | Getfre sheets | 可选；配置可从宿主机拓扑自动填充 |
 
@@ -171,7 +167,6 @@ numa_nodes: [0, 1]              # 省略则自动发现
 | **devkit_mem** | `$DEVKIT_PATH tuner memory -d <t> -i 3` | `devkit_mem.log` | DevKit_Memory, NUMA_Bandwidth |
 | **ksys** | `$KSYS_PATH collect -d <t> -i 3 -c $KSYS_CONFIG_PATH` | `ksys.log` | KSys（11 指标） |
 | **ub_watch** | `$UB_WATCH_PATH -t <t> -i 3` | `ub_watch.log` | UBWatch_Latency, UBWatch_Bandwidth |
-| **smap_bw** | `sudo python3 $SMAP_BW_PATH --clear --duration <t> --timeout <t+10>` | `smap_bw.log` | SMAPBW_Summary, SMAPBW_Cycles |
 | **getfre** | 按 NUMA 节点线程化：每核 `$GETFRE_PATH <total_cores> <core_id>` | `getfre_NUMA{N}.log` | Getfre_Summary, Getfre_NUMA{N}, Getfre_Timeline_NUMA{N} |
 
 `<cpu_range>` = `DEVKIT_CPU_RANGE`，或由 `--numa` 经 `/sys/devices/system/node/node{N}/cpulist` 自动计算。两者都无解时 devkit_top_down 被跳过（绝不以错误范围启动）。
@@ -245,14 +240,13 @@ logs_<timestamp>/
 ├── devkit_mem.log
 ├── ksys.log
 ├── ub_watch.log
-├── smap_bw.log
 └── getfre_NUMA{N}.log
 ```
 
 `resource_report.xlsx` 的 sheet（仅汇总）：`Summary`、`NUMA_Overview`、`VM_Stats`，
 外加对应工具日志存在时才写的 profiler sheet —— `DevKit_TopDown`、`DevKit_Memory`、
-`NUMA_Bandwidth`、`KSys`、`UBWatch_Latency`、`UBWatch_Bandwidth`、`SMAPBW_Summary`、
-`SMAPBW_Cycles`、`Getfre_Summary`、`Getfre_NUMA{N}`。
+`NUMA_Bandwidth`、`KSys`、`UBWatch_Latency`、`UBWatch_Bandwidth`、
+`Getfre_Summary`、`Getfre_NUMA{N}`。
 
 `host_resources.xlsx` 的 sheet（逐采样时序，由 `raw_data/` 派生）：`Host resources`、
 `NUMA`、`Per-VM`、`Disk IO`，以及仅在 `--host-proc` 下生成的 `HostProc`。逐列释义见

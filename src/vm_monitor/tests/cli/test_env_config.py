@@ -37,16 +37,9 @@ class TestSaveEnvConfig(unittest.TestCase):
         self.assertIn("UPROF_PATH", content)
         self.assertNotIn("SMAP_BW_PATH", content)
 
-    @unittest.skipUnless(vm_config.DOTENV_AVAILABLE, "python-dotenv not installed")
-    def test_smap_bw_written_without_uprof(self):
-        vm_config.save_env_config({"smap_bw_path": "/fake/smap_bw.py"})
-        content = self._read()
-        self.assertIn("SMAP_BW_PATH", content)
-        self.assertNotIn("UPROF_PATH", content)
-
 
 def _write_required_paths(tmp):
-    """Create real files for the seven required tool paths so the validation
+    """Create real files for the six required tool paths so the validation
     loop never reaches its prompt for them."""
     paths = {}
     for name in (
@@ -54,7 +47,6 @@ def _write_required_paths(tmp):
         "ksys_path",
         "ksys_config_path",
         "ub_watch_path",
-        "smap_bw_path",
         "getfre_path",
         "getfre_config_path",
     ):
