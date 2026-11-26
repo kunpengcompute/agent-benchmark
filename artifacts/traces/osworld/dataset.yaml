@@ -1,0 +1,4 @@
+glob: "*.replay.json"
+trajectory_dirs:
+  arm64: replays-arm
+  x86: replays-x86

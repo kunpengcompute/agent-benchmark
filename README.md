@@ -54,6 +54,14 @@ bash artifacts/images/osworld/download-images.sh
 python3 artifacts/images/osworld/build-template.py
 ```
 
+回放时通过 `--scenario osworld` 选择数据集，按运行压测程序的本机架构自动选择 ARM 或 x86 轨迹：
+
+```bash
+bench-core --provider aenv --config config/common/replay-ephemeral.yaml --scenario osworld -n 18
+```
+
+配置中不要显式设置 `replay.trajectory_dir`、`replay.template_manifest`，以使用场景自动选择的目录和共享映射。
+
 > 只有 AENV 路径需要模板；`fake` 与 `docker` 后端不需要，可以直接跳到下面的快速开始。
 
 ## 快速开始
@@ -96,8 +104,7 @@ bench-core --provider aenv --config config/common/replay-ephemeral.yaml -n 8 --t
 CLI 覆盖，CLI 优先）把 `replay.trajectory_dir` / `replay.template_manifest` 解析到
 `artifacts/traces/swe-bench/{replays,image-map.json}`（glob 取自同目录的 `dataset.yaml`），
 模板名与上一节构建出来的名字一一对应，无需改任何东西。
-换成自己的数据时改 `replay.scenario: <name>` 指向 `artifacts/traces/<name>/`（webArena /
-OSWorld 将来各自一个场景目录，配置零 fork）；或显式改 `replay.trajectory_dir` /
+换成自己的数据时改 `replay.scenario: <name>` 指向 `artifacts/traces/<name>/`；或显式改 `replay.trajectory_dir` /
 `replay.template_manifest`（DIY：显式 pool 完全绕过 scenario，行为与旧版一致）；
 `template_manifest` 不设则所有轨迹退回 `aenv.template`。
 
