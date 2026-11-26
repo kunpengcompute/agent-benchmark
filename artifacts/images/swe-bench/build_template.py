@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 ARCHES = {"arm64": "arm64 linux", "x86": "amd64 linux"}
 
 
@@ -37,7 +37,7 @@ def load_cases(arch, registry):
         encoding="utf-8"))
     if not isinstance(mapping, dict) or not mapping:
         raise ValueError("image-map.json must be a nonempty object")
-    with (ROOT / "artifacts/images/manifest.csv").open(
+    with (ROOT / "artifacts/images/swe-bench/manifest.csv").open(
             encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         required = {"instance_id", "replay_file", "image_arm64", "image_x86"}
@@ -133,7 +133,7 @@ def build(case, arch, timeout, dry_run):
             except subprocess.CalledProcessError as error:
                 raise ValueError(
                     f"Cannot inspect local image {case['remote']}; check Docker "
-                    "and run bash artifacts/images/download-images.sh first "
+                    "and run bash artifacts/images/swe-bench/download-images.sh first "
                     "if the image is missing") from error
             if actual != expected:
                 raise ValueError(f"{case['remote']}: expected {expected}, got {actual}")
