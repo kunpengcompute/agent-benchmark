@@ -179,12 +179,10 @@ def test_load_config_replay_yaml():
     assert config.workflow_config.replay_trajectory_dir == SWE_BENCH_REPLAYS
     assert config.workflow_config.replay_template_manifest == SWE_BENCH_MAP
     assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
-    # mode is omitted so the shared config resolves to each provider's
-    # default (lifecycle for aenv/aenv-go/cubesandbox, exec_only for
-    # e2b/docker/fake/sandboxsched) -- a hardcoded default would make the
-    # shared config fail at startup on providers without a validated
-    # lifecycle (sandboxsched vetoes it).
-    assert config.workflow_config.replay_mode is None
+    # replay.yaml ships as the explicit lifecycle 1:1 baseline (aenv default,
+    # set explicitly so the same config is unambiguous on any provider);
+    # sandboxsched vetoes it at startup until pause/resume is validated.
+    assert config.workflow_config.replay_mode == "lifecycle"
 
 
 def test_load_config_scenario_resolves_trajectory_keys(tmp_path):
@@ -618,5 +616,5 @@ def test_load_config_replay_yaml_has_aenv_block():
     config, raw = load_config("config/common/replay.yaml")
     assert "aenv" in raw
     assert raw["aenv"]["env"]["E2B_API_URL"] == "http://127.0.0.1:8000"
-    # replay.yaml omits mode (resolved to the provider default at runtime).
-    assert "mode" not in raw["replay"]
+    # replay.yaml sets mode explicitly (lifecycle 1:1 baseline).
+    assert raw["replay"]["mode"] == "lifecycle"
