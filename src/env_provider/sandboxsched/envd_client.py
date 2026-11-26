@@ -305,10 +305,57 @@ def _iter_event(event: bytes) -> Iterator[tuple]:
                     yield "stderr", out_value
                 elif out_field == 3:
                     yield "pty", out_value
-        elif field_num == 3:  # EndEvent: exit_code=1 sint32 (zigzag)
+        elif field_num == 3:  # EndEvent
             for end_field, end_wire, end_value in _iter_fields(value):
                 if end_field == 1 and end_wire == 0:
                     yield "exit", (end_value >> 1) ^ -(end_value & 1)
+                elif end_wire == 2:
+                    # envd >= 0.5.15 replaces the numeric exit code with a Go
+                    # ExitError status string ("exit status N" / "signal: NAME").
+                    yield "exit_status", end_value.decode("utf-8", "replace")
+
+
+# POSIX numbers for Go's os.Signal names (os.ProcessState.String() prints
+# "signal: killed"), mirroring the aenv-go worker's table, so a signal death
+# reports the familiar 128+N shell convention instead of an unknown exit.
+_SIGNAL_NUMBERS = {
+    "hangup": 1,
+    "interrupt": 2,
+    "quit": 3,
+    "illegal instruction": 4,
+    "trace/breakpoint trap": 5,
+    "aborted": 6,
+    "bus error": 7,
+    "floating point exception": 8,
+    "killed": 9,
+    "user defined signal 1": 10,
+    "segmentation fault": 11,
+    "user defined signal 2": 12,
+    "broken pipe": 13,
+    "alarm clock": 14,
+    "terminated": 15,
+}
+
+
+def parse_exit_status(status: str) -> int | None:
+    """Exit code from an envd >= 0.5.15 end-event status string, or ``None``.
+
+    Understands the shapes envd >= 0.5.15 puts on end events: ``"exit status N"``
+    (os.Exit-style) and ``"signal: NAME"`` (killed by a signal, reported as the
+    128+N shell convention). Anything else returns ``None`` so the caller can
+    report an unknown exit instead of silently pretending it was a clean run.
+    """
+    if status.startswith("exit status "):
+        rest = status[len("exit status "):]
+        try:
+            return int(rest)
+        except ValueError:
+            return None
+    if status.startswith("signal: "):
+        signal = status[len("signal: "):].strip().lower()
+        number = _SIGNAL_NUMBERS.get(signal)
+        return None if number is None else 128 + number
+    return None
 
 
 # ============================================================================
@@ -419,6 +466,7 @@ class EnvdClient:
 
         stdout, stderr = [], []
         exit_code = None
+        exit_status = None
         saw_trailers = False
         try:
             for flags, payload in _iter_connect_frames(resp):
@@ -441,9 +489,22 @@ class EnvdClient:
                             on_stderr(value)
                     elif kind == "exit":
                         exit_code = value
+                    elif kind == "exit_status":
+                        exit_status = value
         finally:
             resp.close()
 
+        if exit_code is None and exit_status is not None:
+            # envd >= 0.5.15: the end event carries a Go ExitError string instead
+            # of a numeric code; it is authoritative, so a recognized shape maps
+            # to its code and an unrecognized one is reported rather than
+            # collapsed into a phantom exit-0.
+            code = parse_exit_status(exit_status)
+            if code is None:
+                raise EnvdError(
+                    f"envd end event carries an unrecognized exit status {exit_status!r}"
+                )
+            exit_code = code
         if exit_code is None:
             if not saw_trailers:
                 raise EnvdTruncatedError(

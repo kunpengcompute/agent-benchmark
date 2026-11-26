@@ -92,10 +92,12 @@ pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
 
 **aenv-go** 不走 SDK——同一个 AENV 服务端换走常驻 Go worker 客户端(协议 v2,stdin/stdout
-JSON lines),需要先构建 worker 二进制(仓库内标准库依赖,g只需要 Go 1.22+):
+JSON lines)。`pip install -e .` 会自动构建 worker(`setup.py` 的 `build_py` 钩子,仓库内
+标准库依赖,Go 1.22+,缺失时自动引导到 XDG 缓存):
 
 ```bash
-bash go-client/build.sh               # 产出 go-client/bin/agent-benchmark-go
+pip install -e .                      # 产出 go-client/bin/agent-benchmark-go
+bash go-client/build.sh               # 仅用于手动重建
 ```
 
 worker 路径可用 `AGENT_BENCHMARK_GO_BIN` 覆盖,或写在 `aenv_go:` 块的 `go_client_bin` 上

@@ -17,7 +17,7 @@ Scenarios / providers (all behind the SDK-free `env_provider` contract):
 - **E2B Sandbox** — Firecracker microVMs via the E2B API (`--provider e2b`)
 - **Docker Containers** — browser automation in containers (`--provider docker`)
 - **AgentENV** — e2b SDK pointed at an AgentENV server; adds pause/resume + snapshots (`--provider aenv`)
-- **AgentENV Go** — same AgentENV server via a resident Go worker client (`--provider aenv-go`; see `go-client/` for the worker, `aenv_go:` config block falls back to `aenv:` keys)
+- **AgentENV Go** — same AgentENV server via a resident Go worker client (`--provider aenv-go`, the oversub-bench default; see `go-client/` for the worker, `aenv_go:` config block falls back to `aenv:` keys)
 - **CubeSandbox** — Cloud Hypervisor microVMs, full lifecycle (`--provider cubesandbox`)
 - **SandboxSched** — OpenSandbox server (E2B Firecracker runtime), async-SDK sync bridge + envd data-plane client (`--provider sandboxsched`)
 

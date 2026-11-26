@@ -21,7 +21,7 @@
 # running_concurrency, mode, multiplier, round_size, duration, report output).
 base_config: config/common/replay-ephemeral.yaml
 
-provider: aenv
+provider: aenv-go
 
 # N running slots stays fixed; total_count = N * ratio scales per trial.
 # N defaults to base replay.running_concurrency (384 for the aenv 1.5 TiB host).

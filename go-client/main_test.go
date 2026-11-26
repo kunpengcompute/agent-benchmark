@@ -126,6 +126,55 @@ func TestCommandStreamCompleteResponseAndNonzero(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+func TestCommandStreamEndStatusString(t *testing.T) {
+	// envd >= 0.5.15 end events carry no numeric exit code, only a Go
+	// ExitError string ("exit status N"); signal deaths carry "signal: ...".
+	for _, tc := range []struct {
+		name        string
+		end         object
+		wantCode    int
+		wantSignal  string
+		wantUnknown bool
+	}{
+		{"status exit", object{"exited": true, "status": "exit status 0"}, 0, "", false},
+		{"status nonzero", object{"exited": true, "status": "exit status 7"}, 7, "", false},
+		{"signal death", object{"exited": false, "status": "signal: killed"}, 137, "killed", false},
+		{"signal term", object{"exited": false, "status": "signal: terminated"}, 143, "terminated", false},
+		{"unknown signal", object{"exited": false, "status": "signal: synthetic"}, -1, "synthetic", false},
+		{"unknown status", object{"exited": true, "status": "something else"}, -1, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := fixture(t, func(rw http.ResponseWriter, r *http.Request) {
+				rw.Header().Set("Content-Type", "application/connect+json")
+				emit(rw, object{"event": object{"start": object{"pid": 9}}}, false)
+				emit(rw, object{"event": object{"data": object{"stdout": base64.StdEncoding.EncodeToString([]byte("ok"))}}}, false)
+				emit(rw, object{"event": object{"end": tc.end}}, false)
+				emit(rw, object{}, true)
+			})
+			v, e := w.start(context.Background(), object{"sandbox": object{"sandboxID": "s1"}})
+			if e != nil {
+				t.Fatal(e)
+			}
+			result, e := w.handle(context.Background(), "command_wait", v.(object))
+			if e != nil {
+				t.Fatal(e)
+			}
+			m := result.(object)
+			if m["exit_code"] != tc.wantCode || m["stdout"] != "ok" {
+				t.Fatal(m)
+			}
+			if got, _ := m["exit_signal"].(string); got != tc.wantSignal {
+				t.Fatalf("exit_signal = %q, want %q (%v)", got, tc.wantSignal, m)
+			}
+			if got, _ := m["exit_unknown"].(bool); got != tc.wantUnknown {
+				t.Fatalf("exit_unknown = %v, want %v (%v)", got, tc.wantUnknown, m)
+			}
+			if tc.wantUnknown && m["exit_status_raw"] != "something else" {
+				t.Fatalf("unknown exit lost its raw status string: %v", m)
+			}
+		})
+	}
+}
 func TestDisconnectedStreamIsNotSuccessfulExit(t *testing.T) {
 	w := fixture(t, func(rw http.ResponseWriter, r *http.Request) {
 		emit(rw, object{"event": object{"start": object{"pid": 3}}}, false)

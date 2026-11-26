@@ -126,6 +126,19 @@ oversub-bench --config config/common/replay.yaml --provider aenv --ratios 1,2,3 
 `--output-root`、`--reuse`、`--stop-on-failure`、`--dry-run`、`--no-vm-monitor`、`--auto-compare`、
 `--bench-core-bin`)。
 
+### 1.4 默认 provider 迁移(aenv → aenv-go)
+
+从本版本起内置默认 `provider` 是 `aenv-go`,随仓库分发的 `config/oversub/*.yaml` 也改为
+`aenv-go`。这是一次行为变更,需要留意:
+
+- **preflight**:驱动在第一个 trial 之前解析 Go worker(`aenv_go.go_client_bin` →
+  `AGENT_BENCHMARK_GO_BIN` → wheel 包内目录 → 仓库 `go-client/bin/`),缺失或不可执行时
+  **直接退出**并给出修复指引,不会把失败摊到每个 trial 的 create 上。
+- **构建**:`pip install -e .` 会自动构建 worker(见 [go-client README](../../go-client/README.md));
+  仅用 Docker/E2B 或离线 CI 可用 `AGENT_BENCHMARK_SKIP_GO_BUILD=1` 跳过构建。
+- **保持旧行为**:显式传 `--provider aenv`,或在 sweep-config 里写 `provider: aenv`。
+- `--dry-run` 只打印命令,不做二进制 preflight,可离线预览。
+
 ## 2. 写一个 sweep-config
 
 `config/oversub/template.yaml` 是带注释模板;`lifecycle-1to3.yaml` / `exec-ephemeral-1to3.yaml` /
@@ -135,7 +148,7 @@ oversub-bench --config config/common/replay.yaml --provider aenv --ratios 1,2,3 
 | 键 | 默认 | 含义 |
 |-----|------|------|
 | `base_config` | —(必填) | base replay 压力 profile;每 trial 深拷贝 |
-| `provider` | `aenv` | `{aenv, e2b, docker, sandboxsched, cubesandbox, fake}` |
+| `provider` | `aenv-go` | `{aenv-go, aenv, e2b, docker, sandboxsched, cubesandbox, fake}`;需先构建 Go worker(见 [go-client README](../../go-client/README.md)),缺二进制时明确报错不回退 |
 | `running_concurrency` | base `replay.running_concurrency` | 基线 N;lifecycle 时每 trial 放大到 k×N(全量并发),exec mode 保持 N(ratio 基准) |
 | `ratios` | `1,2,3` | k 值(list 或 `"1,2,3"`);`total_count = k×N` |
 | `modes` | `exec_ephemeral,lifecycle` | 要扫的 replay mode(每条曲线;默认 exec_ephemeral 纯 COW 在前,lifecycle 其次);driver 自动套用默认时 WARNING |

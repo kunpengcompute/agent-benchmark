@@ -144,7 +144,7 @@ DEFAULT_TRIAL_TIMEOUT_SEC = 21600
 # sweep-config value is given). Mirrors build_arg_parser; main() resolves
 # CLI flag > sweep-config > these.
 _TRUE_DEFAULTS: dict[str, object] = {
-    "provider": "aenv",
+    "provider": "aenv-go",
     "scenario": None,
     "running_concurrency": None,
     "ratios": "1,2,3",

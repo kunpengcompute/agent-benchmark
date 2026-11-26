@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import statistics
 import subprocess
 import time
@@ -123,7 +124,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sweep-config", default=None, help="sweep-config YAML (all knobs + base_config); CLI flags override it"
     )
     p.add_argument("--config", default=None, help="base replay.yaml (required unless sweep-config sets base_config)")
-    p.add_argument("--provider", default=None, help="provider name (default aenv)")
+    p.add_argument("--provider", default=None, help="provider name; overrides sweep-config (default aenv-go)")
     p.add_argument(
         "--scenario",
         default=None,
@@ -720,6 +721,30 @@ def _run_sharded_trial(
     return row
 
 
+def preflight_provider(provider: str, base_yaml: dict) -> None:
+    """Fail once, up front, when the aenv-go worker cannot be resolved.
+
+    The driver shells out to bench-core per trial, so a missing worker would
+    otherwise surface as N separate create failures inside individual trials.
+    """
+    if provider != "aenv-go":
+        return
+    from env_provider.aenv_go.bridge import binary_path
+
+    configured = (base_yaml.get("aenv_go") or {}).get("go_client_bin")
+    try:
+        path = binary_path(configured)
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"provider aenv-go is the oversub default, but its Go worker is missing.\n{exc}\n"
+            "Build it with `pip install -e .` (or `bash go-client/build.sh`), set "
+            "AGENT_BENCHMARK_GO_BIN, or pass --provider aenv for the e2b SDK path."
+        ) from exc
+    if not os.access(path, os.X_OK):
+        raise SystemExit(f"Go worker {path} is not executable; rebuild it with `bash go-client/build.sh`")
+    logger.info("preflight: aenv-go worker %s", path)
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
     args = build_arg_parser().parse_args(argv)
@@ -783,6 +808,11 @@ def main(argv: list[str] | None = None) -> int:
     args.no_vm_monitor = resolve("no_vm_monitor")
     args.bench_core_bin = _coerce_cmd(resolve("bench_core_bin"))
     args.auto_compare = resolve("auto_compare")
+
+    # Fail before the first trial when the default aenv-go worker is missing
+    # (dry-run only prints commands, so it must not require the binary).
+    if not args.dry_run:
+        preflight_provider(args.provider, base_yaml)
 
     output_root_arg = resolve("output_root")
     if output_root_arg:

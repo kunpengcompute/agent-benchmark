@@ -19,6 +19,7 @@ from env_provider.sandboxsched.envd_client import (
     EnvdClient,
     EnvdError,
     EnvdTruncatedError,
+    parse_exit_status,
     _frame,
     _iter_connect_frames,
     _ld,
@@ -134,3 +135,38 @@ class TestRun:
         with pytest.raises(EnvdError, match="code= PERMISSIONS") as excinfo:
             _client_with(data).run("denied")
         assert not isinstance(excinfo.value, EnvdTruncatedError)
+
+
+# -------------------------------------------------------------------- envd >= 0.5.15 status strings
+class TestStatusStringEndEvents:
+    """envd >= 0.5.15 replaces the end event's numeric exit code with a Go
+    ExitError status string ("exit status N" / "signal: NAME"); a failure must
+    keep its code instead of collapsing into a phantom exit-0."""
+
+    @staticmethod
+    def _status_event(status: str) -> bytes:
+        # EndEvent carries the status as a string field (wire type 2) where
+        # older envds emitted the numeric zigzag (wire type 0).
+        return _ld(1, _ld(3, _ld(1, status.encode())))
+
+    def test_exit_status_string_yields_the_code(self):
+        data = _frame(_stdout_event(b"out") + self._status_event("exit status 1")) + _end_frame()
+        result = _client_with(data).run("false")
+        assert result.exit_code == 1
+        assert result.stdout == b"out"
+
+    def test_signal_status_maps_to_128_plus_n(self):
+        data = _frame(self._status_event("signal: killed")) + _end_frame()
+        result = _client_with(data).run("killed")
+        assert result.exit_code == 137
+
+    def test_unrecognized_status_raises(self):
+        data = _frame(self._status_event("some weird failure")) + _end_frame()
+        with pytest.raises(EnvdError, match="unrecognized exit status"):
+            _client_with(data).run("weird")
+
+    def test_parse_exit_status_shapes(self):
+        assert parse_exit_status("exit status 3") == 3
+        assert parse_exit_status("exit status 0") == 0
+        assert parse_exit_status("signal: terminated") == 143
+        assert parse_exit_status("garbage") is None
