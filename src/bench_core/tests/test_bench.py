@@ -198,6 +198,113 @@ def test_load_config_scenario_resolves_trajectory_keys(tmp_path):
     assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
 
 
+@pytest.mark.parametrize(
+    ("machine", "directory"),
+    [("aarch64", "replays-arm"), ("arm64", "replays-arm"), ("x86_64", "replays-x86"), ("AMD64", "replays-x86")],
+)
+def test_load_config_osworld_scenario_selects_native_pool(tmp_path, monkeypatch, machine, directory):
+    from bench_core.bench import load_config
+    from bench_core.payload.replay_payload import load_pool
+
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    monkeypatch.chdir(tmp_path)
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: swe-bench\n  mode: exec_ephemeral\n", encoding="utf-8")
+    config, raw = load_config(yml, scenario="osworld")
+    dataset = TRACES_ROOT / "osworld"
+    assert config.workflow_config.replay_trajectory_dir == (dataset / directory).as_posix()
+    assert config.workflow_config.replay_template_manifest == (dataset / "image-map.json").as_posix()
+    assert raw["replay"]["scenario"] == "osworld"
+    pool = load_pool(config)
+    assert len(pool) == 18
+    assert sum(len(trajectory.steps) for trajectory in pool) == 342
+    assert all(trajectory.template == "osworld" for trajectory in pool)
+
+
+def test_load_config_osworld_scenario_from_yaml(tmp_path, monkeypatch):
+    from bench_core.bench import load_config
+
+    monkeypatch.setattr("platform.machine", lambda: "aarch64")
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  scenario: osworld\n", encoding="utf-8")
+    config, _ = load_config(yml)
+    assert config.workflow_config.replay_trajectory_dir == (TRACES_ROOT / "osworld" / "replays-arm").as_posix()
+    assert config.workflow_config.replay_scenario == "osworld"
+
+
+def test_load_config_osworld_scenario_rejects_unsupported_architecture(tmp_path, monkeypatch):
+    from bench_core.bench import load_config
+
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\nreplay:\n  mode: exec_only\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="architecture.*riscv64"):
+        load_config(yml, scenario="osworld")
+
+
+def test_osworld_explicit_pool_bypasses_architecture_selection(tmp_path, monkeypatch):
+    from bench_core.bench import load_config
+
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    pool = tmp_path / "custom"
+    pool.mkdir()
+    yml = tmp_path / "replay.yaml"
+    yml.write_text(f"workflow_type: replay\nreplay:\n  trajectory_dir: {pool.as_posix()}\n", encoding="utf-8")
+    config, _ = load_config(yml, scenario="osworld")
+    assert config.workflow_config.replay_trajectory_dir == pool.as_posix()
+    assert config.workflow_config.replay_template_manifest is None
+
+
+def test_scenario_checks_selected_architecture_pool_exists(tmp_path, monkeypatch):
+    from bench_core import bench_cli
+
+    dataset = tmp_path / "traces" / "native"
+    (dataset / "replays-x86").mkdir(parents=True)
+    (dataset / "image-map.json").write_text("{}", encoding="utf-8")
+    (dataset / "dataset.yaml").write_text(
+        "trajectory_dirs:\n  arm64: replays-arm\n  x86: replays-x86\n", encoding="utf-8")
+    monkeypatch.setattr(bench_cli, "TRACES_ROOT", dataset.parent)
+    monkeypatch.setattr("platform.machine", lambda: "aarch64")
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="replays-arm"):
+        bench_cli.load_config(yml, scenario="native")
+
+
+@pytest.mark.parametrize("directory", ["../outside", "/absolute", "nested/replays", None, 42])
+def test_scenario_rejects_invalid_architecture_pool_directory(tmp_path, monkeypatch, directory):
+    import yaml
+
+    from bench_core import bench_cli
+
+    dataset = tmp_path / "traces" / "custom"
+    dataset.mkdir(parents=True)
+    (dataset / "dataset.yaml").write_text(yaml.safe_dump({"trajectory_dirs": {"arm64": directory}}), encoding="utf-8")
+    (dataset / "image-map.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bench_cli, "TRACES_ROOT", dataset.parent)
+    monkeypatch.setattr("platform.machine", lambda: "aarch64")
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="relative directory name"):
+        bench_cli.load_config(yml, scenario="custom")
+
+
+@pytest.mark.parametrize("mapping", ["replays", []])
+def test_scenario_rejects_invalid_architecture_mapping(tmp_path, monkeypatch, mapping):
+    import yaml
+
+    from bench_core import bench_cli
+
+    dataset = tmp_path / "traces" / "custom"
+    dataset.mkdir(parents=True)
+    (dataset / "dataset.yaml").write_text(yaml.safe_dump({"trajectory_dirs": mapping}), encoding="utf-8")
+    monkeypatch.setattr(bench_cli, "TRACES_ROOT", dataset.parent)
+    yml = tmp_path / "replay.yaml"
+    yml.write_text("workflow_type: replay\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="trajectory_dirs must map architectures"):
+        bench_cli.load_config(yml, scenario="custom")
+
+
 def test_load_config_explicit_trajectory_dir_wins_over_scenario(tmp_path):
     from bench_core.bench import load_config
 

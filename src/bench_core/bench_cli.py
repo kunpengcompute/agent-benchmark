@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import platform
 import re
 import time
 from pathlib import Path
@@ -102,25 +103,45 @@ TRACES_ROOT = Path(__file__).resolve().parents[2] / "artifacts" / "traces"
 _SCENARIO_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def _dataset_glob(scenario_dir: Path) -> str:
-    """``glob`` from ``artifacts/traces/<scenario>/dataset.yaml``; fallback default."""
+def _dataset_metadata(scenario_dir: Path) -> dict[str, Any]:
+    """Read optional dataset metadata; malformed or absent metadata uses defaults."""
     import yaml
 
-    default = "*.replay.json"
     try:
         meta_doc = yaml.safe_load((scenario_dir / "dataset.yaml").read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
-        return default
-    if not isinstance(meta_doc, dict):  # empty file, or a root node that is not a mapping
-        return default
-    dataset_glob = meta_doc.get("glob")
+        return {}
+    return meta_doc if isinstance(meta_doc, dict) else {}
+
+
+def _dataset_glob(scenario_dir: Path) -> str:
+    """``glob`` from ``artifacts/traces/<scenario>/dataset.yaml``; fallback default."""
+    default = "*.replay.json"
+    dataset_glob = _dataset_metadata(scenario_dir).get("glob")
     return dataset_glob if isinstance(dataset_glob, str) and dataset_glob else default
+
+
+def _dataset_trajectory_dir(scenario_dir: Path) -> Path:
+    """Select an optional native-architecture pool, otherwise use ``replays/``."""
+    directories = _dataset_metadata(scenario_dir).get("trajectory_dirs")
+    if directories is None:
+        return scenario_dir / "replays"
+    if not isinstance(directories, dict):
+        raise ValueError(f"{scenario_dir}/dataset.yaml: trajectory_dirs must map architectures to directory names")
+    machine = platform.machine().lower()
+    architecture = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86", "amd64": "x86"}.get(machine, machine)
+    if architecture not in directories:
+        raise ValueError(f"replay scenario {scenario_dir.name!r} has no trajectory directory for architecture {machine!r}")
+    directory = directories[architecture]
+    if not isinstance(directory, str) or not _SCENARIO_NAME.fullmatch(directory):
+        raise ValueError(f"{scenario_dir}/dataset.yaml: trajectory_dirs values must be a single relative directory name")
+    return scenario_dir / directory
 
 
 def _scenario_dataset_problem(scenario: str) -> str | None:
     """Why ``scenario`` cannot serve as a dataset, or None when it can.
 
-    Checked once here, at resolution time: the pool (``replays/``) and the
+    Checked once here, at resolution time: the selected trajectory pool and the
     manifest (``image-map.json``) are what the loader needs, and failing now
     (with the available scenarios) beats a later ``not readable at ...`` from
     ``load_pool`` or -- worse -- a silently empty pool that replays 0 steps.
@@ -133,11 +154,16 @@ def _scenario_dataset_problem(scenario: str) -> str | None:
             f"available: {available}. Omit --scenario (default swe-bench) or set "
             "replay.trajectory_dir in the config to override."
         )
-    missing = [name for name in ("replays", "image-map.json") if not (scenario_dir / name).exists()]
+    trajectory_dir = _dataset_trajectory_dir(scenario_dir)
+    missing = []
+    if not trajectory_dir.is_dir():
+        missing.append(trajectory_dir.name + "/")
+    if not (scenario_dir / "image-map.json").is_file():
+        missing.append("image-map.json")
     if missing:
         return (
             f"replay scenario {scenario!r} is missing {', '.join(missing)} under {scenario_dir.as_posix()}/; "
-            "a dataset dir needs replays/ (trajectory pool) and image-map.json (trajectory -> template), "
+            "a dataset dir needs a trajectory pool directory and image-map.json (trajectory -> template), "
             "or set replay.trajectory_dir explicitly for a custom pool."
         )
     return None
@@ -146,9 +172,10 @@ def _scenario_dataset_problem(scenario: str) -> str | None:
 def _apply_scenario_override(raw: dict[str, Any], scenario: str, *, explicit: bool) -> None:
     """Point the replay trajectory pool + template map at a dataset scenario.
 
-    ``artifacts/traces/<scenario>/`` owns the trajectory pool (``replays/``), the
+    ``artifacts/traces/<scenario>/`` owns the trajectory pool (``replays/`` by default), the
     authoritative trajectory->template map (``image-map.json``) and the dataset
-    metadata (``dataset.yaml``, ``glob:``). An explicit ``replay.trajectory_dir``
+    metadata (``dataset.yaml``, ``glob:``, optional ``trajectory_dirs:`` by architecture).
+    An explicit ``replay.trajectory_dir``
     in the YAML wins over the scenario entirely (custom pool escape hatch);
     otherwise every replay pointer key derives from the scenario, as absolute
     paths so a config authored here stays valid from any working directory. The
@@ -190,7 +217,7 @@ def _apply_scenario_override(raw: dict[str, Any], scenario: str, *, explicit: bo
         logger.warning(f"{problem} -- continuing without a scenario dataset (every sandbox replays 0 steps)")
         return
     scenario_dir = TRACES_ROOT / scenario
-    replay.setdefault("trajectory_dir", (scenario_dir / "replays").as_posix())
+    replay.setdefault("trajectory_dir", _dataset_trajectory_dir(scenario_dir).as_posix())
     replay.setdefault("template_manifest", (scenario_dir / "image-map.json").as_posix())
     replay.setdefault("trajectory_glob", _dataset_glob(scenario_dir))
     replay["scenario"] = scenario

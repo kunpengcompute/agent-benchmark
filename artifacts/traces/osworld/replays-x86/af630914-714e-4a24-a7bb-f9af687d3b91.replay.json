@@ -1,0 +1,105 @@
+{
+  "environment": "main",
+  "instance_id": "af630914-714e-4a24-a7bb-f9af687d3b91",
+  "trajectory": [
+    {
+      "action": "bash /opt/osworld/prepare.sh --task af630914-714e-4a24-a7bb-f9af687d3b91",
+      "delay_time": 0,
+      "source_delay_us": 0,
+      "phase": "prepare"
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\nimport pyautogui; import pyautogui; pyautogui.click(1896, 89, clicks=1, button='\"'\"'left'\"'\"'); '",
+      "delay_time": 0.0,
+      "source_delay_us": 0,
+      "source_record": {
+        "step_num": 1,
+        "action_timestamp": "20250725@071634",
+        "action": "import pyautogui; import pyautogui; pyautogui.click(1896, 89, clicks=1, button='left'); ",
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_1_20250725@071634.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\nimport pyautogui; import pyautogui; pyautogui.click(1580, 767, clicks=1, button='\"'\"'left'\"'\"'); '",
+      "delay_time": 54.0,
+      "source_delay_us": 54000000,
+      "source_record": {
+        "step_num": 2,
+        "action_timestamp": "20250725@071728",
+        "action": "import pyautogui; import pyautogui; pyautogui.click(1580, 817, clicks=1, button='left'); ",
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_2_20250725@071728.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\nimport pyautogui; import pyautogui; pyautogui.click(170, 397, clicks=1, button='\"'\"'left'\"'\"'); '",
+      "delay_time": 67.0,
+      "source_delay_us": 67000000,
+      "source_record": {
+        "step_num": 3,
+        "action_timestamp": "20250725@071835",
+        "action": "import pyautogui; import pyautogui; pyautogui.click(170, 356, clicks=1, button='left'); ",
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_3_20250725@071835.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.scroll(-5, 1200, 900)\n'",
+      "delay_time": 0,
+      "source_delay_us": 0,
+      "adaptation": "User-approved single scroll after source index 3",
+      "source_record": null
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\nimport pyautogui; import pyautogui; pyautogui.click(1214, 910, clicks=1, button='\"'\"'left'\"'\"'); '",
+      "delay_time": 106.0,
+      "source_delay_us": 106000000,
+      "source_record": {
+        "step_num": 4,
+        "action_timestamp": "20250725@072021",
+        "action": "import pyautogui; import pyautogui; pyautogui.click(1214, 730, clicks=1, button='left'); ",
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_4_20250725@072021.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\nimport pyautogui; import pyautogui; pyautogui.click(1214, 1036, clicks=1, button='\"'\"'left'\"'\"'); '",
+      "delay_time": 75.0,
+      "source_delay_us": 75000000,
+      "source_record": {
+        "step_num": 5,
+        "action_timestamp": "20250725@072136",
+        "action": "import pyautogui; import pyautogui; pyautogui.click(1214, 816, clicks=1, button='left'); ",
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_5_20250725@072136.png"
+      }
+    },
+    {
+      "action": "printf '%s\\n' OSWORLD_DONE",
+      "delay_time": 115.0,
+      "source_delay_us": 115000000,
+      "source_record": {
+        "step_num": 6,
+        "action_timestamp": "20250725@072331",
+        "action": "DONE",
+        "reward": 0,
+        "done": true,
+        "info": {
+          "done": true
+        },
+        "screenshot_file": "step_6_20250725@072331.png"
+      }
+    }
+  ]
+}

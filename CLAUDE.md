@@ -277,7 +277,8 @@ config/tools/                getfre_config.yaml (getfre collector template)
 artifacts/traces/swe-bench/replays/   55 bundled trajectories (.replay.json)
 artifacts/traces/swe-bench/image-map.json  trajectory -> template manifest (--scenario default)
 artifacts/traces/swe-bench/dataset.yaml    dataset metadata (glob:) for the swe-bench scenario
-artifacts/images/            image manifest + download-images.sh + build_template.py
+artifacts/images/swe-bench/  image manifest + download-images.sh + build_template.py
+artifacts/images/osworld/    OSWorld download-images.sh + build-template.py
 docs/guide/                  bench-core, oversub-bench and vm-monitor usage guides (EN + zh)
 docs/dev/                    metrics-reference.md (kernel + vm_monitor metrics & formulas)
 agent_replay/                early replay impl, kept for reference (to be deprecated)
