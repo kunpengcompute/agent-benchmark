@@ -1,0 +1,285 @@
+{
+  "environment": "main",
+  "instance_id": "eb03d19a-b88d-4de4-8a64-ca0ac66f426b",
+  "trajectory": [
+    {
+      "action": "bash /opt/osworld/prepare.sh --task eb03d19a-b88d-4de4-8a64-ca0ac66f426b",
+      "delay_time": 0,
+      "source_delay_us": 0,
+      "phase": "prepare"
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.sleep(0.1)\n'",
+      "delay_time": 0.0,
+      "source_delay_us": 0,
+      "source_record": {
+        "step_num": 1,
+        "action_timestamp": "20250722@200039",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "screenshot"
+          },
+          "id": "toolu_bdrk_01844B8iDrcQCKvbvKo9L9e3",
+          "action_type": "tool_use",
+          "command": "pyautogui.sleep(0.1)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_1_20250722@200039.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(244, 258)\n'",
+      "delay_time": 27.0,
+      "source_delay_us": 27000000,
+      "source_record": {
+        "step_num": 2,
+        "action_timestamp": "20250722@200106",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              163,
+              172
+            ]
+          },
+          "id": "toolu_bdrk_01C72UDQHRyFWqYmBKbVBDB3",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(244, 258)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_2_20250722@200106.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.dragTo(640, 322, duration=0.5)\n'",
+      "delay_time": 9.0,
+      "source_delay_us": 9000000,
+      "source_record": {
+        "step_num": 3,
+        "action_timestamp": "20250722@200115",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click_drag",
+            "start_coordinate": [
+              163,
+              172
+            ],
+            "coordinate": [
+              427,
+              215
+            ]
+          },
+          "id": "toolu_bdrk_01SGaZCAgH8SpiUyMnQu9UxF",
+          "action_type": "tool_use",
+          "command": "pyautogui.dragTo(640, 322, duration=0.5)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_3_20250722@200115.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.keyDown('\"'\"'ctrl'\"'\"')\npyautogui.keyDown('\"'\"'c'\"'\"')\npyautogui.keyUp('\"'\"'c'\"'\"')\npyautogui.keyUp('\"'\"'ctrl'\"'\"')\n'",
+      "delay_time": 102.0,
+      "source_delay_us": 102000000,
+      "source_record": {
+        "step_num": 4,
+        "action_timestamp": "20250722@200257",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "key",
+            "text": "ctrl+c"
+          },
+          "id": "toolu_bdrk_01P2FRpGHtxem2xG8Xf88B5v",
+          "action_type": "tool_use",
+          "command": "pyautogui.keyDown('ctrl')\npyautogui.keyDown('c')\npyautogui.keyUp('c')\npyautogui.keyUp('ctrl')\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_4_20250722@200257.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(244, 381)\n'",
+      "delay_time": 28.0,
+      "source_delay_us": 28000000,
+      "source_record": {
+        "step_num": 5,
+        "action_timestamp": "20250722@200325",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              163,
+              254
+            ]
+          },
+          "id": "toolu_bdrk_01VeBUKwuxVxhtHvL4nJWjJU",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(244, 381)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_5_20250722@200325.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.rightClick(244, 381)\n'",
+      "delay_time": 119.0,
+      "source_delay_us": 119000000,
+      "source_record": {
+        "step_num": 6,
+        "action_timestamp": "20250722@200524",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "right_click",
+            "coordinate": [
+              163,
+              254
+            ]
+          },
+          "id": "toolu_bdrk_01V1uAaUencDqB2hdYNL9fd9",
+          "action_type": "tool_use",
+          "command": "pyautogui.rightClick(244, 381)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_6_20250722@200524.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(316, 472)\n'",
+      "delay_time": 15.0,
+      "source_delay_us": 15000000,
+      "source_record": {
+        "step_num": 7,
+        "action_timestamp": "20250722@200539",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              211,
+              315
+            ]
+          },
+          "id": "toolu_bdrk_015sbgMFNWh9qYNrEsqmW4X5",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(316, 472)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_7_20250722@200539.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(538, 600)\n'",
+      "delay_time": 82.0,
+      "source_delay_us": 82000000,
+      "source_record": {
+        "step_num": 8,
+        "action_timestamp": "20250722@200701",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              359,
+              400
+            ]
+          },
+          "id": "toolu_bdrk_017bVFSedTTsbNeU8nahky9B",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(538, 600)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_8_20250722@200701.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(1104, 430)\n'",
+      "delay_time": 104.0,
+      "source_delay_us": 104000000,
+      "source_record": {
+        "step_num": 9,
+        "action_timestamp": "20250722@200845",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              736,
+              287
+            ]
+          },
+          "id": "toolu_bdrk_017NXBiNwU7i9ovunaR6sjUM",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(1104, 430)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_9_20250722@200845.png"
+      }
+    },
+    {
+      "action": "cd /home/user && runuser -u user -- env DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/python3 -c 'import pyautogui; import time; import platform; pyautogui.FAILSAFE = False;\npyautogui.click(1185, 754)\n'",
+      "delay_time": 56.0,
+      "source_delay_us": 56000000,
+      "source_record": {
+        "step_num": 10,
+        "action_timestamp": "20250722@200941",
+        "action": {
+          "name": "computer",
+          "input": {
+            "action": "left_click",
+            "coordinate": [
+              790,
+              503
+            ]
+          },
+          "id": "toolu_bdrk_01XqKK7NTdqNKJK2pUuqRDyz",
+          "action_type": "tool_use",
+          "command": "pyautogui.click(1185, 754)\n"
+        },
+        "reward": 0,
+        "done": false,
+        "info": {},
+        "screenshot_file": "step_10_20250722@200941.png"
+      }
+    },
+    {
+      "action": "printf '%s\\n' OSWORLD_DONE",
+      "delay_time": 34.0,
+      "source_delay_us": 34000000,
+      "source_record": {
+        "step_num": 11,
+        "action_timestamp": "20250722@201015",
+        "action": "DONE",
+        "reward": 0,
+        "done": true,
+        "info": {
+          "done": true
+        },
+        "screenshot_file": "step_11_20250722@201015.png"
+      }
+    }
+  ]
+}
