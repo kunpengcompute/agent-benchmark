@@ -5,7 +5,7 @@
 > New here? The repo [README](../../README.md) has the one-command quick start (fake → docker →
 > aenv); this guide picks up from there.
 >
-> The host-agnostic stress-test kernel. It drives e2b / docker / aenv / aenv-go / cubesandbox / fake
+> The host-agnostic stress-test kernel. It drives e2b / docker / aenv / aenv-go / sandboxsched / cubesandbox / fake
 > backends through the `EnvironmentProvider` abstraction. It coexists with — and shares no code
 > with — the frozen legacy `e2b_bench/` and `docker_bench/`. Adding a backend means one new
 > `env_provider` submodule; the kernel and the contract stay untouched.
@@ -14,17 +14,17 @@
 
 `bench_core` decouples the stress flow from the sandbox implementation: the kernel issues
 every command through a single `exec()` primitive, and a sandbox backend (e2b / docker /
-aenv / aenv-go / cubesandbox / future kata …) only has to run that command inside a sandbox and return the
+aenv / aenv-go / sandboxsched / cubesandbox / future kata …) only has to run that command inside a sandbox and return the
 result. Swapping a backend is therefore just `--provider` — **the same stress profile runs the
 same load curve on any backend**.
 
 - `src/bench_core/` — the kernel: `run_benchmark` spine, stats / round-robin / task
   runners, `KernelConfig`. It never statically imports a backend SDK.
 - `src/env_provider/` — the contract (`EnvironmentProvider` ABC + `SandboxInstance`) and
-  the e2b / docker / aenv / aenv-go / cubesandbox / fake provider impls (opt-in submodules; the contract
+  the e2b / docker / aenv / aenv-go / sandboxsched / cubesandbox / fake provider impls (opt-in submodules; the contract
   itself stays SDK-free).
 - `config/common/` — backend-agnostic workflow configs. Each carries the backend blocks its
-  providers need (`e2b:` + `docker:` for browser/coding/document; `aenv:`/`aenv_go:`/`cubesandbox:` too for
+  providers need (`e2b:` + `docker:` for browser/coding/document; `aenv:`/`aenv_go:`/`sandboxsched:`/`cubesandbox:` too for
   replay); `--provider` selects which block is read.
 
 ---
@@ -101,6 +101,7 @@ The remaining backend SDKs are opt-in — install only the one you use (`fake` n
 
 ```bash
 pip install docker                    # --provider docker
+pip install -e ".[sandboxsched]"      # --provider sandboxsched
 pip install -e ".[cubesandbox]"       # --provider cubesandbox
 ```
 
@@ -128,7 +129,7 @@ against the e2b SDK.
 ### 2.1 File structure
 
 Each YAML in `config/common/` is one workflow and carries the backend blocks its providers need
-(browser/coding/document: `e2b:` + `docker:`; replay: `e2b:` + `docker:` + `aenv:` + `cubesandbox:`):
+(browser/coding/document: `e2b:` + `docker:`; replay: `e2b:` + `docker:` + `aenv:` + `sandboxsched:` + `cubesandbox:`):
 
 ```yaml
 workflow_type: browser        # browser | coding | document | replay
@@ -227,7 +228,7 @@ bench-core --config <yaml> --provider {fake,e2b,docker,aenv,cubesandbox} [mode/p
 | `--create-only` | create + ready-check + persist IDs, then exit (keep running) |
 | `--detect` | reuse existing sandboxes (no create); no cleanup at end |
 | `--warmup-only` | create/detect + warmup, then exit (keep running) |
-| `--cleanup` | list + kill all existing sandboxes, then exit |
+| `--cleanup` | list + kill all existing sandboxes, then exit (sandboxsched scopes this to its own tagged fleet: bench-core-created sandboxes in the config's `sandbox_group`; fleets under another group or tool are left alone) |
 | `-o, --output-dir` | override report output dir |
 | `--report-format` | `txt` (default) / `xlsx` / `both` (xlsx adds an openpyxl workbook) |
 | `--vm-monitor` | `auto` (default, by provider `vmm_type`) / `true` / `false` |

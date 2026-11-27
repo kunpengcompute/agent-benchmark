@@ -1,0 +1,386 @@
+"""SandboxSched :class:`EnvironmentProvider` adapter.
+
+Wraps :class:`env_provider.sandboxsched.manager.SandboxManager` behind the
+kernel's :class:`env_provider.EnvironmentProvider` contract. The manager owns
+the OpenSandbox SDK handles (``SandboxState.sandbox_obj`` -- an async
+``opensandbox.Sandbox``); the adapter translates those into host-agnostic
+:class:`SandboxInstance` objects and routes ``exec`` calls back through the
+manager's handle table -- the kernel never sees an SDK type.
+
+This is the only sandboxsched-specific code the kernel ever loads. It is
+lazy-imported by ``bench_core.bench._build_provider``, so ``bench_core`` itself
+never depends on the opensandbox SDK -- the layering rule (kernel must not
+import provider packages) holds.
+
+Lifecycle / ephemeral support: the OpenSandbox E2B runtime (Firecracker
+microVMs, the default) supports pause/resume, so this provider implements
+:class:`env_provider.LifecycleCapable` (``pause``/``resume`` via the handle's
+``pause`` / the SDK's ``Sandbox.resume``) and :class:`env_provider.
+EphemeralCapable`` (``create_one``/``kill_one`` for trajectory mode). It does
+NOT implement ``SnapshotSizeCapable``: the SDK model carries no snapshot byte
+size (``SnapshotInfo`` has only id / status / created_at) and the server
+rejects ``create_snapshot`` from a paused sandbox, so there is no size to
+report -- the kernel skips the ``snapshot_size`` series event for this
+provider entirely. The containerd runtime has no pause at all; lifecycle
+calls on such a sandbox raise a clear error from the SDK.
+
+``replay.mode=lifecycle`` is currently vetoed (``default_replay_mode =
+"exec_only"``) until a live pause/resume run passes end to end. The veto runs
+at provider build time (``build_provider`` -- the bench-core CLI's argparse
+stage, so an oversub sweep refuses lifecycle trials before any fleet work)
+and ``prepare_env`` re-checks defensively for direct-API callers -- see
+``_ensure_lifecycle_allowed``.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Mapping
+
+from bench_core.config import KernelConfig
+from env_provider import (
+    CommandResult,
+    CreationMetrics,
+    EnvironmentProvider,
+    SandboxInstance,
+    SandboxStatus,
+)
+from env_provider._base import BackendSandboxStatus
+
+from .config import Config
+from .manager import SandboxManager
+from .schemas import SandboxState
+
+logger = logging.getLogger(__name__)
+
+# BackendSandboxStatus.value -> kernel SandboxStatus. The manager sets a
+# BackendSandboxStatus on each state's creation_metrics (PENDING/CREATING/
+# CREATED/PORT_READY/ACTIVE/FAILED/PORT_FAILED/OFFLINE/KILLED -- the shared
+# backend-granular enum from env_provider._base, re-exported via schemas).
+# Keyed by the enum's value string so the lookup stays correct when the enum
+# class is re-bound across the provider/state module boundary (mirrors e2b's
+# _STATUS_MAP). Unknown values map to FAILED defensively.
+_STATUS_MAP: dict[str, SandboxStatus] = {
+    BackendSandboxStatus.PENDING.value: SandboxStatus.PENDING,
+    BackendSandboxStatus.CREATING.value: SandboxStatus.CREATING,
+    BackendSandboxStatus.CREATED.value: SandboxStatus.CREATED,
+    BackendSandboxStatus.PORT_READY.value: SandboxStatus.READY,
+    BackendSandboxStatus.ACTIVE.value: SandboxStatus.ACTIVE,
+    BackendSandboxStatus.FAILED.value: SandboxStatus.FAILED,
+    BackendSandboxStatus.PORT_FAILED.value: SandboxStatus.READY_FAILED,
+    BackendSandboxStatus.OFFLINE.value: SandboxStatus.OFFLINE,
+    BackendSandboxStatus.KILLED.value: SandboxStatus.KILLED,
+}
+
+
+class SandboxSchedProvider(EnvironmentProvider):
+    """EnvironmentProvider backed by a SandboxSched :class:`SandboxManager`.
+
+    The adapter holds the kernel's :class:`KernelConfig` (shared stress params)
+    plus the sandboxsched :class:`Config` (connection, sandbox_group, template,
+    IDs-file path) plus the stop event. The :class:`SandboxManager` is
+    constructed lazily on first use -- so the kernel can run host-side preflight
+    and fail before any SDK client is built. The kernel never sees the manager
+    or SDK types directly.
+    """
+
+    name = "sandboxsched"
+    # OpenSandbox's E2B runtime is Firecracker microVMs (same VMM as e2b/aenv).
+    vmm_type = "firecracker"
+    # Lifecycle-capable in principle, but replay.mode=lifecycle is vetoed until
+    # validated: the state-gated pause/resume path has not been proven against
+    # a live OpenSandbox server yet (a live resume surfaced server-side 500s).
+    # The veto lives in _ensure_lifecycle_allowed -- enforced at provider build
+    # (the CLI's argparse stage) and re-checked in prepare_env -- so an
+    # explicit lifecycle request fails before any fleet work, and the default
+    # mode resolution lands on exec_only. Flip the default (and drop the veto)
+    # once a live run passes end to end.
+    default_replay_mode = "exec_only"
+
+    def __init__(self, kernel_config: KernelConfig, config: Config, stop_event: threading.Event) -> None:
+        self._kernel_config = kernel_config
+        self._config = config
+        self._stop_event = stop_event
+        # Guards the lazy build below (same concurrency story as the manager's
+        # bridge lock -- first access can race under a concurrent create wave).
+        self._manager_lock = threading.Lock()
+        self._manager: SandboxManager | None = None
+
+    @property
+    def manager(self) -> SandboxManager:
+        """The wrapped SandboxManager, constructed on first access.
+
+        Lazy so the kernel's preflight / prepare_env / header-print can run (and
+        fail) before any SDK client is built. Tests inject a mock by setting
+        ``_manager`` directly.
+        """
+        with self._manager_lock:
+            if self._manager is None:
+                self._manager = SandboxManager(self._kernel_config, self._config, self._stop_event)
+        return self._manager
+
+    # ------------------------------------------------------------------ lifecycle
+    def create_all(self, *, templates: dict[int, str | None] | None = None) -> Mapping[int, SandboxInstance]:
+        return self._translate(self.manager.create_all(templates=templates))
+
+    def detect_existing(self) -> Mapping[int, SandboxInstance]:
+        return self._translate(self.manager.detect_existing())
+
+    def list_sandbox_states(self) -> Mapping[str, int] | None:
+        # No manager = nothing was ever created (preflight/cleanup-only runs):
+        # building one here would construct the SDK just to poll a monitor series.
+        if self._manager is None:
+            return None
+        return self.manager.list_states()
+
+    def detect_from_ids(self, ids_file: str | None = None) -> Mapping[int, SandboxInstance] | None:
+        path = ids_file or self._config.sandbox_ids_file
+        if not path:
+            return None
+        return self._translate(self.manager.detect_from_file(path))
+
+    def check_alive(self, inst: SandboxInstance) -> bool:
+        state = self.manager.sandbox_states.get(inst.index)
+        if state is None:
+            return False
+        return self.manager.check_alive(state)
+
+    def cleanup_all(self) -> None:
+        # If the manager was never built (e.g. preflight failed before create),
+        # there is nothing to tear down.
+        if self._manager is None:
+            return
+        self._manager.cleanup_all()
+
+    def cleanup_existing(self) -> int:
+        return self.manager.cleanup_existing()
+
+    # ------------------------------------------------------------------ setup hooks
+    def prepare_env(self) -> None:
+        # Defensive re-check of the build-time veto (see _ensure_lifecycle_allowed):
+        # the bench-core CLI already rejects lifecycle at provider build, so this
+        # only guards direct-API callers who constructed the provider themselves.
+        _ensure_lifecycle_allowed(self._kernel_config)
+        self._config.setup_env()
+
+    # ------------------------------------------------------------------ command exec
+    def exec(
+        self,
+        inst: SandboxInstance,
+        command: str,
+        *,
+        timeout: int | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        state = self.manager.sandbox_states.get(inst.index)
+        if state is None or state.sandbox_obj is None:
+            raise RuntimeError(f"No sandboxsched handle for sandbox index {inst.index}")
+        # E2B-mode sandboxes serve the data plane through envd (Connect RPC),
+        # not the SDK's execd REST contract -- commands.run 404s there by
+        # design. Route through the manager's envd client (server proxy or
+        # direct CNI access per use_server_proxy).
+        exit_code, stdout, stderr = self.manager.envd_exec(
+            state,
+            command,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+        )
+        return CommandResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
+
+    # ------------------------------------------------------------------ id persistence
+    def save_ids(self, instances: Mapping[int, SandboxInstance], ids_file: str | None = None) -> None:
+        path = ids_file or self._config.sandbox_ids_file
+        if not path:
+            return
+        entries = [(inst.id, inst.template) for inst in instances.values() if inst.ready and inst.id]
+        if not entries:
+            logger.warning(f"No ready sandbox IDs to save to {path}")
+            return
+        # Overwrite: each kernel run owns the file (mirrors e2b). Persist
+        # ``<id>\t<template>`` when a concrete template was bound; bare ``<id>``
+        # otherwise. detect_from_file recovers the template so affinity routing
+        # survives the create->detect boundary.
+        with open(path, "w") as handle:
+            for sid, template in entries:
+                if template:
+                    handle.write(f"{sid}\t{template}\n")
+                else:
+                    handle.write(f"{sid}\n")
+        logger.info(f"Saved {len(entries)} sandbox IDs to: {path}")
+
+    # ------------------------------------------------------------------ lifecycle (LifecycleCapable)
+    def pause(self, inst: SandboxInstance) -> None:
+        """Pause the sandbox (async SDK ``Sandbox.pause`` on the bridge loop).
+
+        The sandbox transitions to PAUSED; ``resume`` restores it. The handle
+        stays valid across pause (pause is a server-side state change, not a
+        transport close) -- but resume re-resolves the execd endpoint under a
+        fresh handle, so ``resume`` swaps the handle in.
+        """
+        state = self.manager.sandbox_states.get(inst.index)
+        if state is None or state.sandbox_obj is None:
+            raise RuntimeError(f"No sandboxsched handle for sandbox index {inst.index}")
+        self.manager.pause_handle(state)
+
+    def resume(self, inst: SandboxInstance) -> None:
+        """Resume a paused sandbox (``Sandbox.resume`` by id, on the bridge).
+
+        ``resume`` performs the server-side resume and returns a fresh async
+        ``Sandbox`` (the execd endpoint may change across pause/resume); swap
+        it in (mirrors aenv's resume swapping ``Sandbox.connect``). ``inst.id``
+        is the OpenSandbox sandbox id (set at create via ``_to_instance``); it
+        persists across pause/resume. The old handle's transport is closed
+        after the swap -- each handle owns an httpx pool, and a 384-sandbox
+        lifecycle trial would otherwise accumulate thousands of dead sockets.
+        """
+        state = self.manager.sandbox_states.get(inst.index)
+        if state is None:
+            raise RuntimeError(f"No sandboxsched handle for sandbox index {inst.index}")
+        old_handle = state.sandbox_obj
+        state.sandbox_obj = self.manager.resume_handle(inst.id)
+        if old_handle is not None and old_handle is not state.sandbox_obj:
+            try:
+                self.manager.submit(old_handle.close())
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ ephemeral (EphemeralCapable)
+    def create_one(
+        self, index: int, *, template: str | None = None, metadata: dict[str, str] | None = None
+    ) -> SandboxInstance:
+        """Create a single sandbox on demand (trajectory mode, EphemeralCapable).
+
+        Mirrors the single-sandbox path of ``_create_batch_concurrent``: build a
+        state, run ``_create_single`` (forwarding ``metadata`` + ``template``),
+        populate ``_slot_templates`` so ``_to_instance`` stamps the resolved
+        template onto ``SandboxInstance.template``, run the base readiness
+        probe, and map the result via ``_apply_ready`` -- so timing is
+        consistent with ``create_all``.
+        """
+        mgr = self.manager
+        state = mgr._new_state(index)
+        mgr._states[index] = state
+        result = mgr._create_single(state, metadata=metadata, template=template)
+        label = f"{mgr._noun}{index}"
+        if result["success"]:
+            mgr._slot_templates[index] = result.get("template")
+            ready = mgr._ready_checker().check(
+                mgr._handle_of(state),
+                self._kernel_config.workflow_type,
+                label,
+            )
+            mgr._apply_ready(state, ready, create_elapsed=result["create_elapsed"])
+        else:
+            state.creation_metrics.status = BackendSandboxStatus.FAILED
+            state.creation_metrics.error_msg = result["error"]
+            state.is_alive = False
+            raise RuntimeError(f"create_one({index}) failed: {result['error']}")
+        return self._to_instance(state)
+
+    def kill_one(self, inst: SandboxInstance) -> None:
+        """Tear down a single sandbox (trajectory mode, EphemeralCapable).
+
+        On a successful server-side kill the state is marked ``torn_down`` so
+        the final ``cleanup_all`` skips it (re-killing an already-dead sandbox
+        only yields misleading warnings). A failed kill leaves the flag False so
+        cleanup retries it -- no leak. The handle is kept either way for
+        ``check_alive`` / post-mortem diagnostics.
+        """
+        state = self.manager.sandbox_states.get(inst.index)
+        if state is None:
+            return  # never created (runner finally-path safety)
+        try:
+            if self.manager._handle_of(state) is not None:
+                self.manager._kill_one(state)
+                state.torn_down = True
+        finally:
+            inst.is_alive = False
+            state.is_alive = False
+
+    # ------------------------------------------------------------------ translation
+    def _translate(self, states: Mapping[int, SandboxState]) -> dict[int, SandboxInstance]:
+        """Translate ``{index: SandboxState}`` -> ``{index: SandboxInstance}``."""
+        return {index: self._to_instance(state) for index, state in states.items()}
+
+    def _to_instance(self, state: SandboxState) -> SandboxInstance:
+        cm = state.creation_metrics
+        sbx_id = ""
+        if state.sandbox_obj is not None:
+            # Sandbox.id is the OpenSandbox sandbox id (set at create by
+            # the SDK). Falls back to "" for failed/no-handle states.
+            sbx_id = str(getattr(state.sandbox_obj, "id", "") or "")
+        status = _STATUS_MAP.get(cm.status.value, SandboxStatus.FAILED)
+        return SandboxInstance(
+            id=sbx_id,
+            index=state.sandbox_id,
+            numa_node=None,  # sandboxsched has no client-side NUMA binding
+            ready=(status == SandboxStatus.READY),
+            is_alive=state.is_alive,
+            warmup_done=state.warmup_done,
+            creation_metrics=CreationMetrics(
+                submit_time=cm.submit_time,
+                ready_time=cm.port_ready_time,
+                create_elapsed=cm.create_elapsed,
+                ready_check_elapsed=cm.port_wait_elapsed,
+                total_elapsed=cm.total_elapsed,
+                status=status,
+                error=cm.error_msg,
+                ready_check_error=cm.port_check_error,
+            ),
+            template=self.manager._slot_templates.get(state.sandbox_id),
+        )
+
+
+def _ensure_lifecycle_allowed(kernel_config: KernelConfig) -> None:
+    """Reject replay.mode=lifecycle until pause/resume is validated live.
+
+    The mode machinery is implemented (the provider satisfies LifecycleCapable),
+    but no live OpenSandbox deployment has proven the 202-then-transition path
+    end to end yet -- a live resume surfaced server-side 500s -- so an explicit
+    lifecycle request must fail before any fleet work, not mid-sweep. Called at
+    provider build (``build_provider`` -- the bench-core CLI's argparse stage,
+    so an oversub sweep refuses lifecycle trials at subprocess startup) and
+    re-checked defensively in ``prepare_env``. Cleanup-only runs are exempt:
+    they never touch pause/resume, and a fleet left by a pre-restriction run
+    must stay reachable via ``--cleanup`` (the shared replay.yaml hardcodes mode: lifecycle as the lifecycle baseline; sandboxsched must override replay.mode).
+    """
+    replay_mode = getattr(getattr(kernel_config, "workflow_config", None), "replay_mode", None)
+    if replay_mode == "lifecycle" and not getattr(kernel_config, "cleanup_only", False):
+        raise ValueError(
+            "sandboxsched replay.mode=lifecycle is disabled: pause/resume has "
+            "not been validated against a live OpenSandbox server yet. "
+            "Use exec_only or exec_ephemeral, or omit replay.mode to use the "
+            "provider default (exec_only)."
+        )
+
+
+def from_config(kernel_config: KernelConfig, config: Config, stop_event: threading.Event) -> SandboxSchedProvider:
+    """Build a :class:`SandboxSchedProvider` from a KernelConfig + Config.
+
+    The SandboxManager is constructed lazily on first use, so this is cheap and
+    does not talk to the opensandbox SDK yet.
+    """
+    return SandboxSchedProvider(kernel_config, config, stop_event)
+
+
+def build_provider(config: KernelConfig, raw_config: dict) -> SandboxSchedProvider:
+    """Construct a :class:`SandboxSchedProvider` from a raw YAML dict.
+
+    ``config`` is the already-built :class:`KernelConfig` (shared stress params
+    from :meth:`KernelConfig.from_raw`); the sandboxsched backend Config is
+    rebuilt here from the ``sandboxsched:`` block of the same raw dict. Both are
+    passed to the provider: the kernel drives ``config``, the manager reads
+    backend knobs from the sandboxsched Config.
+
+    This is the bench-core CLI's argparse stage: the replay.mode=lifecycle veto
+    fires HERE (before run_benchmark, before the oversub sweep spawns fleet
+    work), so an explicitly requested unvalidated mode fails at process
+    startup with a clean error instead of inside a trial.
+    """
+    _ensure_lifecycle_allowed(config)
+    stop_event = threading.Event()
+    sched_config = Config.from_raw(raw_config) if raw_config else Config()
+    return from_config(config, sched_config, stop_event)

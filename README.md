@@ -1,10 +1,10 @@
 # agent-benchmark
 
-Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / AgentENV / CubeSandbox 三个受支持后端之间切换，采集沙箱的创建与执行耗时、主机资源指标；超分（overcommit）扫描驱动按不同超分比自动跑一组 trial 并输出退化曲线。以下命令均在仓库根目录执行。
+Agent 负载压测套件：同一份压力配置通过 `--provider` 在 E2B / AgentENV / SandboxSched / CubeSandbox 四个受支持后端之间切换，采集沙箱的创建与执行耗时、主机资源指标；超分（overcommit）扫描驱动按不同超分比自动跑一组 trial 并输出退化曲线。以下命令均在仓库根目录执行。
 
 | 目录 | 内容 | 从哪看 |
 | --- | --- | --- |
-| `src/` | `bench-core` 内核（3 个受支持后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
+| `src/` | `bench-core` 内核（4 个受支持后端）+ `oversub-bench` 扫描驱动 | [快速开始](#快速开始) |
 | `artifacts/` | 55 条代码任务 + 18 条 OSWorld 桌面任务、镜像清单、轨迹 → 模板映射 | [数据集与模板](#数据集与模板) |
 | `agent_replay/` | 早期回放实现，保留仅供参考，后续会 deprecate | — |
 | `docs/guide/` | 中英文使用指南 | [文档](#文档) |
@@ -139,7 +139,9 @@ oversub-bench --provider aenv --sweep-config config/oversub/exec-ephemeral-1to3.
 - **后端**：`fake`（内存，无 SDK）、`docker`、`e2b`、`aenv`（e2b SDK 打 AENV 服务端，带
   pause/resume）、`aenv-go`（同 AENV 服务端，改走常驻 Go worker 客户端，见
   [go-client/README.md](go-client/README.md)；配置在 `aenv_go:` 块逐键回退 `aenv:` 块）、
-  `cubesandbox`。切后端只换 `--provider`，配置文件的共享段不变。
+  `sandboxsched`（OpenSandbox 服务端 + E2B Firecracker 运行时，异步 SDK 同步桥 +
+  envd 数据面，带 pause/resume 与按轨迹临时沙箱）、`cubesandbox`。切后端只换
+  `--provider`，配置文件的共享段不变。
 - **工作流**：browser、coding、document，以及轨迹回放 `replay`
   （`exec_only` / `lifecycle` / `exec_ephemeral`）。
 - **阶段阶梯**：`--create-only` / `--detect` 都会留下运行中的沙箱，收尾用 `--cleanup`。从

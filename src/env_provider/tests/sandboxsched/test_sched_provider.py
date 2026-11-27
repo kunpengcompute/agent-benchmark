@@ -1,0 +1,289 @@
+"""Tests for the SandboxSched provider adapter (:class:`SandboxSchedProvider`).
+
+Mocks the :class:`SandboxManager` so the adapter's translation + exec routing +
+lifecycle/ephemeral/snapshot delegation is tested without the SDK. Mirrors
+``test_e2b_provider.py``'s approach: the manager is the seam, the adapter maps
+SDK types -> kernel contract.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from threading import Event
+from unittest.mock import MagicMock
+
+import pytest
+
+from bench_core.config import KernelConfig
+from bench_core.workflow_registry import ensure_workflow_registered
+
+ensure_workflow_registered("coding")
+from env_provider import SandboxInstance, SandboxStatus
+from env_provider._base import BackendCreationMetrics, BackendSandboxStatus
+from env_provider.sandboxsched import SandboxSchedProvider, build_provider
+from env_provider.sandboxsched.config import Config
+from env_provider.sandboxsched.schemas import SandboxState
+
+
+# -------------------------------------------------------------------- fixtures
+def _kernel_config():
+    cfg = KernelConfig()
+    cfg.total_count = 2
+    cfg.workflow_type = "coding"
+    return cfg
+
+
+def _state(index: int, *, ready: bool = True, sbx_id: str = "sbx-1") -> SandboxState:
+    cm = BackendCreationMetrics()
+    cm.status = BackendSandboxStatus.PORT_READY if ready else BackendSandboxStatus.FAILED
+    cm.create_elapsed = 1.0
+    cm.total_elapsed = 1.5
+    cm.port_wait_elapsed = 0.5
+    cm.port_ready_time = 100.0
+    cm.submit_time = 99.0
+    handle = MagicMock()
+    handle.id = sbx_id
+    return SandboxState(sandbox_id=index, sandbox_obj=handle, creation_metrics=cm, is_alive=ready)
+
+
+@pytest.fixture
+def provider():
+    p = SandboxSchedProvider(_kernel_config(), Config(sandbox_group="sg-1"), Event())
+    p._manager = MagicMock()
+    return p
+
+
+# -------------------------------------------------------------------- translation
+class TestTranslate:
+    def test_to_instance_maps_ready(self, provider):
+        provider._manager._slot_templates = {1: "python:3.11"}
+        inst = provider._to_instance(_state(1, ready=True, sbx_id="abc"))
+        assert inst.id == "abc"
+        assert inst.index == 1
+        assert inst.ready is True
+        assert inst.is_alive is True
+        assert inst.numa_node is None  # sandboxsched has no client-side NUMA
+        assert inst.template == "python:3.11"
+        assert inst.creation_metrics.status == SandboxStatus.READY
+
+    def test_to_instance_maps_failed(self, provider):
+        provider._manager._slot_templates = {}
+        inst = provider._to_instance(_state(2, ready=False))
+        assert inst.ready is False
+        assert inst.creation_metrics.status == SandboxStatus.FAILED
+
+    def test_no_handle_yields_empty_id(self, provider):
+        provider._manager._slot_templates = {}
+        st = _state(1)
+        st.sandbox_obj = None
+        inst = provider._to_instance(st)
+        assert inst.id == ""
+
+
+# -------------------------------------------------------------------- lifecycle delegation
+class TestLifecycle:
+    def test_pause_delegates_to_manager(self, provider):
+        st = _state(1)
+        provider._manager.sandbox_states = {1: st}
+        inst = SandboxInstance(id="x", index=1, ready=True)
+        provider.pause(inst)
+        provider._manager.pause_handle.assert_called_once_with(st)
+
+    def test_pause_missing_state_raises(self, provider):
+        provider._manager.sandbox_states = {}
+        with pytest.raises(RuntimeError, match="No sandboxsched handle"):
+            provider.pause(SandboxInstance(id="x", index=1))
+
+    def test_resume_swaps_handle(self, provider):
+        st = _state(1)
+        provider._manager.sandbox_states = {1: st}
+        new_handle = MagicMock(id="x")
+        provider._manager.resume_handle.return_value = new_handle
+        provider.resume(SandboxInstance(id="x", index=1))
+        assert st.sandbox_obj is new_handle
+        provider._manager.resume_handle.assert_called_once_with("x")
+
+
+# -------------------------------------------------------------------- ephemeral
+class TestEphemeral:
+    def test_create_one_success(self, provider):
+        provider._manager._new_state.return_value = _state(1)
+        provider._manager._create_single.return_value = {"success": True, "create_elapsed": 1.0, "template": "t"}
+        provider._manager._handle_of.return_value = MagicMock()
+        provider._manager._ready_checker.return_value.check.return_value = {
+            "success": True,
+            "wait_elapsed": 0.5,
+            "error": "",
+        }
+        provider._manager._apply_ready = MagicMock()
+        provider._manager._slot_templates = {}
+        inst = provider.create_one(1, template="t")
+        assert inst.index == 1
+        provider._manager._create_single.assert_called_once()
+
+    def test_create_one_failure_raises(self, provider):
+        provider._manager._new_state.return_value = _state(1)
+        provider._manager._create_single.return_value = {
+            "success": False,
+            "create_elapsed": 0.0,
+            "error": "boom",
+            "template": "t",
+        }
+        provider._manager._slot_templates = {}
+        with pytest.raises(RuntimeError, match="create_one"):
+            provider.create_one(1)
+
+    def test_kill_one_marks_torn_down(self, provider):
+        st = _state(1)
+        provider._manager.sandbox_states = {1: st}
+        provider._manager._handle_of.return_value = MagicMock()
+        inst = SandboxInstance(id="x", index=1, ready=True, is_alive=True)
+        provider.kill_one(inst)
+        assert st.torn_down is True
+        assert inst.is_alive is False
+
+    def test_kill_one_missing_state_noop(self, provider):
+        provider._manager.sandbox_states = {}
+        # no raise
+        provider.kill_one(SandboxInstance(id="x", index=99))
+
+
+# -------------------------------------------------------------------- capabilities
+class TestCapabilities:
+    def test_snapshot_sizes_not_implemented(self):
+        # the SDK model carries no snapshot byte size (SnapshotInfo: id/status/
+        # created_at) and create_snapshot is rejected from a paused sandbox --
+        # there is nothing to report, so the provider must NOT claim
+        # SnapshotSizeCapable: the kernel would otherwise start an idle
+        # scanner thread that polls a hook returning None forever
+        from env_provider import SnapshotSizeCapable
+
+        p = SandboxSchedProvider(_kernel_config(), Config(sandbox_group="sg-1", domain=""), Event())
+        p._manager = MagicMock()
+        assert not isinstance(p, SnapshotSizeCapable)
+
+    def test_resume_closes_swapped_out_handle(self, provider):
+        # each handle owns an httpx transport; the old handle's close() must
+        # be submitted after the swap, or a 384-sandbox lifecycle trial
+        # accumulates thousands of dead sockets
+        st = _state(1)
+        old_handle = st.sandbox_obj
+        provider._manager.sandbox_states = {1: st}
+        new_handle = MagicMock(id="x")
+        provider._manager.resume_handle.return_value = new_handle
+        provider.resume(SandboxInstance(id="x", index=1))
+        assert st.sandbox_obj is new_handle
+        provider._manager.submit.assert_called_once_with(old_handle.close())
+
+
+# -------------------------------------------------------------------- fleet state
+class TestListSandboxStates:
+    def test_delegates_to_manager_list_states(self, provider):
+        provider._manager.list_states.return_value = {"running": 2, "paused": 1}
+        assert provider.list_sandbox_states() == {"running": 2, "paused": 1}
+
+    def test_none_manager_returns_none_without_building(self):
+        p = SandboxSchedProvider(_kernel_config(), Config(sandbox_group="sg-1"), Event())
+        assert p.list_sandbox_states() is None
+        assert p._manager is None  # never constructed just to poll the series
+
+
+# -------------------------------------------------------------------- exec
+class TestExec:
+    def test_exec_missing_state_raises(self, provider):
+        provider._manager.sandbox_states = {}
+        with pytest.raises(RuntimeError, match="No sandboxsched handle"):
+            provider.exec(SandboxInstance(id="x", index=1), "echo hi")
+
+    def test_exec_none_handle_raises(self, provider):
+        st = _state(1)
+        st.sandbox_obj = None
+        provider._manager.sandbox_states = {1: st}
+        with pytest.raises(RuntimeError, match="No sandboxsched handle"):
+            provider.exec(SandboxInstance(id="x", index=1), "echo hi")
+
+
+# -------------------------------------------------------------------- build_provider
+class TestBuildProvider:
+    def test_build_from_raw(self):
+        raw = {"sandboxsched": {"sandbox_group": "sg-1", "template": "python:3.11"}}
+        p = build_provider(_kernel_config(), raw)
+        assert isinstance(p, SandboxSchedProvider)
+        assert p._config.sandbox_group == "sg-1"
+
+    def test_build_empty_raw(self):
+        p = build_provider(_kernel_config(), {})
+        assert isinstance(p, SandboxSchedProvider)
+        assert p._config.sandbox_group == ""
+
+
+# -------------------------------------------------------------------- lifecycle restriction
+class TestLifecycleRestriction:
+    """replay.mode=lifecycle is vetoed until pause/resume is validated against
+    a live OpenSandbox server: the mode machinery is implemented (the provider
+    satisfies LifecycleCapable), but a live resume surfaced server-side 500s,
+    so an untestable mode must not burn a fleet. The veto runs at provider
+    BUILD (the bench-core CLI's argparse stage -- an oversub sweep's lifecycle
+    trials refuse at subprocess startup, before any fleet work) and
+    prepare_env re-checks defensively for direct-API callers; the default
+    resolution lands on exec_only."""
+
+    @staticmethod
+    def _kernel_config_with_mode(mode: str, cleanup_only: bool = False) -> KernelConfig:
+        cfg = _kernel_config()
+        cfg.workflow_type = "replay"
+        if cleanup_only:
+            cfg.cleanup_only = True
+        # Mirror the kernel's post-validation state: run_benchmark resolves the
+        # sentinel onto the ReplayConfig view before prepare_env runs.
+        cfg.workflow_config = type("ReplayCfg", (), {"replay_mode": mode})()
+        return cfg
+
+    @classmethod
+    def _provider_with_mode(cls, mode: str, cleanup_only: bool = False) -> SandboxSchedProvider:
+        # domain="" so the pass-case tests stay side-effect-free: a default
+        # Config exports OPEN_SANDBOX_DOMAIN into os.environ
+        return SandboxSchedProvider(
+            cls._kernel_config_with_mode(mode, cleanup_only), Config(sandbox_group="sg-1", domain=""), Event()
+        )
+
+    def test_lifecycle_mode_vetoed_at_build_provider(self):
+        # the argparse-stage veto: fails before run_benchmark, before the
+        # oversub sweep's trial subprocesses do any fleet work
+        raw = {"sandboxsched": {"sandbox_group": "sg-1"}}
+        with pytest.raises(ValueError, match="lifecycle is disabled"):
+            build_provider(self._kernel_config_with_mode("lifecycle"), raw)
+
+    def test_cleanup_only_build_with_lifecycle_mode_is_exempt(self):
+        # --cleanup never touches pause/resume: the fleet left by a
+        # pre-restriction run must stay reachable
+        p = build_provider(self._kernel_config_with_mode("lifecycle", cleanup_only=True), {"sandboxsched": {}})
+        assert isinstance(p, SandboxSchedProvider)
+
+    def test_lifecycle_mode_vetoed_in_prepare_env(self):
+        # the defensive re-check for direct-API callers
+        with pytest.raises(ValueError, match="lifecycle is disabled"):
+            self._provider_with_mode("lifecycle").prepare_env()
+
+    def test_cleanup_only_run_with_lifecycle_mode_is_exempt(self):
+        # --cleanup never touches pause/resume, and the shared replay.yaml
+        # hardcodes mode: lifecycle -- the fleet left by a pre-restriction
+        # run must stay reachable
+        self._provider_with_mode("lifecycle", cleanup_only=True).prepare_env()
+
+    def test_exec_mode_passes_prepare_env(self):
+        self._provider_with_mode("exec_only").prepare_env()
+
+    def test_ephemeral_mode_passes_prepare_env(self):
+        self._provider_with_mode("exec_ephemeral").prepare_env()
+
+    def test_non_replay_workflow_passes_prepare_env(self):
+        # coding/document carry a workflow_config without replay_mode and
+        # browser carries None -- the getattr chain must keep them passing
+        cfg = _kernel_config()  # workflow_type="coding", workflow_config unset
+        p = SandboxSchedProvider(cfg, Config(sandbox_group="sg-1", domain=""), Event())
+        p.prepare_env()
+
+    def test_default_replay_mode_is_exec_only(self):
+        # the sentinel resolution must not walk an untestable mode by default
+        assert SandboxSchedProvider.default_replay_mode == "exec_only"

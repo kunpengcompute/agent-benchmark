@@ -19,6 +19,7 @@ Scenarios / providers (all behind the SDK-free `env_provider` contract):
 - **AgentENV** — e2b SDK pointed at an AgentENV server; adds pause/resume + snapshots (`--provider aenv`)
 - **AgentENV Go** — same AgentENV server via a resident Go worker client (`--provider aenv-go`, the oversub-bench default; see `go-client/` for the worker, `aenv_go:` config block falls back to `aenv:` keys)
 - **CubeSandbox** — Cloud Hypervisor microVMs, full lifecycle (`--provider cubesandbox`)
+- **SandboxSched** — OpenSandbox server (E2B Firecracker runtime), async-SDK sync bridge + envd data-plane client (`--provider sandboxsched`)
 
 The replay workflow (`exec_only` / `lifecycle` / `exec_ephemeral`) replays recorded
 agent trajectories against a backend. The bundled 55-trajectory pool
@@ -106,7 +107,8 @@ ruff format --check .                # format check
 core stack (`psutil`, `paramiko`, `flask`, `PyYAML`, `pandas`, `openpyxl`, `e2b`,
 `aiohttp`); `e2b` is a core dependency pinned 2.46.0. Backend SDKs are otherwise
 optional: `pip install docker` and/or the cubesandbox SDK only when using that
-provider; `--provider fake` needs none.
+provider; the `sandboxsched` extra (`pip install -e '.[sandboxsched]'`) pulls the
+OpenSandbox SDK; `--provider fake` needs none.
 
 `pyproject.toml` sets `pythonpath = ["src"]` for pytest, so tests resolve
 `bench_core` / `env_provider` without an editable install. The `[project.scripts]`
@@ -122,7 +124,7 @@ entries are `bench-core = "bench_core.bench_cli:main"`,
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  CLI / entry                                                 │
-│  bench-core (bench_core.bench_cli.main) --provider {fake,e2b,docker,aenv,aenv-go,cubesandbox} │
+│  bench-core (bench_core.bench_cli.main) --provider {fake,e2b,docker,aenv,aenv-go,cubesandbox,sandboxsched} │
 │  oversub-bench (bench_core.oversub_run.main)                │
 │  oversub-compare (bench_core.compare_sweeps.main)           │
 └─────────────────────────────────────────────────────────────┘
@@ -142,13 +144,14 @@ entries are `bench-core = "bench_core.bench_cli:main"`,
          env_provider.e2b  env_provider.docker  env_provider.aenv  env_provider.cubesandbox
          (opt-in, pulls e2b SDK)  (pulls docker SDK)  (reuses e2b SDK)  (pulls cube SDK)
          env_provider.aenv_go (resident Go worker, no e2b SDK)   env_provider.fake (no SDK)
+         env_provider.sandboxsched (OpenSandbox SDK bridge + envd data plane)
 ```
 
 The kernel (`bench_core`) and every provider impl depend on the contract
 (`env_provider`); neither owns it. The contract stays **SDK-free** —
 `from env_provider import EnvironmentProvider` never imports the e2b, docker, or
 cubesandbox SDK. Providers are **opt-in leaf submodules** loaded only by
-`bench_core.bench._build_provider` when selected, so the kernel never loads a
+`bench_core.bench_cli._build_provider` when selected, so the kernel never loads a
 backend it does not use. Adding a backend is one new `env_provider` submodule;
 contract + kernel untouched.
 
@@ -163,15 +166,15 @@ contract + kernel untouched.
 - `oversub.py` / `oversub_run.py` / `oversub_merge.py` / `oversub_shards.py` / `compare_sweeps.py` — the oversub sweep driver, shard planner, artifact merger, and sweep-comparison tool.
 - `admission.py` (lifecycle admission controller), `transients.py` (transient error detection), `schemas.py` (`BenchSandbox`, `ReplayMetrics`), `utils.py`, `workflow_registry.py`.
 
-**`env_provider` contract** (`src/env_provider/__init__.py`): `EnvironmentProvider` ABC (`create_all`, `detect_existing`, `detect_from_ids`, `save_ids`, `check_alive`, `cleanup_all`, `cleanup_existing`, `prepare_env`, `prepare`, `exec`) + `SandboxInstance` / `CreationMetrics` / `CommandResult` / `SandboxStatus`. `exec()` is the **sole command primitive** — file writes go through `exec` as a heredoc, no separate upload method, so adding a provider is implementing `exec`. The provider keeps any SDK handle internally (`id → handle`); the kernel holds only the host-agnostic `SandboxInstance`. Optional capability Protocols gate lifecycle features: `LifecycleCapable` (`pause`/`resume`), `EphemeralCapable` (`create_one`/`kill_one`), `SnapshotSizeCapable` (`snapshot_sizes`) — `aenv`/`cubesandbox` satisfy these; `e2b`/`docker`/`fake` are exec-only.
+**`env_provider` contract** (`src/env_provider/__init__.py`): `EnvironmentProvider` ABC (`create_all`, `detect_existing`, `detect_from_ids`, `save_ids`, `check_alive`, `cleanup_all`, `cleanup_existing`, `prepare_env`, `prepare`, `exec`) + `SandboxInstance` / `CreationMetrics` / `CommandResult` / `SandboxStatus`. `exec()` is the **sole command primitive** — file writes go through `exec` as a heredoc, no separate upload method, so adding a provider is implementing `exec`. The provider keeps any SDK handle internally (`id → handle`); the kernel holds only the host-agnostic `SandboxInstance`. Optional capability Protocols gate lifecycle features: `LifecycleCapable` (`pause`/`resume`), `EphemeralCapable` (`create_one`/`kill_one`), `SnapshotSizeCapable` (`snapshot_sizes`) — `aenv`/`cubesandbox` satisfy these; `sandboxsched` declares lifecycle + ephemeral only (no `snapshot_sizes`: the SDK model carries no snapshot byte size; `replay.mode=lifecycle` is vetoed at provider build until validated live); `e2b`/`docker`/`fake` are exec-only.
 
 **Shared backend infra** (`src/env_provider/_base.py`, `_ready.py`):
 - `_ready.py` — `ReadyChecker`: workflow-driven poll-until-ready; backend supplies `_exec_probe`. browser=port scan, coding=`uname -a`, document=`document-bench-validate`. Constants `READY_MAX_WAIT=300`, `READY_INTERVAL=5`.
 - `_base.py` — `BackendSandboxStatus` / `BackendCreationMetrics` + `BaseSandboxManager(ABC)` lifecycle template. Subclass supplies SDK seams (`_create_single`, `_list_existing`, `_external_id`, `_attach`, `_kill_one`, `_exec_probe`) + class attrs. `_ready_config` is a concrete base method returning shared constants — readiness is a workflow concern, so there are no per-backend readiness knobs and no `port_check` block in any YAML.
 
-**Provider impls**: `env_provider/e2b/` (`config.py` `setup_e2b_env` + placeholder-credential fallback to `~/.e2b/config.json`, `manager.py`, `schemas.py`), `env_provider/docker/`, `env_provider/aenv/` (`AenvProvider` subclasses `E2BProvider` and reuses the E2B `SandboxManager` handle table + SDK — AENV has no separate SDK, it is the E2B SDK pointed at an AENV server via `E2B_API_URL`; adds `pause`/`resume`, `snapshot_sizes`, `create_one`/`kill_one`), `env_provider/aenv_go/` (`AenvGoProvider` over a resident Go worker subprocess, `go-client/main.go`; a sync `GoBridge` multiplexes the worker's line protocol, no e2b SDK), `env_provider/cubesandbox/`, `env_provider/fake.py`.
+**Provider impls**: `env_provider/e2b/` (`config.py` `setup_e2b_env` + placeholder-credential fallback to `~/.e2b/config.json`, `manager.py`, `schemas.py`), `env_provider/docker/`, `env_provider/aenv/` (`AenvProvider` subclasses `E2BProvider` and reuses the E2B `SandboxManager` handle table + SDK — AENV has no separate SDK, it is the E2B SDK pointed at an AENV server via `E2B_API_URL`; adds `pause`/`resume`, `snapshot_sizes`, `create_one`/`kill_one`), `env_provider/aenv_go/` (`AenvGoProvider` over a resident Go worker subprocess, `go-client/main.go`; a sync `GoBridge` multiplexes the worker's line protocol, no e2b SDK), `env_provider/sandboxsched/` (`SandboxSchedProvider` over the OpenSandbox SDK — async client driven from sync code through one bridge loop with a bounded, shutdown-able lifecycle; envd data plane via a vendored stdlib-only client (exec/health, truncation as its own error type/exit 125); state-gated pause/resume; kills bypass attach so paused fleets clean up; `--cleanup`/`--detect` scope to the fleet tagged at create (`managed_by` + `sandbox_group` metadata filter); replay.mode=lifecycle vetoed at provider build until validated live), `env_provider/cubesandbox/`, `env_provider/fake.py`.
 
-**Config layering**: one `config/common/*.yaml` per workflow carries the per-backend blocks it drives; `--provider` selects which block `Config.from_raw` reads. Browser/coding/document configs carry **both** `e2b:` and `docker:` blocks; replay configs carry `e2b:` / `docker:` / `aenv:` / `cubesandbox:` blocks. The kernel reads only the shared sections. Credential placeholders (`your_e2b_access_token_here` / `your_e2b_api_key_here`) are treated as unset → fall back to `~/.e2b/config.json`.
+**Config layering**: one `config/common/*.yaml` per workflow carries the per-backend blocks it drives; `--provider` selects which block `Config.from_raw` reads. Browser/coding/document configs carry **both** `e2b:` and `docker:` blocks; replay configs carry `e2b:` / `docker:` / `aenv:` / `aenv_go:` / `cubesandbox:` / `sandboxsched:` blocks. The kernel reads only the shared sections. Credential placeholders (`your_e2b_access_token_here` / `your_e2b_api_key_here`) are treated as unset → fall back to `~/.e2b/config.json`.
 
 ### Replay workflow (replay modes)
 
@@ -234,7 +237,7 @@ One bar: **the next reader (or you in three months) changes the code correctly w
 
 | Script | Purpose | CLI |
 |--------|---------|-----|
-| `bench-core` (`bench_core.bench_cli:main`) | host-agnostic kernel | `--config`, `--provider {fake,e2b,docker,aenv,cubesandbox}`, `--create-only`, `--detect`, `--warmup-only`, `--cleanup`, `-n`, `--test-duration`, `--no-vm-monitor`, `--log-level {debug,info,warning}` |
+| `bench-core` (`bench_core.bench_cli:main`) | host-agnostic kernel | `--config`, `--provider {fake,e2b,docker,aenv,cubesandbox,sandboxsched}`, `--create-only`, `--detect`, `--warmup-only`, `--cleanup`, `-n`, `--test-duration`, `--no-vm-monitor`, `--log-level {debug,info,warning}` |
 | `oversub-bench` (`bench_core.oversub_run:main`) | oversub sweep driver | `--sweep-config`, `--config`, `--provider`, `--ratios`, `--modes`, `--running-concurrency`, `--multiplier`, `--shards`, `--repeats`, `--test-duration`, `--output-root`, `--reuse`, `--dry-run`, `--no-vm-monitor` |
 | `oversub-compare` (`bench_core.compare_sweeps:main`) | join sweep dirs into a comparison report | manifest-driven |
 | `vm-monitor` (`vm_monitor.cli:main`) | host-level resource collector (Linux, run as root) | `-t`, `-i`, `--vmm {qemu,firecracker,cubesandbox}`, `--stress-file`, `--enable-capture`, `--host-proc`, `--log-rotation`, `raw-report <log_dir>` |
@@ -249,9 +252,9 @@ One bar: **the next reader (or you in three months) changes the code correctly w
 
 1. Create `src/env_provider/<name>.py` (or `<name>/` package) implementing `EnvironmentProvider` (lifecycle + `exec`); keep an internal `id → handle` table.
 2. If it has an SDK manager with create/detect/cleanup, subclass `BaseSandboxManager` (`_base.py`) and supply the SDK seams + class attrs; put config/schemas under `src/env_provider/<name>/`. For a lifecycle-capable backend that reuses an existing SDK, subclass that provider directly (see `env_provider/aenv/` — `AenvProvider` subclasses `E2BProvider` and only adds the capability methods, no new manager).
-3. Register the provider in **two** places in `bench_core.bench` (both must be kept in sync):
-   - the `_PROVIDERS` roster — drives the `--provider` argparse `choices` and the capability hint;
-   - the `_build_provider` dispatch (lazy import — the kernel never imports a backend statically).
+3. Register the provider in **two** places (both must be kept in sync):
+   - the `_PROVIDERS` roster in `bench_core.bench` — drives the `--provider` argparse `choices` and the capability hint;
+   - the `_build_provider` dispatch in `bench_core.bench_cli` (lazy import — the kernel never imports a backend statically).
 4. Add `config/common/*.yaml` blocks (`<name>:`) as needed — the kernel reads only shared sections.
 5. Add unit tests under `src/env_provider/tests/` (drive via `FakeProvider`-style stubs; no live SDK needed).
 
@@ -265,7 +268,7 @@ One bar: **the next reader (or you in three months) changes the code correctly w
 
 ```
 src/bench_core/              host-agnostic kernel + oversub driver
-src/env_provider/            provider contract + e2b/docker/aenv/cubesandbox/fake impls
+src/env_provider/            provider contract + e2b/docker/aenv/cubesandbox/sandboxsched/fake impls
 src/vm_monitor/              host-level resource collector (vm-monitor CLI: base + sampling,
                              procfs, vmm/ adapters, capture/, export/ incl. export/raw/)
 config/common/               backend-agnostic workflow configs (one file per workflow)

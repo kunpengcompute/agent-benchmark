@@ -180,7 +180,8 @@ def test_load_config_replay_yaml():
     assert config.workflow_config.replay_template_manifest == SWE_BENCH_MAP
     assert config.workflow_config.replay_trajectory_glob == "*.replay.json"
     # replay.yaml ships as the explicit lifecycle 1:1 baseline (aenv default,
-    # set explicitly so the same config is unambiguous on any provider).
+    # set explicitly so the same config is unambiguous on any provider);
+    # sandboxsched vetoes it at startup until pause/resume is validated.
     assert config.workflow_config.replay_mode == "lifecycle"
 
 
