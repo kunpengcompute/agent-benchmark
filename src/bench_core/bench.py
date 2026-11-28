@@ -354,10 +354,14 @@ def _preflight_replay_sites(rcfg: ReplayConfig) -> None:
         ("Magento", f"http://{host}:7770"),
     ]
     timeout = 10
+    # Bypass any system/registry HTTP proxy: the site pair lives on an
+    # internal host a desktop proxy cannot route to (a proxied probe would
+    # time out even though the sites are up and the sandboxes can reach them).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for name, url in sites:
         try:
             req = urllib.request.Request(url, method="HEAD")
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = opener.open(req, timeout=timeout)
             logger.info(f"[Preflight] {name} {url} -> HTTP {resp.status} OK")
         except urllib.error.HTTPError as e:
             # 4xx/5xx: GitLab may return 302/401 for unauthenticated access;
