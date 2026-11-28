@@ -11,6 +11,13 @@
 | 站点 | 规范占位 `http://127.0.0.1:8023`(GitLab)、`http://127.0.0.1:7770`(Magento)；真实 host 回放时传入 |
 | 判定 | `success = (exit_code == 0 and not timed_out)` |
 
+**no-op 步骤说明**(410 步中的 15 步,设计如此,非缺陷):
+- 11 个空 action 是轨迹**终止步**(agent 输出最终答案,不做浏览器操作;原始
+  `_history.json` 中 `is_done: true`、action 为空数组)。
+- 4 个 `#` 注释步是 agent 通过**元素坐标/index** 的交互(无语义选择器,无法转成
+  可复现的 agent-browser 命令),保留为注释描述;回放时是 bash 注释 no-op。
+两者 exit_code=0 计成功,是轨迹数据形态的一部分。
+
 ## 快速开始
 
 ```bash
@@ -50,6 +57,10 @@ REPLAY_TARGET_HOST=<站点IP> oversub-bench --sweep-config config/oversub/webare
 
 28 条轨迹 / 410 步 / 100% 通过率(14 路并行,delay_scale=1.0)。
 
+**覆盖说明**: multiplier M 下每个 slot 连跑 M 条轨迹,但 distinct 覆盖约为
+min(slot 数, 池大小)——`-n 14 × M=2` 实测只覆盖 15/28 条。逐条轨迹验证用
+`multiplier: 1` + `-n 28`;吞吐压测用 M=2。
+
 ## 部署备注（x86 实测，2026-11）
 
 以下为 x86（<AENV_HOST>）上回放时的站点部署实测记录，供复现参考。
@@ -70,3 +81,18 @@ REPLAY_TARGET_HOST=<站点IP> oversub-bench --sweep-config config/oversub/webare
 - **端口**: 7770。
 - **可忽略告警**: 启动日志可能出现 `env-ctrl` / `env` 相关 error，属 Magento 启动早期阶段噪声，cron 自愈后消失，可忽略。
 - **MySQL 重初始化**: 若 `base_url` 长期不生效或站点 500，删除容器 + 数据卷重新 `docker run` 即触发 MySQL 重新初始化；`wa_baseurl_fix.sh` 会在首启阶段重写 `base_url`。
+- **base_url 缓存**: 若 DB 中 `web/*/base_url` 已是正确值但首页仍 302 跳旧 IP，是 Magento 页面缓存未刷新：`docker exec <容器> rm -rf /var/www/magento2/var/cache`。
+
+## 部署备注（同机部署）
+
+一般压测将站点与 AENV 分两台机器部署。若同机部署，注意以下三点（均为实测）：
+
+- **AgentENV 宿主 IP egress 黑名单**: AgentENV 默认禁止沙箱访问宿主 IP（防止沙箱
+  回打宿主服务）。站点与 AENV 同机时需放行站点端口：
+  `iptables -I INPUT -s 10.11.0.0/16 -i aenv-+ -p tcp -m multiport --dports 8023,7770 -j ACCEPT`
+  （`veth-+` 接口同理）。分机部署无需此项。
+- **客户端系统代理**: 客户端机器带系统 HTTP 代理（如本机 127.0.0.1:7890）时，
+  e2b SDK 的 API 流量需 `NO_PROXY=<aenv-host>`；站点预检已内置直连探测，不走代理。
+- **镜像内 shim 行尾**: 仓库检出在 Windows（autocrlf）时，烧 shim 进镜像务必用
+  `git cat-file blob` 提取的 LF 版本——CRLF 的 shebang（`bash\r`）会让每步 rc=127。
+
