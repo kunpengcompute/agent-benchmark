@@ -12,7 +12,9 @@ REAL=/usr/local/node24/bin/agent-browser
 is_load_timeout() { case "$1" in *"Timed out after"*"waiting for load state"*) return 0;; *) return 1;; esac; }
 is_cdp_coldstart() { case "$1" in *"CDP WebSocket connect failed"*|*"Auto-launch failed"*|*"Resource temporarily unavailable"*|*"Failed to read"*) return 0;; *) return 1;; esac; }
 is_aborted() { case "$1" in *"ERR_ABORTED"*) return 0;; *) return 1;; esac; }
-is_nav() { case "$1" in open|goto|navigate) return 0;; *) return 1;; esac; }
+# 'tab new <url>' and 'back' are navigations too (the traces use them); they
+# get the same ERR_ABORTED retry and load-state fallback as open/goto/navigate.
+is_nav() { case "$1" in open|goto|navigate|tab|back) return 0;; *) return 1;; esac; }
 is_find() { case "$1" in find|findfirst|select|fill|click) return 0;; *) return 1;; esac; }
 is_element_not_found() { case "$1" in *"No element at index 0"*|*"No element found"*|*"Element not found"*) return 0;; *) return 1;; esac; }
 is_daemon_crash() { [ -z "$1" ]; }

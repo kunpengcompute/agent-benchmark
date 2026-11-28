@@ -10,7 +10,7 @@ docker pull ${REGISTRY}/webarena-verified-shopping:latest
 
 echo "== Verifying browser image =="
 docker run --rm ${REGISTRY}/ubuntu-openclaw-chromium:webarena-arm64 /usr/local/node24/bin/agent-browser --version
-docker run --rm ${REGISTRY}/ubuntu-openclaw-chromium:webarena-arm64 echo "AGENT_BROWSER_PROFILE=$AGENT_BROWSER_PROFILE"
+docker run --rm ${REGISTRY}/ubuntu-openclaw-chromium:webarena-arm64 bash -c 'test -n "$AGENT_BROWSER_PROFILE" && echo "AGENT_BROWSER_PROFILE=$AGENT_BROWSER_PROFILE"'
 
 echo "== Done. =="
 echo "  Browser template: aenv pull ${REGISTRY}/ubuntu-openclaw-chromium:webarena-arm64 --name browser-webarena --cpu 2 --memory 4096"

@@ -430,11 +430,6 @@ def run_benchmark(config: KernelConfig, provider: EnvironmentProvider) -> dict[s
 
         preflight_document(config)
 
-    # Replay site preflight: verify webArena endpoints before creating sandboxes.
-    # Only runs when replay.target_host is set (site retargeting active).
-    if rcfg is not None and rcfg.replay_target_host and rcfg.replay_site_preflight:
-        _preflight_replay_sites(rcfg)
-
     # 1. Provider-level setup (e2b sets SDK env vars; docker needs nothing).
     provider.prepare_env()
 
@@ -447,6 +442,12 @@ def run_benchmark(config: KernelConfig, provider: EnvironmentProvider) -> dict[s
         killed = provider.cleanup_existing()
         logger.info(f"\nCleanup: tore down {killed} sandbox(es).")
         return {"report": f"Cleanup: tore down {killed} sandbox(es).", "filepath": None}
+
+    # Replay site preflight: verify webArena endpoints before creating sandboxes.
+    # Only runs when replay.target_host is set (site retargeting active). Runs
+    # after the cleanup-only exit so a sites-down run can always be torn down.
+    if rcfg is not None and rcfg.replay_target_host and rcfg.replay_site_preflight:
+        _preflight_replay_sites(rcfg)
 
     _print_header(config, provider)
 

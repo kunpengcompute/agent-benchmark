@@ -11,7 +11,9 @@ e2b:
     E2B_API_URL: http://localhost:3000
     E2B_HTTP_SSL: 'false'
 docker:
-  image: ubuntu-openclaw-chromium:24.04-linuxarm64
+  # The webarena browser image (agent-browser 0.43.0 + hardening shim) -- the
+  # same reference download-images.sh pulls from the public SWR registry.
+  image: swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ubuntu-openclaw-chromium:webarena-arm64
   container_prefix: wa-replay
   cpu_limit: 2.0
   memory_limit: 4g
