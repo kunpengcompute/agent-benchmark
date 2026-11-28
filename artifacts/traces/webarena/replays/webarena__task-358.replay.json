@@ -1,0 +1,94 @@
+{
+  "environment": "main",
+  "trajectory": [
+    {
+      "action": "agent-browser open 'http://127.0.0.1:7770/customer/account/login/'",
+      "thought": "Start: log in to the store before performing the task.",
+      "response": "Navigate to the customer login page.",
+      "delay_time": 0.0,
+      "delay_time_orig": 0.0,
+      "prompt_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "action": "agent-browser fill '#email' 'emma.lopez@gmail.com'",
+      "thought": "Enter the account email.",
+      "response": "Fill in the email field.",
+      "delay_time": 0.0,
+      "delay_time_orig": 0.0,
+      "prompt_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "action": "agent-browser fill '#pass' 'password'",
+      "thought": "Enter the account password.",
+      "response": "Fill in the password field.",
+      "delay_time": 0.0,
+      "delay_time_orig": 0.0,
+      "prompt_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "action": "agent-browser find role button click --name 'Sign In'",
+      "thought": "Submit the login form.",
+      "response": "Click the Sign In button.",
+      "delay_time": 0.0,
+      "delay_time_orig": 0.0,
+      "prompt_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "action": "agent-browser open 'http://127.0.0.1:7770'",
+      "thought": "Start",
+      "response": "Initial navigation",
+      "delay_time": 0.0,
+      "delay_time_orig": 0.0,
+      "prompt_tokens": 1,
+      "output_tokens": 20
+    },
+    {
+      "action": "agent-browser open 'http://127.0.0.1:7770/sales/order/history/'",
+      "thought": "Initial page loaded successfully. Verdict: Success\nThe user wants to see the shipping method for order number 187. This is an e-commerce site (Magento-like \"One Stop Market\"). I need to find the order details. Likely I need to access the account area or order history. Let me look at the page - there's a \"My Account\" link. I'll need to find order 187's shipping method.\n\nLet me click on \"My Account\" first to see if I can access order history. However, I'm not logged in. Let me check what's available. The task requires finding shipping method for order 187.\n\nLet me navigate to the account section. I'll click \"My Account\" (index 336).",
+      "response": "Navigate to My Account to find order history for order 187.",
+      "delay_time": 17.24,
+      "delay_time_orig": 17.24,
+      "prompt_tokens": 193,
+      "output_tokens": 21
+    },
+    {
+      "action": "agent-browser open 'http://127.0.0.1:7770/sales/order/view/order_id/170/'",
+      "thought": "Successfully navigated to My Account page and can see the order history, including order 000000187.\nI need to find the shipping method for order number 187. I can see order 000000187 in the recent orders table. I need to click \"View Order\" for this order to see its details including shipping method.",
+      "response": "Click \"View Order\" for order 000000187 to see its shipping method details.",
+      "delay_time": 9.85,
+      "delay_time_orig": 9.85,
+      "prompt_tokens": 114,
+      "output_tokens": 25
+    },
+    {
+      "action": "",
+      "thought": "Successfully navigated to the order view page for order 000000187. Verdict: Success\nThe user wants to know the shipping method for order number 187. I've successfully navigated to the order detail page. Looking at the page content, I can see under \"Shipping Method\" it says \"Flat Rate - Fixed\". This is the answer to the user's question.",
+      "response": "The shipping method for order number 187 is **Flat Rate - Fixed**.",
+      "delay_time": 11.66,
+      "delay_time_orig": 11.66,
+      "prompt_tokens": 114,
+      "output_tokens": 16
+    }
+  ],
+  "history": [],
+  "info": {
+    "instance_id": "webarena__task-358",
+    "source": "webarena browser-use trajectory 358_history.json",
+    "trajectory_id": "358",
+    "resolved": null
+  },
+  "replay_config": {},
+  "delay_model": {
+    "formula": "delay_time = step_end_time - step_start_time (real wall clock)",
+    "prefill_tps": 3000.0,
+    "decode_tps": 30.0,
+    "tokenizer": "cl100k_base",
+    "token_source": "estimated from thought/response length (webarena history has no usage data); delay_time_orig is the real per-step elapsed seconds (metadata.step_interval)",
+    "retimed_at": "2026-11-12 11:13:51 UTC",
+    "delay_time_source": "delay_time and delay_time_orig now both equal the REAL per-turn wall-clock duration (metadata.step_end_time - step_start_time) from the original *_history.json. Sub-action steps within a turn are 0."
+  }
+}

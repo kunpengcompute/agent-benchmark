@@ -197,7 +197,7 @@ def test_load_pool_concurrent_start_share_one_build(tmp_path, monkeypatch):
     calls: list[Path] = []
     real_load = replay_payload.load_trajectory
 
-    def slow_load(path):
+    def slow_load(path, target_host=None):
         calls.append(path)
         time.sleep(0.01)  # widen the I/O window: an unlocked cache races here
         return real_load(path)

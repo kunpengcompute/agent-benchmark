@@ -25,6 +25,8 @@ import importlib
 import logging
 import signal
 import threading
+import urllib.error
+import urllib.request
 import time
 from pathlib import Path
 from typing import Any
@@ -325,6 +327,59 @@ def _create_only_report(config: KernelConfig, instances: dict[int, SandboxInstan
     return "\n".join(line for line in lines if line != "")
 
 
+def _preflight_replay_sites(rcfg: ReplayConfig) -> None:
+    """Pre-flight gate: verify webArena site endpoints are reachable before
+    creating any sandboxes. Runs when ``replay.target_host`` is set (i.e., the
+    config or REPLAY_TARGET_HOST env retargets actions at a real site pair).
+
+    Checks HTTP connectivity to the two canonical webArena ports on the
+    target host: GitLab (:8023) and Magento (:7770). A 200/301/302 response
+    counts as reachable (GitLab may redirect to login). Connection refused,
+    timeout, or a 5xx aborts the run *before* any sandbox is created --
+    creating N sandboxes that immediately fail every browser step is a waste
+    of resources and pollutes metrics.
+
+    Set ``replay.site_preflight: false`` in the YAML to skip (e.g., when sites
+    are behind a VPN not reachable from the AENV host but reachable from
+    inside sandboxes).
+    """
+    host = rcfg.replay_target_host
+    if not host:
+        return  # no retargeting -> actions replay as recorded (localhost)
+    # Allow opt-out via config (replay.site_preflight: false)
+    # (checked via raw config in run_benchmark before calling this fn)
+
+    sites = [
+        ("GitLab", f"http://{host}:8023"),
+        ("Magento", f"http://{host}:7770"),
+    ]
+    timeout = 10
+    # Bypass any system/registry HTTP proxy: the site pair lives on an
+    # internal host a desktop proxy cannot route to (a proxied probe would
+    # time out even though the sites are up and the sandboxes can reach them).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for name, url in sites:
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            resp = opener.open(req, timeout=timeout)
+            logger.info(f"[Preflight] {name} {url} -> HTTP {resp.status} OK")
+        except urllib.error.HTTPError as e:
+            # 4xx/5xx: GitLab may return 302/401 for unauthenticated access;
+            # 401/302 is fine (site is up, just needs login). 5xx is a real problem.
+            if e.code < 500:
+                logger.info(f"[Preflight] {name} {url} -> HTTP {e.code} (reachable)")
+            else:
+                raise RuntimeError(
+                    f"[Preflight] {name} at {url} returned HTTP {e.code} -- site is unhealthy. "
+                    f"Fix the site before running, or set replay.site_preflight: false to skip."
+                ) from e
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError(
+                f"[Preflight] {name} at {url} is unreachable: {type(e).__name__}: {e}. "
+                f"Start the webArena sites or set replay.site_preflight: false to skip."
+            ) from e
+    logger.info(f"[Preflight] All webArena sites on {host} reachable.")
+
 def run_benchmark(config: KernelConfig, provider: EnvironmentProvider) -> dict[str, Any]:
     """Run the host-agnostic single-test benchmark flow.
 
@@ -391,6 +446,12 @@ def run_benchmark(config: KernelConfig, provider: EnvironmentProvider) -> dict[s
         killed = provider.cleanup_existing()
         logger.info(f"\nCleanup: tore down {killed} sandbox(es).")
         return {"report": f"Cleanup: tore down {killed} sandbox(es).", "filepath": None}
+
+    # Replay site preflight: verify webArena endpoints before creating sandboxes.
+    # Only runs when replay.target_host is set (site retargeting active). Runs
+    # after the cleanup-only exit so a sites-down run can always be torn down.
+    if rcfg is not None and rcfg.replay_target_host and rcfg.replay_site_preflight:
+        _preflight_replay_sites(rcfg)
 
     _print_header(config, provider)
 

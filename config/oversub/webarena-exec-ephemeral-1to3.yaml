@@ -1,0 +1,24 @@
+# webArena oversubscription sweep: exec_ephemeral + M=2, ratios 1:1/1:2/1:3.
+# Same five-step flow as the swe-bench sweep; only the base profile differs.
+#
+#   oversub-bench --sweep-config config/oversub/webarena-exec-ephemeral-1to3.yaml
+#
+# Prereqs: browser-webarena template ready + webArena sites reachable
+# (GitLab :8023 / Magento :7770). Sandbox slots are 2 cpu / 4 GiB; N=96 comes
+# from base replay.running_concurrency -> total_count = k*96 per trial.
+base_config: config/common/webarena-replay.yaml
+
+provider: aenv
+
+ratios: [1, 2, 3]
+modes: [exec_ephemeral]
+multiplier: 2
+repeats: 1
+test_duration: 3600
+failure_tolerance: 0.0
+cooldown_sec: 30
+cleanup_between_trials: on
+reuse: false
+stop_on_failure: false
+no_vm_monitor: false
+bench_core_bin: [bench-core]
