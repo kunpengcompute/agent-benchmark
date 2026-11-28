@@ -6,7 +6,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Build AENV template from webArena browser image")
-    parser.add_argument("--image", default="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ubuntu-openclaw-chromium:webarena-arm64",
+    parser.add_argument("--image", default="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-browser:arm64",
                         help="Docker image reference (default: SWR public registry)")
     parser.add_argument("--name", default="browser-webarena", help="AENV template name")
     parser.add_argument("--cpu", type=int, default=2, help="CPU cores")

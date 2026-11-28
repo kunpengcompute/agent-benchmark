@@ -27,8 +27,8 @@ docker run -d --name webarena-gitlab -p 8023:8023 -e SITE_HOST=<站点IP> \
 docker run -d --name webarena-verified-shopping -p 7770:80 -e SITE_HOST=<站点IP> \
   swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-verified-shopping:latest
 
-# 2) 构建浏览器模板
-aenv pull swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/ubuntu-openclaw-chromium:webarena-arm64 \
+# 2) 构建浏览器模板（x86 主机把 tag 换成 :x86_64）
+aenv pull swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-browser:arm64 \
   --name browser-webarena --cpu 2 --memory 4096 --timeout 1800
 
 # 3) 回放(8 沙箱)
