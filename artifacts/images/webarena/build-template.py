@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Build an AENV template from the pre-built webArena browser image (public registry)."""
 import argparse
+import platform
 import subprocess
 import sys
 
+# The browser image is dual-arch (arm64 / x86_64); default to the host arch.
+_ARCH_TAG = {"x86_64": "x86_64", "aarch64": "arm64"}.get(platform.machine(), "arm64")
+DEFAULT_IMAGE = f"swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-browser:{_ARCH_TAG}"
+
 def main():
     parser = argparse.ArgumentParser(description="Build AENV template from webArena browser image")
-    parser.add_argument("--image", default="swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-browser:arm64",
-                        help="Docker image reference (default: SWR public registry)")
+    parser.add_argument("--image", default=DEFAULT_IMAGE,
+                        help=f"Docker image reference (default: {DEFAULT_IMAGE})")
     parser.add_argument("--name", default="browser-webarena", help="AENV template name")
     parser.add_argument("--cpu", type=int, default=2, help="CPU cores")
     parser.add_argument("--memory", type=int, default=4096, help="Memory in MiB")

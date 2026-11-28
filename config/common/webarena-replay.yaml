@@ -12,7 +12,8 @@ e2b:
     E2B_HTTP_SSL: 'false'
 docker:
   # The webarena browser image (agent-browser 0.43.0 + hardening shim) -- the
-  # same reference download-images.sh pulls from the public SWR registry.
+  # same reference download-images.sh pulls from the public SWR registry
+  # (dual-arch: x86 hosts use webarena-browser:x86_64).
   image: swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/webarena-browser:arm64
   container_prefix: wa-replay
   cpu_limit: 2.0
