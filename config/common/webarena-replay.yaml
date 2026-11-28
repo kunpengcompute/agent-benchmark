@@ -1,0 +1,85 @@
+workflow_type: replay
+e2b:
+  template: browser-webarena
+  create_timeout: 86400
+  numa_bind: 2
+  sandbox_ids_file: sandboxs_webarena_e2b.txt
+  env:
+    E2B_ACCESS_TOKEN: your_e2b_your_api_key_heress_token_here
+    E2B_API_KEY: your_e2b_your_api_key_herepi_key_here
+    E2B_DOMAIN: e2b.app
+    E2B_API_URL: http://localhost:3000
+    E2B_HTTP_SSL: 'false'
+docker:
+  image: ubuntu-openclaw-chromium:24.04-linuxarm64
+  container_prefix: wa-replay
+  cpu_limit: 2.0
+  memory_limit: 4g
+  create_timeout: 300
+aenv:
+  template: browser-webarena
+  create_timeout: 86400
+  sandbox_ids_file: sandboxs_webarena_aenv.txt
+  ccl_bind: false
+  env:
+    E2B_ACCESS_TOKEN: your_e2b_your_api_key_heress_token_here
+    E2B_API_KEY: your_e2b_your_api_key_heress_token_here
+cubesandbox:
+  template: browser-webarena
+  timeout: 86400
+  sandbox_ids_file: sandboxs_webarena_cube.txt
+  env:
+    CUBE_API_URL: http://127.0.0.1:3000
+    CUBE_API_KEY: your_cube_api_key_here
+    CUBE_SANDBOX_DOMAIN: cube.app
+sandbox:
+  total_count: 96
+  detect_existing: false
+  create_only: false
+create_batch:
+  size: 96
+  interval: 1
+task_batch:
+  size: 5
+  interval: 1
+replay:
+  scenario: webarena
+  target_host: null
+  site_preflight: true
+  workdir: /
+  env: {}
+  action_timeout: 300
+  delay_scale: 1.0
+  stop_on_error: false
+  mode: exec_ephemeral
+  multiplier: 2
+  running_concurrency: 96
+  control_plane_qps: 1000.0
+  control_plane_inflight_cap: 1024
+  pause_duration_sec: 0.0
+  ready_probe: true
+  lifecycle_retries: 2
+  launch_interval_sec: 0.0
+test:
+  duration: 1800
+  stats_interval: 10
+  benchmark_percent: 1.0
+  benchmark_mode: fixed
+  round_size: 8
+  round_count: 1
+  round_interval: 0
+report:
+  output_dir: results/webarena-replay
+  filename_prefix: webarena_replay
+  format: both
+monitor:
+  enabled: auto
+  vmm: auto
+  interval: 2
+  capture: auto
+  numa: all
+  disks: all
+  stress_file: /dev/shm/bench_core_monitor.lock
+  log_dir: null
+  merge_report: false
+  report_timeout: 300
