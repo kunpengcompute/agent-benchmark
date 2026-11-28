@@ -7,12 +7,52 @@ import-compat (``from bench_core.task_runner.replay import ReplayConfig``).
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 
 from bench_core.config import KernelConfig
 from bench_core.workflow_registry import WorkflowConfigBase, WorkflowConfigError
 
 logger = logging.getLogger(__name__)
+
+# replay.target_host must be a bare host: an IPv4 address or a DNS-label
+# hostname. Anything else (port, path, spaces, ...) is rejected in parsing.
+_HOST_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _normalize_target_host(value: object) -> str | None:
+    """Normalize ``replay.target_host`` -- a bare host (IP or hostname).
+
+    A scheme prefix and trailing slashes are tolerated and stripped
+    (``http://site.example/`` == ``site.example``). A port or a path suffix is
+    rejected loudly: per-site ports and paths live in the traces, so a port
+    here would double up in every rewritten URL. None = no rewriting: actions
+    replay exactly as recorded.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WorkflowConfigError(
+            f"replay.target_host must be a string, got {type(value).__name__}"
+        )
+    host = value.strip()
+    for scheme in ("http://", "https://"):
+        if host.startswith(scheme):
+            host = host[len(scheme):]
+            break
+    host = host.rstrip("/")
+    if not host:
+        raise WorkflowConfigError("replay.target_host must not be empty")
+    # Bare host only (IPv4 / DNS-label hostname). The per-site ports and paths
+    # live in the traces: a port here would double up in every rewritten URL
+    # ("http://host:8023" -> "http://<target>:8023:8023") and fail every step.
+    if not _HOST_RE.fullmatch(host):
+        raise WorkflowConfigError(
+            f"replay.target_host must be a bare host (IP or hostname; no port, "
+            f"no path -- ports and paths come from the traces), got {value!r}"
+        )
+    return host
 
 
 @dataclass
@@ -64,6 +104,19 @@ class ReplayConfig(WorkflowConfigBase):
     replay_lifecycle_retries: int = 2
     replay_launch_interval_sec: float = 0.0
     replay_pause_duration_sec: float = 0.0
+    # Runtime host retargeting. The repo's webArena traces canonically record
+    # the site pair as http://127.0.0.1:{7770,8023}; set this to the host that
+    # actually serves the sites and every action's placeholder host is replaced
+    # with it at trajectory-load time (in-memory -- trace files stay pristine).
+    # None = replay actions exactly as recorded. Per-run override without
+    # editing the config: REPLAY_TARGET_HOST=<host> bench-core ... (env wins;
+    # oversub trial subprocesses inherit the driver's env).
+    replay_target_host: str | None = None
+    # Pre-flight gate: when target_host is set, verify site endpoints
+    # (GitLab :8023 / Magento :7770) are reachable before creating any
+    # sandbox. Set false to skip (e.g., sites reachable from inside
+    # sandboxes but not from the AENV host).
+    replay_site_preflight: bool = True
 
     def __post_init__(self) -> None:
         # exec_only / exec_ephemeral have no lifecycle calls (exec_ephemeral is a
@@ -101,10 +154,21 @@ class ReplayConfig(WorkflowConfigBase):
             replay_lifecycle_retries=r.get("lifecycle_retries", 2),
             replay_launch_interval_sec=r.get("launch_interval_sec", 0.0),
             replay_pause_duration_sec=r.get("pause_duration_sec", 0.0),
+            replay_target_host=_normalize_target_host(
+                os.environ.get("REPLAY_TARGET_HOST") or r.get("target_host")
+            ),
+            replay_site_preflight=r.get("site_preflight", True),
         )
 
     def validate(self, kernel_config: KernelConfig) -> None:
         """Range checks + the sole cross-section (running_concurrency <= total_count)."""
+        if self.replay_scenario == "webarena" and self.replay_target_host is None:
+            logger.warning(
+                "[replay] scenario 'webarena' has no replay.target_host: actions keep "
+                "their recorded 127.0.0.1 hosts (in-sandbox localhost), so browser "
+                "steps will fail unless the sites live there -- pass "
+                "REPLAY_TARGET_HOST=<site-host> or set replay.target_host"
+            )
         if self.replay_running_concurrency is not None:
             if self.replay_running_concurrency < 1:
                 raise WorkflowConfigError(

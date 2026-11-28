@@ -85,7 +85,12 @@ def classify_action(action: str) -> str:
     return "shell"
 
 
-def load_trajectory(path: Path) -> Trajectory:
+# Canonical placeholder host recorded in the webArena traces. load_trajectory
+# swaps it for replay.target_host (in-memory) when one is configured.
+_PLACEHOLDER_HOST = "127.0.0.1"
+
+
+def load_trajectory(path: Path, target_host: str | None = None) -> Trajectory:
     """Load one trajectory JSON, truncating at the first terminal action.
 
     The terminal action (``submit``/``finish``/``done``) marks "agent
@@ -107,6 +112,8 @@ def load_trajectory(path: Path) -> Trajectory:
     steps: list[ReplayStep] = []
     for idx, entry in enumerate(raw_steps):
         action = entry.get("action") or ""
+        if target_host is not None and target_host != _PLACEHOLDER_HOST:
+            action = action.replace(_PLACEHOLDER_HOST, target_host)
         action_type = classify_action(action)
         if action_type in _TERMINAL_ACTIONS:
             break  # truncate; terminal action + its delay_time discarded
@@ -129,7 +136,7 @@ _TRAJECTORY_SUFFIXES = (".replay.json", ".json", ".traj")
 # Module-level pool cache: (dir, glob, manifest_path, limit, rc) -> tuple[Trajectory, ...].
 # Frozen tuples are safe for concurrent read by many runner threads; the pool is
 # shared read-only across all sandboxes. Each runner keeps its own cursor.
-_POOL_CACHE: dict[tuple[str, str, str, str, str], tuple[Trajectory, ...]] = {}
+_POOL_CACHE: dict[tuple[str, str, str, str, str, str], tuple[Trajectory, ...]] = {}
 # The load is I/O-bound (json.load releases the GIL), so an unlocked
 # check-then-load lets every runner thread that starts at the same time build a
 # private copy. Measured at the 384-slot production shape: 64 concurrent
@@ -190,7 +197,7 @@ def _replay_view(config: KernelConfig) -> ReplayConfig:
     return rcfg
 
 
-def _pool_cache_key(rcfg: ReplayConfig) -> tuple[str, str, str, str, str]:
+def _pool_cache_key(rcfg: ReplayConfig) -> tuple[str, str, str, str, str, str]:
     # ``rc`` (the oversub baseline fleet size N) is in the key because the
     # linearity clamp below may reduce ``limit`` to ``rc // T`` -- two configs
     # with the same trajectory_limit but different rc clamp differently, so they
@@ -201,10 +208,11 @@ def _pool_cache_key(rcfg: ReplayConfig) -> tuple[str, str, str, str, str]:
         str(rcfg.replay_template_manifest or ""),
         str(rcfg.replay_trajectory_limit or ""),
         str(rcfg.replay_running_concurrency or ""),
+        str(rcfg.replay_target_host or ""),
     )
 
 
-def _build_pool(rcfg: ReplayConfig, cache_key: tuple[str, str, str, str, str]) -> tuple[Trajectory, ...]:
+def _build_pool(rcfg: ReplayConfig, cache_key: tuple[str, str, str, str, str, str]) -> tuple[Trajectory, ...]:
     """Build the pool for ``cache_key``. Caller holds ``_POOL_LOCK``."""
     directory = rcfg.replay_trajectory_dir
     glob = rcfg.replay_trajectory_glob
@@ -229,9 +237,10 @@ def _build_pool(rcfg: ReplayConfig, cache_key: tuple[str, str, str, str, str]) -
     # instead of a WARNING per file (the oversub driver spawns one bench-core
     # subprocess per trial, so per-file WARNINGs repeat across every ratio).
     skipped_manifest: list[tuple[str, str]] = []
+    target_host = rcfg.replay_target_host
     for path in find_trajectories(Path(directory), glob):
         try:
-            traj = load_trajectory(path)
+            traj = load_trajectory(path, target_host)
         except (json.JSONDecodeError, OSError, KeyError) as exc:
             logger.warning(f"[replay] skipping unparseable trajectory {path.name}: {type(exc).__name__}: {exc}")
             continue
